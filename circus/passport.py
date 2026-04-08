@@ -151,14 +151,30 @@ def generate_passport(
     avg_priority = row['avg_priority'] or 5.0
     avg_access = row['avg_access'] or 0.0
 
-    # Calculate proof count (citations)
-    cursor.execute("""
-        SELECT AVG(json_array_length(citations)) as avg_citations
-        FROM memories
-        WHERE status = 'active' AND citations IS NOT NULL
-    """)
-    row = cursor.fetchone()
-    avg_citations = row['avg_citations'] or 0.0
+    # Calculate proof count (citations) - check if column exists first
+    avg_citations = 0.0
+    try:
+        cursor.execute("""
+            SELECT AVG(json_array_length(citations)) as avg_citations
+            FROM memories
+            WHERE status = 'active' AND citations IS NOT NULL
+        """)
+        row = cursor.fetchone()
+        avg_citations = row['avg_citations'] or 0.0
+    except sqlite3.OperationalError:
+        # citations column doesn't exist, check for citationsJson
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) as count
+                FROM memories
+                WHERE status = 'active' AND citationsJson IS NOT NULL AND citationsJson != '[]'
+            """)
+            row = cursor.fetchone()
+            # Estimate average based on presence
+            if memory_count > 0:
+                avg_citations = row['count'] / memory_count * 2.0
+        except sqlite3.OperationalError:
+            pass  # No citation tracking
 
     # Extract behavioral traits (if identity table exists)
     behavioral_traits = []
