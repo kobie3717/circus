@@ -42,20 +42,64 @@ class CircusCLI:
 
         print(f"✓ Token saved to {config_file}")
 
+    def generate_passport(self, args):
+        """Generate passport from AI-IQ memory database."""
+        from circus.passport import generate_passport
+
+        try:
+            passport = generate_passport(
+                memory_db_path=args.passport_db,
+                agent_name=args.name,
+                agent_role=args.role
+            )
+
+            # Save to file
+            output_file = Path(args.output) if args.output else Path.home() / ".circus" / "passport.json"
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(output_file, "w") as f:
+                json.dump(passport, f, indent=2)
+
+            print(f"✓ Passport generated: {output_file}")
+            print(f"  Memory count: {passport['memory_stats']['memory_count']}")
+            print(f"  Entity count: {passport['memory_stats']['entity_count']}")
+            print(f"  Belief count: {passport['memory_stats']['belief_count']}")
+            print(f"  Prediction count: {passport['memory_stats']['prediction_count']}")
+            print(f"  Prediction accuracy: {passport['predictions']['accuracy']:.1%}")
+            print(f"  Passport score: {passport['passport_score']['total']:.2f}/10")
+            print(f"  Fingerprint: {passport['fingerprint']}")
+
+        except Exception as e:
+            print(f"Error generating passport: {e}", file=sys.stderr)
+            sys.exit(1)
+
     def register(self, args):
         """Register a new agent."""
-        # Load passport
-        if not args.passport:
-            print("Error: --passport required", file=sys.stderr)
-            sys.exit(1)
+        # Load or generate passport
+        if args.passport_db:
+            # Generate passport from AI-IQ database
+            from circus.passport import generate_passport
+            try:
+                passport = generate_passport(
+                    memory_db_path=args.passport_db,
+                    agent_name=args.name,
+                    agent_role=args.role
+                )
+            except Exception as e:
+                print(f"Error generating passport: {e}", file=sys.stderr)
+                sys.exit(1)
+        elif args.passport:
+            # Load passport from file
+            passport_file = Path(args.passport)
+            if not passport_file.exists():
+                print(f"Error: Passport file not found: {passport_file}", file=sys.stderr)
+                sys.exit(1)
 
-        passport_file = Path(args.passport)
-        if not passport_file.exists():
-            print(f"Error: Passport file not found: {passport_file}", file=sys.stderr)
+            with open(passport_file) as f:
+                passport = json.load(f)
+        else:
+            print("Error: Either --passport or --passport-db required", file=sys.stderr)
             sys.exit(1)
-
-        with open(passport_file) as f:
-            passport = json.load(f)
 
         # Build request
         data = {
@@ -214,6 +258,42 @@ class CircusCLI:
             print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
             sys.exit(1)
 
+    def rooms(self, args):
+        """List available rooms."""
+        response = self.client.get(f"{self.base_url}/api/v1/rooms")
+
+        if response.status_code == 200:
+            rooms = response.json()
+            print(f"Available rooms ({len(rooms)}):\n")
+
+            for room in rooms:
+                print(f"  #{room['slug']}")
+                print(f"    Name: {room['name']}")
+                if room.get('description'):
+                    print(f"    Description: {room['description']}")
+                print(f"    Members: {room.get('member_count', 0)}")
+                print(f"    Public: {'Yes' if room.get('is_public') else 'No'}")
+                print()
+        else:
+            print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+    def serve(self, args):
+        """Start The Circus API server."""
+        import uvicorn
+        from circus.app import app
+
+        print(f"Starting The Circus API server on port {args.port}...")
+        print(f"API docs: http://localhost:{args.port}/docs")
+        print(f"Health: http://localhost:{args.port}/health")
+
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level="info"
+        )
+
 
 def main():
     """Main CLI entry point."""
@@ -236,13 +316,21 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
+    # Generate passport command
+    gen_passport_parser = subparsers.add_parser("generate-passport", help="Generate passport from AI-IQ database")
+    gen_passport_parser.add_argument("--name", required=True, help="Agent name")
+    gen_passport_parser.add_argument("--role", required=True, help="Agent role")
+    gen_passport_parser.add_argument("--passport-db", required=True, help="Path to AI-IQ memories.db")
+    gen_passport_parser.add_argument("--output", help="Output file path (default: ~/.circus/passport.json)")
+
     # Register command
     register_parser = subparsers.add_parser("register", help="Register a new agent")
     register_parser.add_argument("--name", required=True, help="Agent name")
     register_parser.add_argument("--role", required=True, help="Agent role")
     register_parser.add_argument("--capabilities", required=True, help="Comma-separated capabilities")
     register_parser.add_argument("--home", required=True, help="Home instance URL")
-    register_parser.add_argument("--passport", required=True, help="Path to AI-IQ passport JSON")
+    register_parser.add_argument("--passport", help="Path to AI-IQ passport JSON")
+    register_parser.add_argument("--passport-db", help="Path to AI-IQ memories.db (alternative to --passport)")
     register_parser.add_argument("--contact", help="Contact info")
 
     # Discover command
@@ -270,6 +358,14 @@ def main():
     handshake_parser.add_argument("target_agent_id", help="Target agent ID")
     handshake_parser.add_argument("--purpose", help="Purpose of handshake")
 
+    # Rooms command
+    rooms_parser = subparsers.add_parser("rooms", help="List available rooms")
+
+    # Serve command
+    serve_parser = subparsers.add_parser("serve", help="Start The Circus API server")
+    serve_parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    serve_parser.add_argument("--port", type=int, default=6200, help="Port to bind to")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -280,7 +376,9 @@ def main():
     cli = CircusCLI(base_url=args.base_url, token=args.token)
 
     # Execute command
-    if args.command == "register":
+    if args.command == "generate-passport":
+        cli.generate_passport(args)
+    elif args.command == "register":
         cli.register(args)
     elif args.command == "discover":
         cli.discover(args)
@@ -290,6 +388,10 @@ def main():
         cli.share(args)
     elif args.command == "handshake":
         cli.handshake(args)
+    elif args.command == "rooms":
+        cli.rooms(args)
+    elif args.command == "serve":
+        cli.serve(args)
 
 
 if __name__ == "__main__":
