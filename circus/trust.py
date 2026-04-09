@@ -56,7 +56,11 @@ def calculate_trust_score(
 
     # Extract passport score (10%)
     score_data = passport.get("score", {})
-    passport_total = score_data.get("total", 0.0)
+    # Handle both dict format {"total": 75.0} and direct float 75.0
+    if isinstance(score_data, dict):
+        passport_total = score_data.get("total", 0.0)
+    else:
+        passport_total = score_data if isinstance(score_data, (int, float)) else 0.0
     passport_score = (passport_total / 10) * settings.trust_weight_passport_score * 100
 
     # Calculate longevity score (10%)

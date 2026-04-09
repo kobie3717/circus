@@ -29,6 +29,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
             token_hash TEXT NOT NULL,
             trust_score REAL DEFAULT 50.0,
             trust_tier TEXT DEFAULT 'Established',
+            public_key BLOB,
+            signed_card TEXT,
             registered_at TEXT NOT NULL,
             last_seen TEXT NOT NULL,
             is_active INTEGER DEFAULT 1
@@ -142,6 +144,83 @@ def init_database(db_path: Optional[Path] = None) -> None:
         )
     """)
 
+    # Tasks table (A2A task lifecycle)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            from_agent_id TEXT NOT NULL,
+            to_agent_id TEXT NOT NULL,
+            task_type TEXT NOT NULL,
+            payload TEXT NOT NULL,       -- JSON blob
+            state TEXT DEFAULT 'submitted',
+            result TEXT,                 -- JSON blob (when completed)
+            error TEXT,                  -- Error message (when failed)
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            deadline TEXT,
+            FOREIGN KEY (from_agent_id) REFERENCES agents(id),
+            FOREIGN KEY (to_agent_id) REFERENCES agents(id),
+            CHECK (state IN ('submitted', 'working', 'input-required', 'completed', 'failed', 'canceled'))
+        )
+    """)
+
+    # Task state transitions table (for audit log)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS task_state_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            from_state TEXT,
+            to_state TEXT NOT NULL,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        )
+    """)
+
+    # Audit log table (OWASP security)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT,
+            action TEXT NOT NULL,
+            resource_type TEXT,
+            resource_id TEXT,
+            trust_tier TEXT,
+            allowed INTEGER NOT NULL,
+            reason TEXT,
+            ip_address TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # Federation peers table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS federation_peers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            url TEXT UNIQUE NOT NULL,
+            public_key BLOB NOT NULL,
+            trust_score REAL DEFAULT 50.0,
+            last_sync TEXT,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # Federation sync log
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS federation_sync_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            peer_id TEXT NOT NULL,
+            direction TEXT NOT NULL,  -- 'pull' or 'push'
+            agents_synced INTEGER DEFAULT 0,
+            status TEXT NOT NULL,     -- 'success' or 'failed'
+            error TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (peer_id) REFERENCES federation_peers(id)
+        )
+    """)
+
     # Create indexes
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_agents_trust_score ON agents(trust_score)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_agents_last_seen ON agents(last_seen)")
@@ -150,6 +229,11 @@ def init_database(db_path: Optional[Path] = None) -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_shared_memories_room_id ON shared_memories(room_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_trust_events_agent_id ON trust_events(agent_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_handshakes_agents ON handshakes(agent_a_id, agent_b_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_from_agent ON tasks(from_agent_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_to_agent ON tasks(to_agent_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_agent ON audit_log(agent_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at)")
 
     # Create FTS5 virtual table for agent search
     # Standalone FTS table (not content-based) for simplicity
@@ -215,6 +299,41 @@ def init_database(db_path: Optional[Path] = None) -> None:
             WHERE room_id = new.id;
         END
     """)
+
+    # Agent embeddings table (for semantic search)
+    # Store both blob (for sqlite-vec) and JSON (for fallback)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS agent_embeddings (
+            agent_id TEXT PRIMARY KEY,
+            embedding BLOB,
+            embedding_json TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+        )
+    """)
+
+    # Try to enable sqlite-vec if available
+    try:
+        conn.enable_load_extension(True)
+        vec_loaded = False
+        for ext_path in ["vec0", "/usr/local/lib/vec0.so", "/usr/lib/vec0.so"]:
+            try:
+                conn.load_extension(ext_path)
+                vec_loaded = True
+                break
+            except sqlite3.OperationalError:
+                continue
+        conn.enable_load_extension(False)
+
+        if vec_loaded:
+            # Create optimized vector index if sqlite-vec is available
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_agent_embeddings_vec
+                ON agent_embeddings(embedding)
+            """)
+    except Exception:
+        # sqlite-vec not available, will use fallback search
+        pass
 
     conn.commit()
     conn.close()

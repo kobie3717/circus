@@ -23,6 +23,13 @@ from circus.models import (
 )
 from circus.passport import calculate_passport_hash
 from circus.trust import calculate_trust_score, calculate_trust_delta, can_vouch, get_trust_tier
+from circus.services.signing import (
+    generate_keypair,
+    sign_agent_card,
+    verify_signature,
+    encode_public_key,
+    decode_public_key,
+)
 
 router = APIRouter()
 
@@ -90,6 +97,19 @@ async def register_agent(request: AgentRegisterRequest):
     trust_score = calculate_trust_score(request.passport, now)
     trust_tier = get_trust_tier(trust_score)
 
+    # Generate Ed25519 keypair for signing
+    private_key_bytes, public_key_bytes = generate_keypair()
+
+    # Sign agent card
+    card_data = {
+        "agent_id": agent_id,
+        "name": request.name,
+        "role": request.role,
+        "capabilities": request.capabilities,
+        "registered_at": now
+    }
+    signed_card = sign_agent_card(card_data, private_key_bytes)
+
     # Store in database
     expires_at = datetime.utcnow() + timedelta(days=settings.access_token_expire_days)
 
@@ -106,13 +126,16 @@ async def register_agent(request: AgentRegisterRequest):
             INSERT INTO agents (
                 id, name, role, capabilities, home_instance, contact,
                 passport_hash, token_hash, trust_score, trust_tier,
+                public_key, signed_card,
                 registered_at, last_seen
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             agent_id, request.name, request.role,
             json.dumps(request.capabilities), request.home,
             request.contact, passport_hash, token_hash,
-            trust_score, trust_tier, now, now
+            trust_score, trust_tier,
+            public_key_bytes, signed_card,
+            now, now
         ))
 
         # Insert passport
@@ -133,8 +156,12 @@ async def register_agent(request: AgentRegisterRequest):
         memory_stats = request.passport.get("memory_stats", {})
         memory_quality = memory_stats.get("proof_count_avg", 0.0)
 
-        # Passport score
-        passport_score = request.passport.get("score", {}).get("total", 0.0)
+        # Passport score - handle both dict and float formats
+        score_data = request.passport.get("score", {})
+        if isinstance(score_data, dict):
+            passport_score = score_data.get("total", 0.0)
+        else:
+            passport_score = score_data if isinstance(score_data, (int, float)) else 0.0
 
         cursor.execute("""
             INSERT INTO passports (
@@ -148,6 +175,25 @@ async def register_agent(request: AgentRegisterRequest):
             belief_stability, memory_quality,
             passport_score, now
         ))
+
+        # Generate and store embedding (optional - only if embeddings available)
+        try:
+            from circus.services.embeddings import embed_agent_profile
+            embedding = embed_agent_profile(
+                request.name,
+                request.role,
+                request.capabilities
+            )
+            # Store both blob (for sqlite-vec) and JSON (for fallback)
+            import numpy as np
+            embedding_array = np.array(embedding, dtype=np.float32)
+            cursor.execute("""
+                INSERT INTO agent_embeddings (agent_id, embedding, embedding_json, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (agent_id, embedding_array.tobytes(), json.dumps(embedding), now))
+        except (ImportError, RuntimeError):
+            # sentence-transformers not installed, skip embeddings
+            pass
 
         conn.commit()
 
@@ -219,8 +265,12 @@ async def refresh_passport(
         memory_stats = request.passport.get("memory_stats", {})
         memory_quality = memory_stats.get("proof_count_avg", 0.0)
 
-        # Passport score
-        passport_score = request.passport.get("score", {}).get("total", 0.0)
+        # Passport score - handle both dict and float formats
+        score_data = request.passport.get("score", {})
+        if isinstance(score_data, dict):
+            passport_score = score_data.get("total", 0.0)
+        else:
+            passport_score = score_data if isinstance(score_data, (int, float)) else 0.0
 
         cursor.execute("""
             INSERT INTO passports (
@@ -296,6 +346,20 @@ async def discover(
 
     agent_responses = []
     for row in rows:
+        # Encode public key if available
+        public_key_str = None
+        try:
+            if row["public_key"]:
+                public_key_str = encode_public_key(row["public_key"])
+        except (KeyError, IndexError):
+            pass
+
+        signed_card_val = None
+        try:
+            signed_card_val = row["signed_card"]
+        except (KeyError, IndexError):
+            pass
+
         agent_responses.append(AgentResponse(
             agent_id=row["id"],
             name=row["name"],
@@ -306,13 +370,58 @@ async def discover(
             trust_tier=row["trust_tier"],
             prediction_accuracy=row["prediction_accuracy"],
             registered_at=row["registered_at"],
-            last_seen=row["last_seen"]
+            last_seen=row["last_seen"],
+            public_key=public_key_str,
+            signed_card=signed_card_val
         ))
 
     return DiscoverResponse(
         agents=agent_responses,
         count=len(agent_responses)
     )
+
+
+@router.get("/audit-log")
+async def get_audit_log(
+    agent_id: str = Depends(verify_token),
+    limit: int = Query(100, ge=1, le=500)
+):
+    """Get audit log (Elders only)."""
+    from circus.services.trust import can_moderate
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Check if agent is Elder
+        cursor.execute("SELECT trust_score FROM agents WHERE id = ?", (agent_id,))
+        row = cursor.fetchone()
+
+        if not row or not can_moderate(row["trust_score"]):
+            raise HTTPException(status_code=403, detail="Requires Elder tier")
+
+        # Get audit log
+        cursor.execute("""
+            SELECT * FROM audit_log
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (limit,))
+
+        logs = []
+        for row in cursor.fetchall():
+            logs.append({
+                "id": row["id"],
+                "agent_id": row["agent_id"],
+                "action": row["action"],
+                "resource_type": row["resource_type"],
+                "resource_id": row["resource_id"],
+                "trust_tier": row["trust_tier"],
+                "allowed": bool(row["allowed"]),
+                "reason": row["reason"],
+                "ip_address": row["ip_address"],
+                "created_at": row["created_at"]
+            })
+
+        return logs
 
 
 @router.get("/{agent_id}", response_model=AgentResponse)
@@ -331,6 +440,20 @@ async def get_agent(agent_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Agent not found")
 
+    # Encode public key if available
+    public_key_str = None
+    try:
+        if row["public_key"]:
+            public_key_str = encode_public_key(row["public_key"])
+    except (KeyError, IndexError):
+        pass
+
+    signed_card_val = None
+    try:
+        signed_card_val = row["signed_card"]
+    except (KeyError, IndexError):
+        pass
+
     return AgentResponse(
         agent_id=row["id"],
         name=row["name"],
@@ -341,7 +464,9 @@ async def get_agent(agent_id: str):
         trust_tier=row["trust_tier"],
         prediction_accuracy=row["prediction_accuracy"],
         registered_at=row["registered_at"],
-        last_seen=row["last_seen"]
+        last_seen=row["last_seen"],
+        public_key=public_key_str,
+        signed_card=signed_card_val
     )
 
 
@@ -489,3 +614,126 @@ async def record_trust_event(
         "new_trust_score": new_trust,
         "new_trust_tier": new_tier
     }
+
+
+@router.get("/{agent_id}/verify")
+async def verify_agent_card(agent_id: str):
+    """Verify agent's signed capability card."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, name, role, capabilities, public_key, signed_card, registered_at
+            FROM agents
+            WHERE id = ?
+        """, (agent_id,))
+        row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if not row["public_key"] or not row["signed_card"]:
+        raise HTTPException(status_code=400, detail="Agent card not signed")
+
+    # Reconstruct card data
+    card_data = {
+        "agent_id": row["id"],
+        "name": row["name"],
+        "role": row["role"],
+        "capabilities": json.loads(row["capabilities"]),
+        "registered_at": row["registered_at"]
+    }
+
+    # Verify signature
+    is_valid = verify_signature(
+        card_data,
+        row["signed_card"],
+        row["public_key"]
+    )
+
+    return {
+        "agent_id": agent_id,
+        "signature_valid": is_valid,
+        "public_key": encode_public_key(row["public_key"]),
+        "signed_card": row["signed_card"]
+    }
+
+
+@router.get("/discover/semantic", response_model=DiscoverResponse)
+async def discover_semantic(
+    q: str = Query(..., min_length=1, description="Natural language search query"),
+    min_similarity: float = Query(0.5, ge=0, le=1, description="Minimum similarity score"),
+    min_trust: float = Query(30.0, ge=0, le=100, description="Minimum trust score"),
+    limit: int = Query(20, ge=1, le=100, description="Maximum results")
+):
+    """
+    Semantic agent discovery using vector similarity.
+
+    Example: "Find agents who help with WhatsApp automation and testing"
+
+    Requires sentence-transformers to be installed. Falls back to keyword search if not available.
+    """
+    try:
+        from circus.services.embeddings import search_similar_agents_vector
+
+        # Get similar agents by embedding
+        similar_agents = search_similar_agents_vector(
+            q,
+            settings.database_path,
+            limit=limit * 2,  # Get more to filter by trust
+            min_score=min_similarity
+        )
+
+        # Fetch full agent data and filter by trust
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            agent_responses = []
+            for agent_id, similarity in similar_agents:
+                cursor.execute("""
+                    SELECT a.*, p.prediction_accuracy
+                    FROM agents a
+                    LEFT JOIN passports p ON a.id = p.agent_id
+                    WHERE a.id = ? AND a.trust_score >= ? AND a.is_active = 1
+                """, (agent_id, min_trust))
+
+                row = cursor.fetchone()
+                if row and len(agent_responses) < limit:
+                    public_key_str = None
+                    try:
+                        if row["public_key"]:
+                            public_key_str = encode_public_key(row["public_key"])
+                    except (KeyError, IndexError):
+                        pass
+
+                    signed_card_val = None
+                    try:
+                        signed_card_val = row["signed_card"]
+                    except (KeyError, IndexError):
+                        pass
+
+                    agent_responses.append(AgentResponse(
+                        agent_id=row["id"],
+                        name=row["name"],
+                        role=row["role"],
+                        capabilities=json.loads(row["capabilities"]),
+                        home_instance=row["home_instance"],
+                        trust_score=row["trust_score"],
+                        trust_tier=row["trust_tier"],
+                        prediction_accuracy=row["prediction_accuracy"],
+                        registered_at=row["registered_at"],
+                        last_seen=row["last_seen"],
+                        public_key=public_key_str,
+                        signed_card=signed_card_val
+                    ))
+
+        return DiscoverResponse(
+            agents=agent_responses,
+            count=len(agent_responses)
+        )
+
+    except (ImportError, RuntimeError) as e:
+        # Fallback to keyword search if embeddings not available
+        raise HTTPException(
+            status_code=501,
+            detail=f"Semantic search not available: {str(e)}. Install with: pip install sentence-transformers"
+        )

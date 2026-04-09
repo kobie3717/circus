@@ -1,6 +1,7 @@
 """Pydantic models for API requests and responses."""
 
 from datetime import datetime
+from enum import Enum
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -83,6 +84,8 @@ class AgentResponse(BaseModel):
     prediction_accuracy: Optional[float] = None
     registered_at: str
     last_seen: str
+    public_key: Optional[str] = None
+    signed_card: Optional[str] = None
 
 
 class AgentRegisterResponse(BaseModel):
@@ -174,3 +177,55 @@ class HealthResponse(BaseModel):
     agents_count: int
     rooms_count: int
     timestamp: str
+    trace_id: Optional[str] = None
+
+
+# Task lifecycle models (Phase 3)
+
+class TaskState(str, Enum):
+    """Task state machine."""
+    SUBMITTED = "submitted"
+    WORKING = "working"
+    INPUT_REQUIRED = "input-required"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
+class TaskSubmitRequest(BaseModel):
+    """Submit task to another agent."""
+    to_agent_id: str = Field(..., min_length=1)
+    task_type: str = Field(..., min_length=1)
+    payload: dict[str, Any] = Field(...)
+    deadline: Optional[str] = None
+
+
+class TaskUpdateRequest(BaseModel):
+    """Update task state."""
+    state: TaskState
+    result: Optional[dict[str, Any]] = None
+    error: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class TaskResponse(BaseModel):
+    """Task response."""
+    task_id: str
+    from_agent_id: str
+    to_agent_id: str
+    task_type: str
+    payload: dict[str, Any]
+    state: TaskState
+    result: Optional[dict[str, Any]] = None
+    error: Optional[str] = None
+    created_at: str
+    updated_at: str
+    deadline: Optional[str] = None
+
+
+class TaskStateTransition(BaseModel):
+    """Task state transition record."""
+    from_state: Optional[TaskState]
+    to_state: TaskState
+    notes: Optional[str]
+    created_at: str

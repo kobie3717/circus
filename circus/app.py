@@ -11,8 +11,11 @@ from fastapi.responses import JSONResponse
 from circus.config import settings
 from circus.database import init_database, seed_default_rooms, get_db
 from circus.models import HealthResponse
-from circus.routes import agents, rooms, handshake
+from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation
 from circus.trust import apply_trust_decay, get_trust_tier
+from circus.middleware.rate_limiter import check_rate_limit
+from circus.middleware.telemetry import setup_tracing, get_current_trace_id
+from circus.middleware.security import security_middleware
 
 
 async def trust_decay_task():
@@ -102,6 +105,9 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Setup OpenTelemetry tracing
+setup_tracing(app)
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -110,6 +116,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Trace ID middleware
+@app.middleware("http")
+async def add_trace_id_header(request: Request, call_next):
+    """Add X-Trace-ID header to all responses."""
+    response = await call_next(request)
+    trace_id = get_current_trace_id()
+    if trace_id:
+        response.headers["X-Trace-ID"] = trace_id
+    return response
+
+
+# Security middleware (OWASP)
+@app.middleware("http")
+async def security_middleware_handler(request: Request, call_next):
+    """Security middleware wrapper."""
+    return await security_middleware(request, call_next)
+
+
+# Rate limiting middleware
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Rate limiting middleware."""
+    await check_rate_limit(request)
+    response = await call_next(request)
+    return response
 
 
 # Exception handlers
@@ -142,12 +175,15 @@ async def health_check():
         cursor.execute("SELECT COUNT(*) FROM rooms")
         rooms_count = cursor.fetchone()[0]
 
+    trace_id = get_current_trace_id()
+
     return HealthResponse(
         status="healthy",
         version=settings.app_version,
         agents_count=agents_count,
         rooms_count=rooms_count,
-        timestamp=datetime.utcnow().isoformat()
+        timestamp=datetime.utcnow().isoformat(),
+        trace_id=trace_id
     )
 
 
@@ -155,6 +191,75 @@ async def health_check():
 app.include_router(agents.router, prefix="/api/v1/agents", tags=["Agents"])
 app.include_router(rooms.router, prefix="/api/v1/rooms", tags=["Rooms"])
 app.include_router(handshake.router, prefix="/api/v1", tags=["Handshake"])
+app.include_router(sse.router, prefix="/api/v1", tags=["SSE"])
+app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["Tasks"])
+app.include_router(credentials.router, prefix="/api/v1/credentials", tags=["Credentials"])
+app.include_router(federation.router, prefix="/api/v1/federation", tags=["Federation"])
+
+
+@app.get("/.well-known/agent.json", tags=["A2A"])
+async def agent_card():
+    """A2A Protocol agent card (RFC 9110 /.well-known/)."""
+    return {
+        "name": "The Circus",
+        "description": "Agent commons with AI-IQ passport-based identity and trust",
+        "url": "https://circus.whatshubb.co.za",
+        "version": settings.app_version,
+        "capabilities": [
+            "agent-registry",
+            "trust-scoring",
+            "memory-sharing",
+            "p2p-handshake",
+            "passport-verification",
+            "room-based-collaboration",
+            "sse-streaming",
+            "ed25519-signing",
+            "semantic-discovery",
+            "a2a-task-lifecycle",
+            "trust-portability",
+            "federation-trqp",
+            "audit-logging"
+        ],
+        "authentication": {
+            "methods": ["bearer"],
+            "bearer": {
+                "scheme": "JWT",
+                "description": "Register via POST /api/v1/agents/register to obtain token"
+            }
+        },
+        "endpoints": {
+            "register": "/api/v1/agents/register",
+            "discover": "/api/v1/agents/discover",
+            "discover_semantic": "/api/v1/agents/discover/semantic",
+            "verify_signature": "/api/v1/agents/{agent_id}/verify",
+            "rooms": "/api/v1/rooms",
+            "handshake": "/api/v1/handshake",
+            "sse_stream": "/api/v1/rooms/{room_id}/stream",
+            "tasks": "/api/v1/tasks",
+            "task_inbox": "/api/v1/tasks/inbox",
+            "credentials": "/api/v1/credentials/trust-attestation",
+            "federation_discover": "/api/v1/federation/discover",
+            "audit_log": "/api/v1/agents/audit-log"
+        },
+        "protocols": ["A2A", "MCP"],
+        "signing": {
+            "algorithm": "Ed25519",
+            "description": "All agent capability declarations are signed with Ed25519"
+        },
+        "trust_tiers": [
+            {"tier": "Newcomer", "min_score": 0, "max_score": settings.trust_tier_newcomer_max},
+            {"tier": "Established", "min_score": settings.trust_tier_newcomer_max, "max_score": settings.trust_tier_established_max},
+            {"tier": "Trusted", "min_score": settings.trust_tier_established_max, "max_score": settings.trust_tier_trusted_max},
+            {"tier": "Elder", "min_score": settings.trust_tier_trusted_max, "max_score": 100}
+        ],
+        "rate_limits": {
+            "Newcomer": "100 req/hr",
+            "Established": "500 req/hr",
+            "Trusted": "2000 req/hr",
+            "Elder": "10000 req/hr",
+            "Anonymous": "30 req/hr"
+        }
+    }
 
 
 @app.get("/", tags=["System"])
@@ -166,9 +271,11 @@ async def root():
         "description": "Agent commons and registry with AI-IQ passport-based identity",
         "docs": "/docs",
         "health": "/health",
+        "agent_card": "/.well-known/agent.json",
         "api_endpoints": {
             "agents": "/api/v1/agents",
             "rooms": "/api/v1/rooms",
-            "handshake": "/api/v1/handshake"
+            "handshake": "/api/v1/handshake",
+            "sse": "/api/v1/rooms/{room_id}/stream"
         }
     }
