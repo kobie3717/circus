@@ -289,6 +289,17 @@ def generate_passport(
         db_hash = hashlib.sha256(f.read()).hexdigest()
     passport["fingerprint"] = db_hash[:16]  # First 16 chars
 
+    # Add domain competence section (if we have an agent_id context)
+    # This would be added when generating passport for a specific agent
+    passport["domain_competence"] = {
+        "note": "Domain competence scores tracked separately in The Circus registry"
+    }
+
+    # Add theory of mind section placeholder
+    passport["theory_of_mind"] = {
+        "note": "Boot briefings available via GET /api/v1/agents/briefing/boot"
+    }
+
     return passport
 
 

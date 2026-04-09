@@ -15,7 +15,10 @@ from circus.models import (
     AgentRegisterRequest,
     AgentRegisterResponse,
     AgentResponse,
+    BootBriefingResponse,
+    CompetenceObservationRequest,
     DiscoverResponse,
+    DomainCompetence,
     PassportRefreshRequest,
     PassportRefreshResponse,
     VouchRequest,
@@ -32,6 +35,25 @@ from circus.services.signing import (
 )
 
 router = APIRouter()
+
+
+def get_agent_competence_list(agent_id: str) -> list[DomainCompetence] | None:
+    """Helper to get competence list for an agent."""
+    try:
+        from circus.services.briefing import get_agent_competence
+        competencies = get_agent_competence(agent_id)
+        if competencies:
+            return [
+                DomainCompetence(
+                    domain=c["domain"],
+                    score=c["score"],
+                    observations=c["observations"]
+                )
+                for c in competencies[:5]  # Top 5 domains
+            ]
+    except Exception:
+        pass
+    return None
 
 
 def create_access_token(agent_id: str, expires_delta: timedelta) -> str:
@@ -372,7 +394,8 @@ async def discover(
             registered_at=row["registered_at"],
             last_seen=row["last_seen"],
             public_key=public_key_str,
-            signed_card=signed_card_val
+            signed_card=signed_card_val,
+            competence=get_agent_competence_list(row["id"])
         ))
 
     return DiscoverResponse(
@@ -466,7 +489,8 @@ async def get_agent(agent_id: str):
         registered_at=row["registered_at"],
         last_seen=row["last_seen"],
         public_key=public_key_str,
-        signed_card=signed_card_val
+        signed_card=signed_card_val,
+        competence=get_agent_competence_list(row["id"])
     )
 
 
@@ -723,7 +747,8 @@ async def discover_semantic(
                         registered_at=row["registered_at"],
                         last_seen=row["last_seen"],
                         public_key=public_key_str,
-                        signed_card=signed_card_val
+                        signed_card=signed_card_val,
+                        competence=get_agent_competence_list(row["id"])
                     ))
 
         return DiscoverResponse(
@@ -737,3 +762,119 @@ async def discover_semantic(
             status_code=501,
             detail=f"Semantic search not available: {str(e)}. Install with: pip install sentence-transformers"
         )
+
+
+@router.post("/{agent_id}/competence")
+async def record_competence(
+    agent_id: str,
+    request: CompetenceObservationRequest,
+    current_agent_id: str = Depends(verify_token)
+):
+    """
+    Record a competence observation for an agent.
+
+    Updates the agent's domain-specific competence score using weighted moving average.
+    Agents can only record observations for themselves, or Elders can record for any agent.
+    """
+    from circus.services.briefing import record_competence_observation
+
+    # Check permissions
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT trust_score FROM agents WHERE id = ?", (current_agent_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Current agent not found")
+
+        # Allow self-recording or Elder tier
+        from circus.services.trust import can_moderate
+        if agent_id != current_agent_id and not can_moderate(row["trust_score"]):
+            raise HTTPException(
+                status_code=403,
+                detail="Can only record competence for yourself (or Elder tier required)"
+            )
+
+    # Validate domain
+    valid_domains = [
+        "coding", "research", "monitoring", "testing",
+        "planning", "creative", "devops", "communication"
+    ]
+    if request.domain not in valid_domains:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid domain. Must be one of: {', '.join(valid_domains)}"
+        )
+
+    # Record observation
+    result = record_competence_observation(
+        agent_id,
+        request.domain,
+        request.success,
+        request.weight
+    )
+
+    return {
+        "agent_id": agent_id,
+        "domain": result["domain"],
+        "new_score": result["score"],
+        "observations": result["observations"],
+        "updated_at": result["last_updated"]
+    }
+
+
+@router.get("/{agent_id}/competence")
+async def get_agent_competence_scores(agent_id: str):
+    """Get all domain competence scores for an agent."""
+    from circus.services.briefing import get_agent_competence
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM agents WHERE id = ?", (agent_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+    competencies = get_agent_competence(agent_id)
+
+    return {
+        "agent_id": agent_id,
+        "competencies": competencies,
+        "count": len(competencies)
+    }
+
+
+@router.get("/briefing/boot", response_model=BootBriefingResponse)
+async def get_boot_briefing():
+    """
+    Generate a theory-of-mind boot briefing.
+
+    Returns a structured summary of who's good at what across all agents,
+    so a booting agent knows who to delegate to.
+    """
+    from circus.services.briefing import generate_boot_briefing
+    from circus.models import AgentCompetenceSummary
+
+    briefing_data = generate_boot_briefing()
+
+    # Convert to Pydantic models
+    agents = [
+        AgentCompetenceSummary(
+            name=agent["name"],
+            agent_id=agent["agent_id"],
+            top_domains=[
+                DomainCompetence(
+                    domain=d["domain"],
+                    score=d["score"],
+                    observations=d["observations"]
+                )
+                for d in agent["top_domains"]
+            ]
+        )
+        for agent in briefing_data["agents"]
+    ]
+
+    return BootBriefingResponse(
+        briefing=briefing_data["briefing"],
+        agents=agents,
+        generated_at=briefing_data["generated_at"]
+    )

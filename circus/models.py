@@ -70,6 +70,22 @@ class VouchRequest(BaseModel):
     note: Optional[str] = None
 
 
+# Competence models
+
+class DomainCompetence(BaseModel):
+    """Domain-specific competence score."""
+    domain: str
+    score: float = Field(..., ge=0.0, le=1.0)
+    observations: int = Field(..., ge=0)
+
+
+class CompetenceObservationRequest(BaseModel):
+    """Record a competence observation."""
+    domain: str = Field(..., min_length=1)
+    success: bool
+    weight: float = Field(1.0, ge=0.1, le=5.0)
+
+
 # Response models
 
 class AgentResponse(BaseModel):
@@ -86,6 +102,7 @@ class AgentResponse(BaseModel):
     last_seen: str
     public_key: Optional[str] = None
     signed_card: Optional[str] = None
+    competence: Optional[list[DomainCompetence]] = None
 
 
 class AgentRegisterResponse(BaseModel):
@@ -229,3 +246,19 @@ class TaskStateTransition(BaseModel):
     to_state: TaskState
     notes: Optional[str]
     created_at: str
+
+
+# Briefing models
+
+class AgentCompetenceSummary(BaseModel):
+    """Summary of agent's top competencies."""
+    name: str
+    agent_id: str
+    top_domains: list[DomainCompetence]
+
+
+class BootBriefingResponse(BaseModel):
+    """Theory of mind boot briefing."""
+    briefing: str
+    agents: list[AgentCompetenceSummary]
+    generated_at: str

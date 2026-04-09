@@ -312,6 +312,24 @@ def init_database(db_path: Optional[Path] = None) -> None:
         )
     """)
 
+    # Agent competence table (per-domain scoring)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS agent_competence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            score REAL DEFAULT 0.5,
+            observations INTEGER DEFAULT 0,
+            last_updated TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+            UNIQUE(agent_id, domain)
+        )
+    """)
+
+    # Create indexes for competence table
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_competence_agent_id ON agent_competence(agent_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_competence_domain ON agent_competence(domain)")
+
     # Try to enable sqlite-vec if available
     try:
         conn.enable_load_extension(True)

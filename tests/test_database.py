@@ -46,7 +46,7 @@ def test_database_initialization(temp_db):
             expected_tables = {
                 "agents", "passports", "rooms", "room_members",
                 "shared_memories", "trust_events", "vouches", "handshakes",
-                "agents_fts", "rooms_fts"
+                "agents_fts", "rooms_fts", "agent_competence", "agent_embeddings"
             }
 
             assert expected_tables.issubset(tables)

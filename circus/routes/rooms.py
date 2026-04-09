@@ -9,6 +9,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from circus.database import get_db
 from circus.models import (
+    AgentCompetenceSummary,
+    BootBriefingResponse,
+    DomainCompetence,
     MemoryResponse,
     MemoryShareRequest,
     MemoryShareResponse,
@@ -273,3 +276,45 @@ async def list_rooms(
             ))
 
         return rooms
+
+
+@router.get("/{room_id}/briefing", response_model=BootBriefingResponse)
+async def get_room_briefing(room_id: str):
+    """
+    Generate a theory-of-mind briefing for a specific room.
+
+    Returns competency summary for all members of the room.
+    """
+    from circus.services.briefing import generate_boot_briefing
+
+    # Verify room exists
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM rooms WHERE id = ?", (room_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Room not found")
+
+    briefing_data = generate_boot_briefing(room_id=room_id)
+
+    # Convert to Pydantic models
+    agents = [
+        AgentCompetenceSummary(
+            name=agent["name"],
+            agent_id=agent["agent_id"],
+            top_domains=[
+                DomainCompetence(
+                    domain=d["domain"],
+                    score=d["score"],
+                    observations=d["observations"]
+                )
+                for d in agent["top_domains"]
+            ]
+        )
+        for agent in briefing_data["agents"]
+    ]
+
+    return BootBriefingResponse(
+        briefing=briefing_data["briefing"],
+        agents=agents,
+        generated_at=briefing_data["generated_at"]
+    )

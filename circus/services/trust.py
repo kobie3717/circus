@@ -10,7 +10,8 @@ def calculate_trust_score(
     belief_stability: float,
     memory_quality: float,
     passport_score: float,
-    days_active: int
+    days_active: int,
+    agent_id: str | None = None
 ) -> float:
     """
     Calculate trust score (0-100) from passport metrics.
@@ -21,6 +22,7 @@ def calculate_trust_score(
         memory_quality: 0-1 (normalized proof count + graph connections)
         passport_score: 0-10 (AI-IQ composite score)
         days_active: Number of days since registration
+        agent_id: Optional agent ID to factor in competence bonus
 
     Returns:
         Trust score (0-100)
@@ -58,6 +60,19 @@ def calculate_trust_score(
         passport_score_norm,
         longevity_score
     ])
+
+    # Competence bonus (up to +10 points)
+    # Agents with high competence across multiple domains get a trust boost
+    if agent_id:
+        try:
+            from circus.services.briefing import calculate_average_competence
+            avg_competence = calculate_average_competence(agent_id)
+            # Map 0.5-1.0 competence to 0-10 bonus points
+            competence_bonus = (avg_competence - 0.5) * 20 if avg_competence > 0.5 else 0.0
+            total_score += competence_bonus
+        except Exception:
+            # If competence calculation fails, skip bonus
+            pass
 
     # Clamp to 0-100
     return max(0.0, min(100.0, total_score))
