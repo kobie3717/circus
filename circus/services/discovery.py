@@ -104,10 +104,13 @@ def search_agents_fts(
 
         query = """
             SELECT a.*, p.prediction_accuracy
-            FROM agents_fts f
-            JOIN agents a ON f.agent_id = a.id
+            FROM agents a
             LEFT JOIN passports p ON a.id = p.agent_id
-            WHERE agents_fts MATCH ? AND a.trust_score >= ? AND a.is_active = 1
+            WHERE a.id IN (
+                SELECT agent_id FROM agents_fts WHERE agents_fts MATCH ?
+            )
+            AND a.trust_score >= ?
+            AND a.is_active = 1
             ORDER BY a.trust_score DESC
             LIMIT ?
         """

@@ -3,7 +3,7 @@
 import json
 import secrets
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from jose import JWTError, jwt
@@ -18,9 +18,11 @@ from circus.models import (
     DiscoverResponse,
     PassportRefreshRequest,
     PassportRefreshResponse,
+    VouchRequest,
+    VouchResponse,
 )
 from circus.passport import calculate_passport_hash
-from circus.trust import calculate_trust_score, get_trust_tier
+from circus.trust import calculate_trust_score, calculate_trust_delta, can_vouch, get_trust_tier
 
 router = APIRouter()
 
@@ -57,13 +59,21 @@ def verify_token(authorization: str = Header(...)) -> str:
 async def register_agent(request: AgentRegisterRequest):
     """Register a new agent with AI-IQ passport."""
     # Validate passport structure
-    required_fields = ["agent_name", "generated_at", "passport_score"]
+    required_fields = ["identity", "score"]
     for field in required_fields:
         if field not in request.passport:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid passport: missing field '{field}'"
             )
+
+    # Validate identity structure
+    identity = request.passport.get("identity", {})
+    if "name" not in identity:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid passport: identity.name is required"
+        )
 
     # Generate agent ID
     agent_id = f"{request.name.lower().replace(' ', '-')}-{secrets.token_hex(3)}"
@@ -106,11 +116,25 @@ async def register_agent(request: AgentRegisterRequest):
         ))
 
         # Insert passport
-        prediction_accuracy = request.passport.get("predictions", {}).get("accuracy", 0.0)
-        belief_stability = request.passport.get("beliefs", {}).get("stability", 1.0)
-        memory_quality_data = request.passport.get("memory_quality", {})
-        memory_quality = memory_quality_data.get("proof_count_avg", 0.0)
-        passport_score = request.passport.get("passport_score", {}).get("total", 0.0)
+        # Calculate prediction accuracy from confirmed/refuted
+        predictions = request.passport.get("predictions", {})
+        confirmed = predictions.get("confirmed", 0)
+        refuted = predictions.get("refuted", 0)
+        total_predictions = confirmed + refuted
+        prediction_accuracy = confirmed / total_predictions if total_predictions > 0 else 0.5
+
+        # Belief stability (lower contradictions = higher stability)
+        beliefs = request.passport.get("beliefs", {})
+        total_beliefs = beliefs.get("total", 1)
+        contradictions = beliefs.get("contradictions", 0)
+        belief_stability = 1.0 - (contradictions / total_beliefs) if total_beliefs > 0 else 1.0
+
+        # Memory quality from memory_stats
+        memory_stats = request.passport.get("memory_stats", {})
+        memory_quality = memory_stats.get("proof_count_avg", 0.0)
+
+        # Passport score
+        passport_score = request.passport.get("score", {}).get("total", 0.0)
 
         cursor.execute("""
             INSERT INTO passports (
@@ -178,11 +202,25 @@ async def refresh_passport(
         """, (passport_hash, trust_score, trust_tier, now, agent_id))
 
         # Insert new passport
-        prediction_accuracy = request.passport.get("predictions", {}).get("accuracy", 0.0)
-        belief_stability = request.passport.get("beliefs", {}).get("stability", 1.0)
-        memory_quality_data = request.passport.get("memory_quality", {})
-        memory_quality = memory_quality_data.get("proof_count_avg", 0.0)
-        passport_score = request.passport.get("passport_score", {}).get("total", 0.0)
+        # Calculate prediction accuracy from confirmed/refuted
+        predictions = request.passport.get("predictions", {})
+        confirmed = predictions.get("confirmed", 0)
+        refuted = predictions.get("refuted", 0)
+        total_predictions = confirmed + refuted
+        prediction_accuracy = confirmed / total_predictions if total_predictions > 0 else 0.5
+
+        # Belief stability (lower contradictions = higher stability)
+        beliefs = request.passport.get("beliefs", {})
+        total_beliefs = beliefs.get("total", 1)
+        contradictions = beliefs.get("contradictions", 0)
+        belief_stability = 1.0 - (contradictions / total_beliefs) if total_beliefs > 0 else 1.0
+
+        # Memory quality from memory_stats
+        memory_stats = request.passport.get("memory_stats", {})
+        memory_quality = memory_stats.get("proof_count_avg", 0.0)
+
+        # Passport score
+        passport_score = request.passport.get("score", {}).get("total", 0.0)
 
         cursor.execute("""
             INSERT INTO passports (
@@ -227,18 +265,21 @@ async def discover(
 
         if capability:
             # Search by capability using FTS
+            # For FTS5, we need to search in the capabilities column specifically
+            # Escape and quote the search term for FTS5
+            fts_query = f'capabilities: "{capability}"'
             cursor.execute("""
                 SELECT a.*, p.prediction_accuracy
                 FROM agents a
                 LEFT JOIN passports p ON a.id = p.agent_id
                 WHERE a.id IN (
-                    SELECT agent_id FROM agents_fts WHERE capabilities MATCH ?
+                    SELECT agent_id FROM agents_fts WHERE agents_fts MATCH ?
                 )
                 AND a.trust_score >= ?
                 AND a.is_active = 1
                 ORDER BY a.trust_score DESC
                 LIMIT ?
-            """, (capability, min_trust, limit))
+            """, (fts_query, min_trust, limit))
         else:
             # List all agents above trust threshold
             cursor.execute("""
@@ -302,3 +343,149 @@ async def get_agent(agent_id: str):
         registered_at=row["registered_at"],
         last_seen=row["last_seen"]
     )
+
+
+@router.post("/{agent_id}/vouch", response_model=VouchResponse)
+async def vouch_for_agent(
+    agent_id: str,
+    request: VouchRequest,
+    current_agent_id: str = Depends(verify_token)
+):
+    """Vouch for another agent (costs trust to the voucher, benefits the vouchee)."""
+    target_agent_id = request.target_agent_id
+
+    # Can't vouch for yourself
+    if current_agent_id == target_agent_id:
+        raise HTTPException(status_code=400, detail="Cannot vouch for yourself")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get voucher's trust score
+        cursor.execute("SELECT trust_score FROM agents WHERE id = ?", (current_agent_id,))
+        voucher_row = cursor.fetchone()
+        if not voucher_row:
+            raise HTTPException(status_code=404, detail="Voucher not found")
+
+        voucher_trust = voucher_row["trust_score"]
+
+        # Check if voucher has permission
+        if not can_vouch(voucher_trust):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient trust to vouch (requires Trusted tier or higher)"
+            )
+
+        # Get target agent
+        cursor.execute("SELECT trust_score FROM agents WHERE id = ?", (target_agent_id,))
+        target_row = cursor.fetchone()
+        if not target_row:
+            raise HTTPException(status_code=404, detail="Target agent not found")
+
+        # Check if vouch already exists
+        cursor.execute("""
+            SELECT id FROM vouches
+            WHERE from_agent_id = ? AND to_agent_id = ?
+        """, (current_agent_id, target_agent_id))
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="Already vouched for this agent")
+
+        # Calculate trust deltas
+        target_delta = calculate_trust_delta("vouch_received")
+        voucher_cost = calculate_trust_delta("vouch_given")  # This is negative
+
+        now = datetime.utcnow().isoformat()
+
+        # Insert vouch record
+        cursor.execute("""
+            INSERT INTO vouches (from_agent_id, to_agent_id, weight, note, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (current_agent_id, target_agent_id, target_delta, request.note, now))
+
+        vouch_id = cursor.lastrowid
+
+        # Update target agent's trust score
+        new_target_trust = target_row["trust_score"] + target_delta
+        cursor.execute("""
+            UPDATE agents SET trust_score = ?, trust_tier = ? WHERE id = ?
+        """, (new_target_trust, get_trust_tier(new_target_trust), target_agent_id))
+
+        # Update voucher's trust score
+        new_voucher_trust = voucher_trust + voucher_cost
+        cursor.execute("""
+            UPDATE agents SET trust_score = ?, trust_tier = ? WHERE id = ?
+        """, (new_voucher_trust, get_trust_tier(new_voucher_trust), current_agent_id))
+
+        # Log trust events
+        cursor.execute("""
+            INSERT INTO trust_events (agent_id, event_type, delta, reason, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (target_agent_id, "vouch_received", target_delta, f"Vouched by {current_agent_id}", now))
+
+        cursor.execute("""
+            INSERT INTO trust_events (agent_id, event_type, delta, reason, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (current_agent_id, "vouch_given", voucher_cost, f"Vouched for {target_agent_id}", now))
+
+        conn.commit()
+
+    return VouchResponse(
+        vouch_id=vouch_id,
+        target_trust_delta=target_delta,
+        your_trust_cost=voucher_cost
+    )
+
+
+@router.post("/{agent_id}/trust-event")
+async def record_trust_event(
+    agent_id: str,
+    event_type: str,
+    context: dict[str, Any] | None = None,
+    current_agent_id: str = Depends(verify_token)
+):
+    """Record a trust event and update agent's trust score."""
+    # For now, allow agents to record their own trust events
+    # In production, this should be admin-only or restricted
+    if agent_id != current_agent_id:
+        raise HTTPException(status_code=403, detail="Can only record trust events for yourself")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get current trust score
+        cursor.execute("SELECT trust_score FROM agents WHERE id = ?", (agent_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        current_trust = row["trust_score"]
+
+        # Calculate trust delta
+        context = context or {}
+        context["current_trust"] = current_trust
+        delta = calculate_trust_delta(event_type, context)
+
+        # Update trust score
+        new_trust = max(0.0, min(100.0, current_trust + delta))
+        new_tier = get_trust_tier(new_trust)
+
+        cursor.execute("""
+            UPDATE agents SET trust_score = ?, trust_tier = ? WHERE id = ?
+        """, (new_trust, new_tier, agent_id))
+
+        # Log trust event
+        now = datetime.utcnow().isoformat()
+        cursor.execute("""
+            INSERT INTO trust_events (agent_id, event_type, delta, reason, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (agent_id, event_type, delta, json.dumps(context), now))
+
+        conn.commit()
+
+    return {
+        "agent_id": agent_id,
+        "event_type": event_type,
+        "delta": delta,
+        "new_trust_score": new_trust,
+        "new_trust_tier": new_tier
+    }

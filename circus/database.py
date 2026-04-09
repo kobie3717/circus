@@ -152,30 +152,28 @@ def init_database(db_path: Optional[Path] = None) -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_handshakes_agents ON handshakes(agent_a_id, agent_b_id)")
 
     # Create FTS5 virtual table for agent search
+    # Standalone FTS table (not content-based) for simplicity
     cursor.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS agents_fts USING fts5(
             agent_id UNINDEXED,
             name,
             role,
-            capabilities,
-            content=agents,
-            content_rowid=rowid
+            capabilities
         )
     """)
 
     # Create FTS5 virtual table for room search
+    # Standalone FTS table (not content-based) for simplicity
     cursor.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS rooms_fts USING fts5(
             room_id UNINDEXED,
             name,
             slug,
-            description,
-            content=rooms,
-            content_rowid=rowid
+            description
         )
     """)
 
-    # Triggers to keep FTS tables in sync
+    # Triggers to keep FTS tables in sync (standalone FTS tables)
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS agents_fts_insert AFTER INSERT ON agents BEGIN
             INSERT INTO agents_fts(agent_id, name, role, capabilities)
@@ -191,9 +189,9 @@ def init_database(db_path: Optional[Path] = None) -> None:
 
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS agents_fts_update AFTER UPDATE ON agents BEGIN
-            DELETE FROM agents_fts WHERE agent_id = old.id;
-            INSERT INTO agents_fts(agent_id, name, role, capabilities)
-            VALUES (new.id, new.name, new.role, new.capabilities);
+            UPDATE agents_fts
+            SET name = new.name, role = new.role, capabilities = new.capabilities
+            WHERE agent_id = new.id;
         END
     """)
 
@@ -212,9 +210,9 @@ def init_database(db_path: Optional[Path] = None) -> None:
 
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS rooms_fts_update AFTER UPDATE ON rooms BEGIN
-            DELETE FROM rooms_fts WHERE room_id = old.id;
-            INSERT INTO rooms_fts(room_id, name, slug, description)
-            VALUES (new.id, new.name, new.slug, new.description);
+            UPDATE rooms_fts
+            SET name = new.name, slug = new.slug, description = new.description
+            WHERE room_id = new.id;
         END
     """)
 

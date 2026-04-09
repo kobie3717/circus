@@ -168,3 +168,66 @@ def get_vouch_cost(trust_score: float) -> float:
     if trust_score >= settings.trust_tier_trusted_max:
         return 0.0  # Elders vouch for free
     return 2.0
+
+
+def log_trust_event(
+    agent_id: str,
+    event_type: str,
+    delta: float,
+    reason: str = ""
+) -> None:
+    """
+    Log a trust event for an agent.
+
+    Args:
+        agent_id: Agent ID
+        event_type: Type of trust event
+        delta: Trust score change
+        reason: Optional reason for the event
+    """
+    from circus.database import get_db
+    from datetime import datetime
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        cursor.execute("""
+            INSERT INTO trust_events (agent_id, event_type, delta, reason, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (agent_id, event_type, delta, reason, now))
+        conn.commit()
+
+
+def get_trust_history(agent_id: str, limit: int = 100) -> list[dict]:
+    """
+    Get trust event history for an agent.
+
+    Args:
+        agent_id: Agent ID
+        limit: Maximum number of events to return
+
+    Returns:
+        List of trust events
+    """
+    from circus.database import get_db
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT event_type, delta, reason, created_at
+            FROM trust_events
+            WHERE agent_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (agent_id, limit))
+
+        events = []
+        for row in cursor.fetchall():
+            events.append({
+                "event_type": row["event_type"],
+                "delta": row["delta"],
+                "reason": row["reason"],
+                "created_at": row["created_at"]
+            })
+
+        return events

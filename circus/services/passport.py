@@ -62,18 +62,31 @@ def extract_passport_info(passport: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_passport(passport: dict[str, Any]) -> bool:
-    """Validate passport structure."""
-    required_fields = ["identity", "capabilities", "memory_stats"]
+def validate_passport(passport: dict[str, Any], raise_error: bool = False) -> bool:
+    """
+    Validate passport structure.
+
+    Args:
+        passport: Passport data to validate
+        raise_error: If True, raise ValueError on validation failure. If False, return False.
+
+    Returns:
+        True if valid, False otherwise (when raise_error=False)
+    """
+    required_fields = ["identity", "score"]
 
     for field in required_fields:
         if field not in passport:
-            raise ValueError(f"Missing required passport field: {field}")
+            if raise_error:
+                raise ValueError(f"Missing required passport field: {field}")
+            return False
 
     # Validate identity
     identity = passport.get("identity", {})
-    if "name" not in identity or "role" not in identity:
-        raise ValueError("Passport identity must include name and role")
+    if "name" not in identity:
+        if raise_error:
+            raise ValueError("Passport identity must include name")
+        return False
 
     return True
 

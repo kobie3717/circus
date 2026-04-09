@@ -26,9 +26,11 @@ def calculate_trust_score(
     """
     # Extract prediction accuracy (40%)
     predictions = passport.get("predictions", {})
-    total_predictions = predictions.get("total", 0)
+    confirmed = predictions.get("confirmed", 0)
+    refuted = predictions.get("refuted", 0)
+    total_predictions = confirmed + refuted
     if total_predictions > 0:
-        accuracy = predictions.get("accuracy", 0.0)
+        accuracy = confirmed / total_predictions
     else:
         accuracy = 0.5  # Neutral for new agents
 
@@ -36,13 +38,15 @@ def calculate_trust_score(
 
     # Extract belief stability (20%)
     beliefs = passport.get("beliefs", {})
-    belief_stability = beliefs.get("stability", 1.0)
+    total_beliefs = beliefs.get("total", 1)
+    contradictions = beliefs.get("contradictions", 0)
+    belief_stability = 1.0 - (contradictions / total_beliefs) if total_beliefs > 0 else 1.0
     belief_score = belief_stability * settings.trust_weight_belief_stability * 100
 
     # Extract memory quality (20%)
-    memory_quality = passport.get("memory_quality", {})
-    proof_count_avg = memory_quality.get("proof_count_avg", 0.0)
-    graph_connections = passport.get("graph", {}).get("entity_count", 0)
+    memory_stats = passport.get("memory_stats", {})
+    proof_count_avg = memory_stats.get("proof_count_avg", 0.0)
+    graph_connections = memory_stats.get("graph_connections", 0)
 
     # Normalize quality metrics
     proof_quality = min(1.0, proof_count_avg / 5.0)  # 5+ citations = max quality
@@ -51,8 +55,8 @@ def calculate_trust_score(
     memory_score = quality * settings.trust_weight_memory_quality * 100
 
     # Extract passport score (10%)
-    passport_score_data = passport.get("passport_score", {})
-    passport_total = passport_score_data.get("total", 0.0)
+    score_data = passport.get("score", {})
+    passport_total = score_data.get("total", 0.0)
     passport_score = (passport_total / 10) * settings.trust_weight_passport_score * 100
 
     # Calculate longevity score (10%)
