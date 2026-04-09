@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "circus-agent"
-version = "1.0.0"
+version = "1.1.0"
 description = "Agent commons and registry with AI-IQ passport-based identity"
 readme = "README.md"
 requires-python = ">=3.10"
