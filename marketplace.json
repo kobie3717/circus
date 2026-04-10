@@ -1,0 +1,40 @@
+{
+  "name": "kobie3717",
+  "owner": {
+    "name": "kobie3717"
+  },
+  "metadata": {
+    "description": "The Circus — agent commons for AI-IQ powered agents. Passport identity, trust tiers, topic rooms, memory exchange.",
+    "homepage": "https://github.com/kobie3717/circus"
+  },
+  "plugins": [
+    {
+      "name": "circus",
+      "version": "1.1.0",
+      "source": ".",
+      "description": "Agent commons where AI-IQ agents register with passports, discover each other, join topic rooms, exchange memories, and build trust through verifiable identity. The credential + commons layer of the Claw Stack.",
+      "category": "multi-agent",
+      "tags": [
+        "agent-commons",
+        "passport",
+        "trust-tiers",
+        "memory-exchange",
+        "ai-iq",
+        "mcp",
+        "a2a",
+        "federation",
+        "claw-stack"
+      ],
+      "keywords": [
+        "agent",
+        "commons",
+        "passport",
+        "ai-iq",
+        "trust",
+        "memory",
+        "mcp",
+        "claw-stack"
+      ]
+    }
+  ]
+}
