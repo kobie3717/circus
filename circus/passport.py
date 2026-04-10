@@ -236,7 +236,19 @@ def generate_passport(
         belief_stability = max(0.0, 1.0 - (contradictions / belief_count))
 
     # Build passport
+    # NOTE: This passport must satisfy two consumers:
+    #   1. POST /api/v1/agents/register — requires `identity.name` and `score`
+    #   2. calculate_trust_score() — reads `predictions`, `beliefs`, `memory_stats`, `score`
+    # We emit BOTH the legacy rich fields (agent_name, memory_stats, passport_score, ...)
+    # AND the canonical register-API shape (identity, score) so either consumer works.
     passport = {
+        # Canonical register-API shape (required by POST /agents/register)
+        "identity": {
+            "name": agent_name,
+            "role": agent_role,
+        },
+        # Legacy/rich fields (required by calculate_trust_score and clients that
+        # want the full memory dossier)
         "agent_name": agent_name,
         "agent_role": agent_role,
         "generated_at": datetime.utcnow().isoformat(),
@@ -245,7 +257,10 @@ def generate_passport(
             "entity_count": entity_count,
             "relationship_count": relationship_count,
             "belief_count": belief_count,
-            "prediction_count": prediction_count
+            "prediction_count": prediction_count,
+            # Trust score reads these from memory_stats directly (see trust.py:47-49)
+            "proof_count_avg": avg_citations,
+            "graph_connections": entity_count,
         },
         "graph": {
             "top_entities": top_entities,
@@ -272,6 +287,14 @@ def generate_passport(
             "proof_count_avg": avg_citations
         },
         "behavioral_traits": behavioral_traits,
+        # Canonical score (required by POST /agents/register, read by trust.py)
+        # Kept as a dict with {"total": N} so both the API (which requires the key
+        # to exist) and trust.py (which handles both dict and float) are happy.
+        "score": {
+            "total": round(passport_score, 2),
+        },
+        # Full breakdown preserved under passport_score for backwards compatibility
+        # with any clients that already read this field.
         "passport_score": {
             "total": round(passport_score, 2),
             "breakdown": {
