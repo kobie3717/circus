@@ -515,7 +515,31 @@ def run_v3_migration(db_path: Optional[Path] = None) -> None:
 
 @contextmanager
 def get_db() -> Generator[sqlite3.Connection, None, None]:
-    """Get database connection context manager."""
+    """Get database connection context manager.
+
+    IMPORTANT — COMMIT DISCIPLINE:
+    This context manager does NOT auto-commit on exit. Writes require an
+    explicit `conn.commit()` before the context block ends, or they will
+    be silently dropped when the connection closes.
+
+    On exception inside the block, SQLite rolls back the open transaction
+    automatically when the connection closes — no explicit rollback needed,
+    but nothing will have persisted either.
+
+    Pattern for writes:
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT ...", (...))
+            conn.commit()   # REQUIRED — do not omit
+
+    Pattern for reads: no commit needed.
+
+    Violating this is the single most common "why didn't it persist?"
+    failure mode in this codebase. If you add a new module that writes
+    through get_db(), also add at least one test that reads the row back
+    to prove the commit landed.
+    """
     conn = sqlite3.connect(str(settings.database_path))
     conn.row_factory = sqlite3.Row
     try:
