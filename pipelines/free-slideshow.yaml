@@ -1,0 +1,49 @@
+# Free Slideshow Pipeline
+# Stack: Pexels (free images) + gTTS (Google TTS) + FFmpeg (assembly)
+# Cost: $0.00
+
+name: free-slideshow
+description: Text → voiced MP4 slideshow using free tools only
+
+inputs:
+  title: "Auction item title or topic"
+  description: "Narration script (1-3 sentences)"
+  keywords: "Comma-separated search keywords for Pexels images"
+  output_path: "/tmp/output.mp4"
+
+stages:
+  - id: fetch_images
+    tool: pexels_fetch
+    description: "Pull 3-5 free stock images matching keywords"
+    inputs:
+      query: "{{ inputs.keywords }}"
+      count: 4
+
+  - id: generate_audio
+    tool: gtts_speak
+    description: "Convert description to MP3 voiceover via Google TTS"
+    inputs:
+      text: "{{ inputs.title }}. {{ inputs.description }}"
+      lang: "en"
+      output: "/tmp/narration.mp3"
+
+  - id: assemble
+    tool: ffmpeg_slideshow
+    description: "Combine images + audio into MP4 with Ken Burns effect"
+    inputs:
+      images: "{{ stages.fetch_images.output }}"
+      audio: "{{ stages.generate_audio.output }}"
+      output: "{{ inputs.output_path }}"
+      fps: 25
+      image_duration: 3.0
+
+outputs:
+  video: "{{ stages.assemble.output }}"
+  duration_seconds: "{{ stages.assemble.duration }}"
+
+examples:
+  whatsauction_item:
+    title: "Lot 42 — 2019 BMW 3-Series"
+    description: "Excellent condition, 45,000 km. Bidding starts at R85,000. Auction closes Friday at 8 PM."
+    keywords: "BMW luxury car sedan"
+    output_path: "/tmp/lot42-preview.mp4"

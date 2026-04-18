@@ -1,5 +1,5 @@
 """API routes for The Circus."""
 
-from circus.routes import agents, rooms, handshake
+from circus.routes import agents, rooms, handshake, memory_commons
 
-__all__ = ["agents", "rooms", "handshake"]
+__all__ = ["agents", "rooms", "handshake", "memory_commons"]

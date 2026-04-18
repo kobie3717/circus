@@ -69,13 +69,15 @@ def test_seed_default_rooms(temp_db):
             cursor.execute("SELECT COUNT(*) FROM rooms")
             count = cursor.fetchone()[0]
 
-            assert count == len(settings.default_rooms)
+            # Should have default_rooms + memory-commons
+            assert count == len(settings.default_rooms) + 1
 
             # Check room slugs
             cursor.execute("SELECT slug FROM rooms")
             slugs = {row[0] for row in cursor.fetchall()}
 
-            assert slugs == set(settings.default_rooms)
+            expected_slugs = set(settings.default_rooms) | {"memory-commons"}
+            assert slugs == expected_slugs
     finally:
         settings.database_path = original_path
 

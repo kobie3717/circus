@@ -16,6 +16,9 @@ def init_database(db_path: Optional[Path] = None) -> None:
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
 
+    # Run v2 migration after base schema
+    is_new_db = not db_path.exists() or db_path.stat().st_size == 0
+
     # Agents table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS agents (
@@ -356,6 +359,75 @@ def init_database(db_path: Optional[Path] = None) -> None:
     conn.commit()
     conn.close()
 
+    # Run v2 migration for Memory Commons
+    run_v2_migration(db_path)
+
+
+def run_v2_migration(db_path: Optional[Path] = None) -> None:
+    """Run Memory Commons v2 migration."""
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v2_memory_commons.sql"
+
+    if not migration_file.exists():
+        return  # Migration file not found, skip
+
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+
+    # Read and execute migration SQL using executescript (handles multi-statement SQL)
+    with open(migration_file, 'r') as f:
+        migration_sql = f.read()
+
+    cursor.executescript(migration_sql)
+
+    # Add columns to shared_memories if they don't exist
+    # Check which columns exist
+    cursor.execute("PRAGMA table_info(shared_memories)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    columns_to_add = {
+        'privacy_tier': "ALTER TABLE shared_memories ADD COLUMN privacy_tier TEXT DEFAULT 'team' CHECK(privacy_tier IN ('private', 'team', 'public'))",
+        'hop_count': "ALTER TABLE shared_memories ADD COLUMN hop_count INTEGER DEFAULT 1",
+        'original_author': "ALTER TABLE shared_memories ADD COLUMN original_author TEXT",
+        'confidence': "ALTER TABLE shared_memories ADD COLUMN confidence REAL DEFAULT 1.0",
+        'age_days': "ALTER TABLE shared_memories ADD COLUMN age_days INTEGER DEFAULT 0",
+        'derived_from': "ALTER TABLE shared_memories ADD COLUMN derived_from TEXT",
+        'effective_confidence': "ALTER TABLE shared_memories ADD COLUMN effective_confidence REAL"
+    }
+
+    for col_name, alter_sql in columns_to_add.items():
+        if col_name not in existing_columns:
+            cursor.execute(alter_sql)
+
+    # Create index on privacy_tier if it doesn't exist
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_privacy_tier ON shared_memories(privacy_tier)")
+
+    # Add columns to federation_peers if they don't exist
+    cursor.execute("PRAGMA table_info(federation_peers)")
+    existing_peer_columns = {row[1] for row in cursor.fetchall()}
+
+    peer_columns_to_add = {
+        'memory_sync_enabled': "ALTER TABLE federation_peers ADD COLUMN memory_sync_enabled INTEGER DEFAULT 1",
+        'last_memory_sync': "ALTER TABLE federation_peers ADD COLUMN last_memory_sync TEXT",
+        'min_trust_for_sync': "ALTER TABLE federation_peers ADD COLUMN min_trust_for_sync REAL DEFAULT 30.0"
+    }
+
+    for col_name, alter_sql in peer_columns_to_add.items():
+        if col_name not in existing_peer_columns:
+            cursor.execute(alter_sql)
+
+    # Ensure room-memory-commons exists (required for Memory Commons feature)
+    now = datetime.utcnow().isoformat()
+    cursor.execute("""
+        INSERT OR IGNORE INTO rooms (id, name, slug, description, created_by, is_public, created_at)
+        VALUES ('room-memory-commons', '#Memory Commons',
+                'memory-commons', 'Goal-driven memory sharing and semantic routing',
+                'circus-system', 1, ?)
+    """, (now,))
+
+    conn.commit()
+    conn.close()
+
 
 @contextmanager
 def get_db() -> Generator[sqlite3.Connection, None, None]:
@@ -394,6 +466,21 @@ def seed_default_rooms() -> None:
             system_agent_id, "Circus System", "system", "[]",
             "https://circus.whatshubb.co.za", "system", "system",
             100.0, "Elder", now, now
+        ))
+
+        # Create memory-commons special room (for goal-routed memories)
+        cursor.execute("""
+            INSERT OR IGNORE INTO rooms (
+                id, name, slug, description, created_by, is_public, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "room-memory-commons",
+            "#Memory Commons",
+            "memory-commons",
+            "Goal-driven memory sharing and semantic routing",
+            system_agent_id,
+            1,
+            now
         ))
 
         # Create default rooms
