@@ -191,3 +191,67 @@ class TestReviewFixes:
         assert row[2] == "memory-commons"
 
         conn.close()
+
+    def test_fix5_list_goals_excludes_expired_and_inactive(
+        self, client, temp_db, established_agent
+    ):
+        """FIX 5: GET /goals must match router semantics — only active + unexpired.
+
+        Reviewer caught a mismatch: list query filtered only by agent_id while
+        the router filters by is_active=1 AND (expires_at IS NULL OR > now).
+        This test locks in listing=router parity so 'listed but not routable'
+        ghost goals can't reappear.
+        """
+        from datetime import datetime, timedelta
+        from circus.routes.agents import verify_token
+
+        agent_id = "established-test-456"
+
+        def override_auth():
+            return agent_id
+
+        app.dependency_overrides[verify_token] = override_auth
+
+        conn = sqlite3.connect(str(temp_db))
+        cursor = conn.cursor()
+
+        now = datetime.utcnow()
+        past = (now - timedelta(hours=1)).isoformat()
+        future = (now + timedelta(hours=24)).isoformat()
+        now_iso = now.isoformat()
+
+        # Seed 4 goals:
+        #   active-future: routable + should list
+        #   active-never-expires: routable + should list
+        #   active-expired: NOT routable → should NOT list
+        #   inactive-future: NOT routable → should NOT list
+        cursor.executemany(
+            """
+            INSERT INTO goal_subscriptions (
+                id, agent_id, goal_description, goal_embedding,
+                min_confidence, is_active, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("goal-active-future", agent_id, "routable future goal",
+                 b"", 0.0, 1, now_iso, future),
+                ("goal-active-never", agent_id, "routable no-expiry goal",
+                 b"", 0.0, 1, now_iso, None),
+                ("goal-active-expired", agent_id, "stale goal past expiry",
+                 b"", 0.0, 1, now_iso, past),
+                ("goal-inactive-future", agent_id, "soft-deleted goal",
+                 b"", 0.0, 0, now_iso, future),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        try:
+            response = client.get("/api/v1/memory-commons/goals")
+            assert response.status_code == 200
+            returned_ids = {g["id"] for g in response.json()}
+            assert returned_ids == {"goal-active-future", "goal-active-never"}, (
+                f"GET /goals returned stale/inactive goals: {returned_ids}"
+            )
+        finally:
+            app.dependency_overrides.clear()

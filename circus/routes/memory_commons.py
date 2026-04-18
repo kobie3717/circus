@@ -164,8 +164,10 @@ async def list_goals(
                    created_at, expires_at, is_active
             FROM goal_subscriptions
             WHERE agent_id = ?
+              AND is_active = 1
+              AND (expires_at IS NULL OR expires_at > ?)
             ORDER BY created_at DESC
-        """, (agent_id,))
+        """, (agent_id, datetime.utcnow().isoformat()))
 
         goals = []
         for row in cursor.fetchall():
