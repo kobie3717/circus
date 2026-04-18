@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     goal_similarity_threshold: float = 0.6
     embedding_model: str = "all-MiniLM-L6-v2"
 
+    # Week 2: Conflict detection and domain authority
+    conflict_detection_enabled: bool = True
+    max_domains_per_agent: int = 5
+    conflict_similarity_threshold: float = 0.8
+
     # CORS
     cors_origins: list[str] = [
         "http://localhost:3000",

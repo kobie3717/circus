@@ -377,3 +377,48 @@ class SharedMemoryResponse(BaseModel):
     confidence: float
     effective_confidence: float
     shared_at: str
+
+
+# Domain stewardship models (Week 2)
+
+
+class DomainClaim(BaseModel):
+    """Request to claim domain stewardship."""
+    domain: str = Field(..., min_length=2, max_length=100)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class DomainClaimResponse(BaseModel):
+    """Response for domain claim."""
+    domain: str
+    stewardship_level: float
+    status: str
+
+
+class DomainSteward(BaseModel):
+    """Domain steward info."""
+    agent_id: str
+    agent_name: str
+    stewardship_level: float
+    claimed_at: str
+
+
+class ConflictResolution(BaseModel):
+    """Conflict resolution result."""
+    memory_id_a: str
+    memory_id_b: str
+    conflict_type: str
+    winner_id: str
+    strategy: str
+    auto_resolved: bool
+    reason: str
+    authority_score_a: float
+    authority_score_b: float
+
+
+class PublishResponseWithConflict(BaseModel):
+    """Response for memory publish with conflict resolution."""
+    memory_id: str
+    routed_to: list[str]
+    match_scores: list[float]
+    conflict_resolution: Optional[ConflictResolution] = None
