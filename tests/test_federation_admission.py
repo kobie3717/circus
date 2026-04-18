@@ -242,18 +242,26 @@ def test_admit_malformed_bundle_missing_peer_id(test_db):
     assert "peer_id" in result.detail
 
 
-def test_admit_malformed_bundle_missing_bundle_id(test_db):
-    """Bundle missing bundle_id should be hard-rejected."""
+def test_admit_missing_bundle_id_auto_derives(test_db):
+    """Bundle missing bundle_id is no longer malformed — it auto-derives.
+
+    Per Sub-step 3.4 design §4.1: if bundle_id is absent, derive from
+    sha256(canonicalize_for_signing(bundle))[:16]. Absence is NOT a hard reject.
+    The bundle still flows through the pipeline and fails at the next
+    applicable verifier (here: no peer registered → quarantined as passport_unknown
+    or similar). The test only pins the contract: missing bundle_id ≠ malformed.
+    """
     now = datetime.utcnow()
-    bundle = {"peer_id": "peer-test-001"}  # No bundle_id
+    bundle = {"peer_id": "peer-test-001"}  # No bundle_id, no passport, no signature
 
     result = admit_bundle(bundle, now=now)
 
+    # bundle_id is derived (not None) even though the bundle didn't provide one
+    assert result.bundle_id is not None
+    assert len(result.bundle_id) == 16  # sha256 prefix per design §4.1
+    # Admission still fails — but NOT for missing bundle_id
     assert result.admitted is False
-    assert result.decision == "rejected"
-    assert result.reason == "malformed_bundle"
-    assert result.stage_reached == "peer_lookup"
-    assert "bundle_id" in result.detail
+    assert result.reason != "malformed_bundle"
 
 
 def test_admit_passport_peer_mismatch(test_db, registered_peer, valid_bundle, valid_keypair):
@@ -487,38 +495,69 @@ def test_quarantine_and_audit_atomic(test_db, registered_peer, valid_bundle, val
     assert metadata["quarantine_id"] == result.quarantine_id
 
 
-def test_audit_always_written_on_decision(test_db, registered_peer, signed_bundle):
-    """Every terminal decision must produce exactly one audit row."""
+def test_audit_written_on_non_skip_decisions(test_db, registered_peer, valid_bundle, valid_keypair):
+    """Every terminal decision EXCEPT 'skipped' must produce exactly one audit row.
+
+    Per Sub-step 3.4 design §6.1: transport-dedup skip returns early before
+    persistence — no audit row for replay events (would flood audit log).
+    Admitted / rejected / quarantined all write audit as in 3.3.
+
+    Each sub-case uses a distinct bundle (different canonical bytes) so transport
+    dedup does not collide across sub-cases within a single test run.
+    """
     peer_id, _ = registered_peer
+    private_key_bytes, _ = valid_keypair
+    private_key = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
     now = datetime.utcnow()
 
-    # Test admitted case
-    result1 = admit_bundle(signed_bundle, now=now)
+    def _sign(bundle):
+        canonical = canonicalize_for_signing(bundle)
+        sig = base64.b64encode(private_key.sign(canonical)).decode("ascii")
+        return {**bundle, "signature": sig}
+
+    # Sub-case 1: admitted — use valid_bundle, signed
+    admitted_bundle = _sign({**valid_bundle, "bundle_id": "bundle-audit-admitted"})
+    result1 = admit_bundle(admitted_bundle, now=now)
+    assert result1.decision == "admitted"
     assert result1.audit_id is not None
 
     cursor = test_db.cursor()
     cursor.execute("SELECT COUNT(*) FROM federation_audit WHERE id = ?", (result1.audit_id,))
     assert cursor.fetchone()[0] == 1
 
-    # Test hard-reject case
-    bundle_no_sig = {**signed_bundle}
-    del bundle_no_sig["signature"]
+    # Sub-case 2: rejected — distinct bundle_id, no signature → signature_malformed
+    bundle_no_sig = {**valid_bundle, "bundle_id": "bundle-audit-rejected"}
+    # No signature attached
     result2 = admit_bundle(bundle_no_sig, now=now)
+    assert result2.decision == "rejected"
     assert result2.audit_id is not None
 
     cursor.execute("SELECT COUNT(*) FROM federation_audit WHERE id = ?", (result2.audit_id,))
     assert cursor.fetchone()[0] == 1
 
-    # Test quarantine case
-    bundle_expired = {**signed_bundle}
-    bundle_expired["passport"]["expires_at"] = (now - timedelta(days=1)).isoformat()
-    result3 = admit_bundle(bundle_expired, now=now)
+    # Sub-case 3: quarantined — distinct bundle_id, expired passport
+    quarantined_raw = {**valid_bundle, "bundle_id": "bundle-audit-quarantined"}
+    quarantined_raw["passport"] = {**valid_bundle["passport"]}
+    quarantined_raw["passport"]["expires_at"] = (now - timedelta(days=1)).isoformat()
+    quarantined_bundle = _sign(quarantined_raw)
+    result3 = admit_bundle(quarantined_bundle, now=now)
+    assert result3.decision == "quarantined"
     assert result3.audit_id is not None
 
     cursor.execute("SELECT COUNT(*) FROM federation_audit WHERE id = ?", (result3.audit_id,))
     assert cursor.fetchone()[0] == 1
 
-    # Total audit rows: 3
+    # Total audit rows from the three terminal decisions: 3
+    cursor.execute("SELECT COUNT(*) FROM federation_audit")
+    assert cursor.fetchone()[0] == 3
+
+    # Sub-case 4: skipped — re-send the admitted bundle identically → skipped, NO audit.
+    result4 = admit_bundle(admitted_bundle, now=now)
+    assert result4.decision == "skipped"
+    assert result4.reason == "bundle_replay"
+    assert result4.audit_id is None
+
+    # Audit row count unchanged — skipped did not audit
     cursor.execute("SELECT COUNT(*) FROM federation_audit")
     assert cursor.fetchone()[0] == 3
 

@@ -363,6 +363,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v2_migration(db_path)
     # Run v3 migration for Federation
     run_v3_migration(db_path)
+    # Run v4 migration for Federation dedup
+    run_v4_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -508,6 +510,36 @@ def run_v3_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v3 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v4_migration(db_path: Optional[Path] = None) -> None:
+    """Run Memory Commons v4 migration (federation_bundles_seen for transport dedup)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v4_bundles_seen.sql"
+
+    if not migration_file.exists():
+        return  # Migration file not found, skip
+
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+
+    try:
+        # Execute migration SQL (idempotent via IF NOT EXISTS)
+        with open(migration_file, 'r') as f:
+            migration_sql = f.read()
+        cursor.executescript(migration_sql)
+
+        conn.commit()
+        logger.info("v4 federation migration: federation_bundles_seen table created")
+    except Exception as e:
+        conn.rollback()
+        logger.error("v4 migration failed: %s", e)
         raise
     finally:
         conn.close()
