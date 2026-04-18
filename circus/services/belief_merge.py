@@ -123,7 +123,7 @@ def detect_conflict(
                     memory_b_id=new_memory["id"],
                     conflict_type="self-contradiction",
                     similarity=similarity,
-                    domain=new_memory.get("category"),  # TEMPORARY (Week 2): Use category as domain until explicit domain field added. Remove in Week 3. See spec §6.1.
+                    domain=new_memory["domain"],
                 )
             else:
                 # Same author, high similarity, no negation = update
@@ -132,7 +132,7 @@ def detect_conflict(
                     memory_b_id=new_memory["id"],
                     conflict_type="update",
                     similarity=similarity,
-                    domain=new_memory.get("category"),  # TEMPORARY (Week 2): Use category as domain until explicit domain field added. Remove in Week 3. See spec §6.1.
+                    domain=new_memory["domain"],
                 )
 
         # Different authors with negation difference = contradiction
@@ -142,7 +142,7 @@ def detect_conflict(
                 memory_b_id=new_memory["id"],
                 conflict_type="contradiction",
                 similarity=similarity,
-                domain=new_memory.get("category"),  # TEMPORARY (Week 2): Use category as domain until explicit domain field added. Remove in Week 3. See spec §6.1.
+                domain=new_memory["domain"],
             )
 
         # High similarity, no negation difference = refinement
@@ -152,7 +152,7 @@ def detect_conflict(
                 memory_b_id=new_memory["id"],
                 conflict_type="refinement",
                 similarity=similarity,
-                domain=new_memory.get("category"),  # TEMPORARY (Week 2): Use category as domain until explicit domain field added. Remove in Week 3. See spec §6.1.
+                domain=new_memory["domain"],
             )
 
     return None
@@ -191,8 +191,7 @@ def resolve_conflict(
     author_a = memory_a["from_agent_id"]
     author_b = memory_b["from_agent_id"]
 
-    # TEMPORARY (Week 2): Use category as domain until explicit domain field added. Remove in Week 3. See spec §6.1.
-    logger.info("Using category '%s' as domain fallback", domain)
+    logger.debug("Resolving conflict on domain '%s'", domain)
 
     # Get stewardship levels for registered stewards in this domain
     cursor.execute(

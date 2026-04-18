@@ -32,6 +32,7 @@ from circus.models import (
 from circus.services.goal_router import goal_router
 from circus.services.provenance import decay_confidence
 from circus.services.belief_merge import detect_conflict, resolve_conflict, apply_merge
+from circus.services.domain_validation import validate_domain, InvalidDomainError
 
 import asyncio
 import json
@@ -201,11 +202,21 @@ async def publish_memory(
 
     Memory is routed to matching goal subscriptions via SSE.
     Week 2: Applies confidence decay and detects conflicts.
+    Week 3: Domain field is required and validated.
     """
     if not settings.memory_commons_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Memory Commons is disabled"
+        )
+
+    # Week 3: Validate domain field (required, regex-validated)
+    try:
+        normalized_domain = validate_domain(mem_req.domain)
+    except InvalidDomainError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid domain: {str(e)}"
         )
 
     with get_db() as conn:
@@ -262,15 +273,16 @@ async def publish_memory(
         # Insert into shared_memories (use memory-commons room)
         cursor.execute("""
             INSERT INTO shared_memories (
-                id, room_id, from_agent_id, content, category, tags, provenance,
+                id, room_id, from_agent_id, content, category, domain, tags, provenance,
                 privacy_tier, hop_count, original_author, confidence,
                 age_days, effective_confidence, shared_at, trust_verified
-            ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0)
+            ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0)
         """, (
             memory_id,
             agent_id,
             mem_req.content,
             mem_req.category,
+            normalized_domain,
             json.dumps(mem_req.tags or []),
             json.dumps(provenance_data),
             mem_req.privacy_tier,
@@ -286,7 +298,7 @@ async def publish_memory(
         if settings.conflict_detection_enabled:
             # Fetch recent memories in same category for conflict detection
             cursor.execute("""
-                SELECT id, from_agent_id, content, category, confidence, shared_at
+                SELECT id, from_agent_id, content, category, domain, confidence, shared_at
                 FROM shared_memories
                 WHERE category = ?
                   AND id != ?
@@ -301,8 +313,9 @@ async def publish_memory(
                     "from_agent_id": row[1],
                     "content": row[2],
                     "category": row[3],
-                    "confidence": row[4],
-                    "shared_at": row[5],
+                    "domain": row[4],
+                    "confidence": row[5],
+                    "shared_at": row[6],
                 }
                 for row in cursor.fetchall()
             ]
@@ -312,6 +325,7 @@ async def publish_memory(
                 "from_agent_id": agent_id,
                 "content": mem_req.content,
                 "category": mem_req.category,
+                "domain": normalized_domain,
                 "confidence": mem_req.confidence,
                 "shared_at": now.isoformat(),
             }
@@ -321,7 +335,7 @@ async def publish_memory(
             if conflict_info:
                 # Fetch full memory data for resolution
                 cursor.execute("""
-                    SELECT id, from_agent_id, content, category, confidence, shared_at
+                    SELECT id, from_agent_id, content, category, domain, confidence, shared_at
                     FROM shared_memories
                     WHERE id = ?
                 """, (conflict_info.memory_a_id,))
@@ -331,16 +345,17 @@ async def publish_memory(
                     "from_agent_id": row[1],
                     "content": row[2],
                     "category": row[3],
-                    "confidence": row[4],
-                    "shared_at": row[5],
+                    "domain": row[4],
+                    "confidence": row[5],
+                    "shared_at": row[6],
                 }
 
-                # Resolve conflict
+                # Resolve conflict (domain is now required)
                 resolution = resolve_conflict(
                     conn,
                     memory_a,
                     new_memory,
-                    conflict_info.domain or mem_req.category
+                    conflict_info.domain
                 )
 
                 # Record conflict in belief_conflicts table

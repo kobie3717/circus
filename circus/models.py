@@ -301,6 +301,7 @@ class MemoryPublish(BaseModel):
     """Request to publish a memory."""
     content: str = Field(..., min_length=10, max_length=5000)
     category: str = Field(..., min_length=2, max_length=50)
+    domain: str = Field(..., min_length=1, max_length=50)
     tags: Optional[list[str]] = Field(default=None)
     privacy_tier: str = Field(default="team", pattern="^(private|team|public)$")
     provenance: Optional[ProvenanceInfo] = Field(default=None)
