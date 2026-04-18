@@ -17,14 +17,21 @@ from circus.models import (
     GoalInfo,
     MemoryPublish,
     PublishResponse,
+    PublishResponseWithConflict,
     ConnectedEvent,
     MemoryEvent,
     GoalExpiredEvent,
     HeartbeatEvent,
     AgentInfo,
     ProvenanceEvent,
+    DomainClaim,
+    DomainClaimResponse,
+    DomainSteward,
+    ConflictResolution,
 )
 from circus.services.goal_router import goal_router
+from circus.services.provenance import decay_confidence
+from circus.services.belief_merge import detect_conflict, resolve_conflict, apply_merge
 
 import asyncio
 import json
@@ -184,7 +191,7 @@ async def list_goals(
         return goals
 
 
-@router.post("/publish", response_model=PublishResponse)
+@router.post("/publish", response_model=PublishResponseWithConflict)
 async def publish_memory(
     mem_req: MemoryPublish,
     agent_id: str = Depends(verify_token)
@@ -193,6 +200,7 @@ async def publish_memory(
     Publish a memory to the commons.
 
     Memory is routed to matching goal subscriptions via SSE.
+    Week 2: Applies confidence decay and detects conflicts.
     """
     if not settings.memory_commons_enabled:
         raise HTTPException(
@@ -243,6 +251,14 @@ async def publish_memory(
             if mem_req.provenance.reasoning:
                 provenance_data["reasoning"] = mem_req.provenance.reasoning
 
+        # Compute effective_confidence with decay (hop=1, age=0 at publish time)
+        effective_conf = decay_confidence(
+            base_confidence=mem_req.confidence,
+            hop_count=1,
+            age_seconds=0.0,
+            author_trust_score=trust_score
+        )
+
         # Insert into shared_memories (use memory-commons room)
         cursor.execute("""
             INSERT INTO shared_memories (
@@ -260,10 +276,111 @@ async def publish_memory(
             mem_req.privacy_tier,
             agent_id,
             mem_req.confidence,
-            mem_req.confidence,  # effective_confidence = confidence at hop=1
+            effective_conf,
             now.isoformat()
         ))
         conn.commit()
+
+        # Week 2: Conflict detection
+        conflict_result = None
+        if settings.conflict_detection_enabled:
+            # Fetch recent memories in same category for conflict detection
+            cursor.execute("""
+                SELECT id, from_agent_id, content, category, confidence, shared_at
+                FROM shared_memories
+                WHERE category = ?
+                  AND id != ?
+                  AND privacy_tier IN ('public', 'team')
+                ORDER BY shared_at DESC
+                LIMIT 50
+            """, (mem_req.category, memory_id))
+
+            existing_memories = [
+                {
+                    "id": row[0],
+                    "from_agent_id": row[1],
+                    "content": row[2],
+                    "category": row[3],
+                    "confidence": row[4],
+                    "shared_at": row[5],
+                }
+                for row in cursor.fetchall()
+            ]
+
+            new_memory = {
+                "id": memory_id,
+                "from_agent_id": agent_id,
+                "content": mem_req.content,
+                "category": mem_req.category,
+                "confidence": mem_req.confidence,
+                "shared_at": now.isoformat(),
+            }
+
+            conflict_info = detect_conflict(new_memory, existing_memories)
+
+            if conflict_info:
+                # Fetch full memory data for resolution
+                cursor.execute("""
+                    SELECT id, from_agent_id, content, category, confidence, shared_at
+                    FROM shared_memories
+                    WHERE id = ?
+                """, (conflict_info.memory_a_id,))
+                row = cursor.fetchone()
+                memory_a = {
+                    "id": row[0],
+                    "from_agent_id": row[1],
+                    "content": row[2],
+                    "category": row[3],
+                    "confidence": row[4],
+                    "shared_at": row[5],
+                }
+
+                # Resolve conflict
+                resolution = resolve_conflict(
+                    conn,
+                    memory_a,
+                    new_memory,
+                    conflict_info.domain or mem_req.category
+                )
+
+                # Record conflict in belief_conflicts table
+                cursor.execute("""
+                    INSERT INTO belief_conflicts (
+                        memory_id_a, memory_id_b, conflict_type, detected_at,
+                        resolution, resolved_at, resolved_by_agent_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    conflict_info.memory_a_id,
+                    conflict_info.memory_b_id,
+                    conflict_info.conflict_type,
+                    now.isoformat(),
+                    resolution.strategy if resolution.auto_resolved else None,
+                    now.isoformat() if resolution.auto_resolved else None,
+                    agent_id if resolution.auto_resolved else None,
+                ))
+                conn.commit()
+
+                # Apply merge if auto-resolved
+                if resolution.auto_resolved:
+                    apply_merge(
+                        conn,
+                        resolution.winner_id,
+                        resolution.loser_id,
+                        resolution.strategy
+                    )
+
+                # Build conflict result for response
+                conflict_result = ConflictResolution(
+                    memory_id_a=conflict_info.memory_a_id,
+                    memory_id_b=conflict_info.memory_b_id,
+                    conflict_type=conflict_info.conflict_type,
+                    winner_id=resolution.winner_id,
+                    strategy=resolution.strategy,
+                    auto_resolved=resolution.auto_resolved,
+                    reason=resolution.reason,
+                    authority_score_a=resolution.authority_score_a,
+                    authority_score_b=resolution.authority_score_b,
+                )
 
         # Semantic routing: find matching goals
         matches = goal_router.find_matching_goals(
@@ -295,10 +412,11 @@ async def publish_memory(
                 match_score=match['match_score']
             )
 
-        return PublishResponse(
+        return PublishResponseWithConflict(
             memory_id=memory_id,
             routed_to=[m['goal_id'] for m in matches],
-            match_scores=[m['match_score'] for m in matches]
+            match_scores=[m['match_score'] for m in matches],
+            conflict_resolution=conflict_result
         )
 
 
@@ -449,3 +567,165 @@ async def _broadcast_to_goal(goal_id: str, event: BaseModel):
             await queue.put(event_dict)
         except Exception:
             pass
+
+
+# Domain stewardship endpoints (Week 2)
+
+
+@router.post("/domains/claim", response_model=DomainClaimResponse)
+async def claim_domain(
+    claim_req: DomainClaim,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Claim stewardship of a domain.
+
+    Requires Established+ tier (trust_score >= 30).
+    Max 5 domains per agent.
+    """
+    if not settings.memory_commons_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Memory Commons is disabled"
+        )
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Check trust tier
+        cursor.execute("SELECT trust_score FROM agents WHERE id = ?", (agent_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Agent not found"
+            )
+
+        if row[0] < settings.trust_tier_newcomer_max:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Established tier or higher required to claim domains"
+            )
+
+        # Check domain count limit
+        cursor.execute("""
+            SELECT COUNT(*) FROM agent_domains WHERE agent_id = ?
+        """, (agent_id,))
+        domain_count = cursor.fetchone()[0]
+
+        if domain_count >= settings.max_domains_per_agent:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Maximum {settings.max_domains_per_agent} domains per agent"
+            )
+
+        # Insert or update claim
+        now = datetime.utcnow().isoformat()
+        try:
+            cursor.execute("""
+                INSERT INTO agent_domains (
+                    agent_id, domain, stewardship_level, claim_reason,
+                    claimed_at, last_updated
+                ) VALUES (?, ?, 0.5, ?, ?, ?)
+            """, (
+                agent_id,
+                claim_req.domain,
+                claim_req.reason,
+                now,
+                now
+            ))
+            conn.commit()
+            status_msg = "claimed"
+        except sqlite3.IntegrityError:
+            # Already claimed by this agent, update reason
+            cursor.execute("""
+                UPDATE agent_domains
+                SET claim_reason = ?, last_updated = ?
+                WHERE agent_id = ? AND domain = ?
+            """, (claim_req.reason, now, agent_id, claim_req.domain))
+            conn.commit()
+            status_msg = "updated"
+
+        # Fetch current stewardship level
+        cursor.execute("""
+            SELECT stewardship_level FROM agent_domains
+            WHERE agent_id = ? AND domain = ?
+        """, (agent_id, claim_req.domain))
+        stewardship_level = cursor.fetchone()[0]
+
+        return DomainClaimResponse(
+            domain=claim_req.domain,
+            stewardship_level=stewardship_level,
+            status=status_msg
+        )
+
+
+@router.get("/domains/{domain}/stewards", response_model=list[DomainSteward])
+async def get_domain_stewards(
+    domain: str,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Get stewards for a domain.
+
+    Returns agents ordered by stewardship level (highest first).
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT ad.agent_id, a.name, ad.stewardship_level, ad.claimed_at
+            FROM agent_domains ad
+            JOIN agents a ON ad.agent_id = a.id
+            WHERE ad.domain = ?
+            ORDER BY ad.stewardship_level DESC
+        """, (domain,))
+
+        stewards = []
+        for row in cursor.fetchall():
+            stewards.append(DomainSteward(
+                agent_id=row[0],
+                agent_name=row[1],
+                stewardship_level=row[2],
+                claimed_at=row[3]
+            ))
+
+        return stewards
+
+
+@router.delete("/domains/{claim_id}")
+async def release_domain_claim(
+    claim_id: int,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Release a domain claim.
+
+    Agent can only release their own claims.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Verify ownership
+        cursor.execute("""
+            SELECT agent_id FROM agent_domains WHERE id = ?
+        """, (claim_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Domain claim not found"
+            )
+
+        if row[0] != agent_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to release this claim"
+            )
+
+        # Delete claim
+        cursor.execute("DELETE FROM agent_domains WHERE id = ?", (claim_id,))
+        conn.commit()
+
+        return {"status": "released", "claim_id": claim_id}

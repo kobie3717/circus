@@ -301,3 +301,120 @@ class TestMemoryCommonsE2E:
             assert response.status_code == 429
         finally:
             app.dependency_overrides.clear()
+
+    def test_ship_gate_w2_belief_merge(self, client, temp_db, friday_agent, claw_agent):
+        """
+        Week 2 ship gate test: Domain authority conflict resolution.
+
+        Scenario:
+        1. Friday (steward of "user-preferences") publishes "Kobus prefers Afrikaans"
+        2. Claw (non-steward) publishes "Kobus prefers English"
+        3. System detects conflict
+        4. Friday wins by domain authority
+        5. belief_conflicts table records resolution
+        6. Claw's memory marked as superseded
+        """
+        from circus.routes.agents import verify_token
+
+        # Friday claims user-preferences domain
+        conn = sqlite3.connect(str(temp_db))
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO agent_domains (
+                agent_id, domain, stewardship_level, claim_reason, claimed_at, last_updated
+            ) VALUES (
+                'friday-test-456', 'user-preferences', 0.8,
+                'Primary maintainer of user preferences', datetime('now'), datetime('now')
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        # Step 1: Friday publishes first memory
+        def friday_auth():
+            return "friday-test-456"
+
+        app.dependency_overrides[verify_token] = friday_auth
+
+        friday_response = client.post(
+            "/api/v1/memory-commons/publish",
+            json={
+                "content": "User prefers terse replies and concise communication style",
+                "category": "user-preferences",
+                "tags": ["user", "communication", "preferences"],
+                "privacy_tier": "team",
+                "confidence": 0.85
+            }
+        )
+
+        assert friday_response.status_code == 200
+        friday_memory_id = friday_response.json()["memory_id"]
+
+        app.dependency_overrides.clear()
+
+        # Step 2: Claw publishes conflicting memory (with negation)
+        def claw_auth():
+            return "claw-test-123"
+
+        app.dependency_overrides[verify_token] = claw_auth
+
+        claw_response = client.post(
+            "/api/v1/memory-commons/publish",
+            json={
+                "content": "User does not prefer terse replies and likes detailed communication style",
+                "category": "user-preferences",
+                "tags": ["user", "communication", "preferences"],
+                "privacy_tier": "team",
+                "confidence": 0.9  # Higher confidence, but no stewardship
+            }
+        )
+
+        assert claw_response.status_code == 200
+        claw_data = claw_response.json()
+        claw_memory_id = claw_data["memory_id"]
+
+        # Step 3: Verify conflict was detected
+        assert "conflict_resolution" in claw_data
+        conflict = claw_data["conflict_resolution"]
+
+        # Step 4: Verify Friday won by domain authority
+        assert conflict is not None, "Conflict should have been detected"
+        assert conflict["winner_id"] == friday_memory_id, "Friday should win as domain steward"
+        assert conflict["conflict_type"] in ["contradiction", "refinement"]
+        assert conflict["auto_resolved"] is True, "Should auto-resolve with clear authority gap"
+        assert "stewardship" in conflict["reason"].lower() or "authority" in conflict["reason"].lower()
+
+        app.dependency_overrides.clear()
+
+        # Step 5: Verify belief_conflicts table records resolution
+        conn = sqlite3.connect(str(temp_db))
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT memory_id_a, memory_id_b, conflict_type, resolution, resolved_at
+            FROM belief_conflicts
+            WHERE (memory_id_a = ? OR memory_id_b = ?)
+              AND (memory_id_a = ? OR memory_id_b = ?)
+        """, (friday_memory_id, friday_memory_id, claw_memory_id, claw_memory_id))
+
+        conflict_record = cursor.fetchone()
+        assert conflict_record is not None, "Conflict should be recorded in belief_conflicts table"
+        assert conflict_record[2] in ["contradiction", "refinement", "update"]  # conflict_type
+        assert conflict_record[3] is not None, "Resolution should be set"
+        assert conflict_record[4] is not None, "Resolved_at should be set"
+
+        # Step 6: Verify Claw's memory marked as superseded
+        cursor.execute("""
+            SELECT provenance FROM shared_memories WHERE id = ?
+        """, (claw_memory_id,))
+
+        loser_row = cursor.fetchone()
+        assert loser_row is not None
+
+        import json
+        provenance = json.loads(loser_row[0])
+        # The loser should be marked as superseded
+        assert "superseded_by" in provenance, "Loser memory should be marked as superseded"
+        assert provenance["superseded_by"] == friday_memory_id
+
+        conn.close()
