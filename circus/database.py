@@ -361,6 +361,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
 
     # Run v2 migration for Memory Commons
     run_v2_migration(db_path)
+    # Run v3 migration for Federation
+    run_v3_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -427,6 +429,88 @@ def run_v2_migration(db_path: Optional[Path] = None) -> None:
 
     conn.commit()
     conn.close()
+
+
+def run_v3_migration(db_path: Optional[Path] = None) -> None:
+    """Run Memory Commons v3 migration (Federation schema hardening)."""
+    import json
+    import logging
+    import uuid
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v3_federation.sql"
+
+    if not migration_file.exists():
+        return  # Migration file not found, skip
+
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+
+    try:
+        # Check if migration already applied (domain column exists)
+        cursor.execute("PRAGMA table_info(shared_memories)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        domain_already_exists = 'domain' in existing_columns
+
+        # Add domain column if it doesn't exist
+        if not domain_already_exists:
+            cursor.execute("ALTER TABLE shared_memories ADD COLUMN domain TEXT")
+
+        # Execute federation tables SQL first (idempotent with IF NOT EXISTS)
+        with open(migration_file, 'r') as f:
+            migration_sql = f.read()
+        cursor.executescript(migration_sql)
+
+        # Backfill domain from category (idempotent - only NULL domains)
+        # Only backfill if category is valid (non-empty, printable ASCII)
+        cursor.execute("""
+            SELECT id, category FROM shared_memories
+            WHERE domain IS NULL AND category IS NOT NULL AND category != ''
+        """)
+        rows_to_backfill = cursor.fetchall()
+
+        backfilled_count = 0
+        skipped_count = 0
+
+        for row_id, category in rows_to_backfill:
+            # Validate category is domain-name-looking (non-empty, printable ASCII)
+            if category and category.isprintable() and len(category) > 0:
+                cursor.execute("UPDATE shared_memories SET domain = ? WHERE id = ?", (category, row_id))
+                backfilled_count += 1
+            else:
+                # Skip malformed category, log warning
+                skipped_count += 1
+                logger.warning("v3 migration: skipped backfill for memory %s with malformed category: %r",
+                             row_id, category)
+
+        # Create domain index
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_commons_domain ON shared_memories(domain)")
+
+        # Log backfill to federation_audit (only if we actually backfilled something)
+        if backfilled_count > 0 or skipped_count > 0:
+            audit_id = f"audit-{uuid.uuid4().hex[:16]}"
+            now = datetime.utcnow().isoformat()
+            metadata = json.dumps({
+                "rows_backfilled": backfilled_count,
+                "rows_skipped": skipped_count
+            })
+            cursor.execute("""
+                INSERT INTO federation_audit (id, action, actor_passport, target_id, reason, metadata, created_at)
+                VALUES (?, 'backfill_run', NULL, NULL, 'v3 migration domain backfill', ?, ?)
+            """, (audit_id, metadata, now))
+
+            logger.info("v3 federation migration: backfilled %d rows (skipped %d malformed)",
+                       backfilled_count, skipped_count)
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error("v3 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
 
 
 @contextmanager
