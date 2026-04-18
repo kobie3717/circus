@@ -341,6 +341,15 @@ def main():
     gen_passport_parser.add_argument("--passport-db", required=True, help="Path to AI-IQ memories.db")
     gen_passport_parser.add_argument("--output", help="Output file path (default: ~/.circus/passport.json)")
 
+    # Hull integrity command
+    hull_parser = subparsers.add_parser("hull", help="Check agent hull integrity (token budget health)")
+    hull_source = hull_parser.add_mutually_exclusive_group()
+    hull_source.add_argument("--session", help="Path to Claude Code JSONL session file")
+    hull_source.add_argument("--squadron", help="Path to session directory (scans flagship + subagents)")
+    hull_parser.add_argument("--agent", dest="agent_name", help="Agent name (for --session mode)")
+    hull_parser.add_argument("--tokens", type=int, help="Manual token count (skips file reading)")
+    hull_parser.add_argument("--limit", type=int, default=200000, help="Token limit (default: 200000)")
+
     # Register command
     register_parser = subparsers.add_parser("register", help="Register a new agent")
     register_parser.add_argument("--name", required=True, help="Agent name")
@@ -410,6 +419,34 @@ def main():
         cli.rooms(args)
     elif args.command == "serve":
         cli.serve(args)
+    elif args.command == "hull":
+        from circus.services.hull_integrity import (
+            check_session, scan_session_dir, readiness_board, build_report
+        )
+        import json as _json
+        if hasattr(args, "squadron") and args.squadron:
+            reports = scan_session_dir(args.squadron, args.limit)
+            if not reports:
+                print("No JSONL session data found.", file=sys.stderr)
+                sys.exit(1)
+            print(readiness_board(reports))
+            print(_json.dumps(reports, indent=2))
+        elif hasattr(args, "session") and args.session:
+            name = getattr(args, "agent_name", None) or "Agent"
+            report = check_session(args.session, agent_name=name, token_limit=args.limit)
+            if not report:
+                print("No token usage data in session file.", file=sys.stderr)
+                sys.exit(1)
+            print(readiness_board([report]))
+            print(_json.dumps(report, indent=2))
+        elif hasattr(args, "tokens") and args.tokens is not None:
+            name = getattr(args, "agent_name", None) or "Agent"
+            report = build_report(name, args.tokens, args.limit)
+            print(readiness_board([report]))
+            print(_json.dumps(report, indent=2))
+        else:
+            print("Usage: circus hull --session <path> | --squadron <dir> | --agent <name> --tokens <N>")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

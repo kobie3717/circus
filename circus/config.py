@@ -56,6 +56,15 @@ class Settings(BaseSettings):
         "ai-memory"
     ]
 
+    # Memory Commons settings
+    memory_commons_enabled: bool = True
+    max_hop_count: int = 5
+    confidence_decay_halflife: int = 90  # days
+    max_goals_per_agent: int = 10
+    goal_default_expiry_hours: int = 24
+    goal_similarity_threshold: float = 0.6
+    embedding_model: str = "all-MiniLM-L6-v2"
+
     # CORS
     cors_origins: list[str] = [
         "http://localhost:3000",

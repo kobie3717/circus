@@ -262,3 +262,118 @@ class BootBriefingResponse(BaseModel):
     briefing: str
     agents: list[AgentCompetenceSummary]
     generated_at: str
+
+
+# Memory Commons models
+
+class GoalCreate(BaseModel):
+    """Request to create a goal subscription."""
+    goal_description: str = Field(..., min_length=5, max_length=500)
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    expires_in_hours: Optional[int] = Field(default=24, ge=1, le=168)
+
+
+class GoalResponse(BaseModel):
+    """Response for goal creation."""
+    goal_id: str
+    stream_url: str
+
+
+class GoalInfo(BaseModel):
+    """Goal subscription information."""
+    id: str
+    agent_id: str
+    goal_description: str
+    min_confidence: float
+    created_at: str
+    expires_at: Optional[str]
+    is_active: bool
+
+
+class ProvenanceInfo(BaseModel):
+    """Provenance metadata for memory."""
+    derived_from: Optional[list[str]] = Field(default=None)
+    citations: Optional[list[str]] = Field(default=None)
+    reasoning: Optional[str] = Field(default=None)
+
+
+class MemoryPublish(BaseModel):
+    """Request to publish a memory."""
+    content: str = Field(..., min_length=10, max_length=5000)
+    category: str = Field(..., min_length=2, max_length=50)
+    tags: Optional[list[str]] = Field(default=None)
+    privacy_tier: str = Field(default="team", pattern="^(private|team|public)$")
+    provenance: Optional[ProvenanceInfo] = Field(default=None)
+    confidence: float = Field(default=0.9, ge=0.1, le=1.0)
+
+
+class PublishResponse(BaseModel):
+    """Response for memory publish."""
+    memory_id: str
+    routed_to: list[str]
+    match_scores: list[float]
+
+
+class AgentInfo(BaseModel):
+    """Minimal agent info for events."""
+    id: str
+    name: str
+    trust_score: float
+
+
+class ProvenanceEvent(BaseModel):
+    """Provenance data in SSE events."""
+    hop_count: int
+    original_author: str
+    confidence: float
+    age_days: int
+    effective_confidence: float
+
+
+class MemoryEvent(BaseModel):
+    """Memory SSE event."""
+    type: str = "memory"
+    memory_id: str
+    content: str
+    category: str
+    tags: Optional[list[str]]
+    from_agent: AgentInfo
+    provenance: ProvenanceEvent
+    match_score: float
+    goal_id: str
+    timestamp: str
+
+
+class ConnectedEvent(BaseModel):
+    """Connected SSE event."""
+    type: str = "connected"
+    timestamp: str
+    goal_id: Optional[str] = None
+
+
+class GoalExpiredEvent(BaseModel):
+    """Goal expired SSE event."""
+    type: str = "goal_expired"
+    goal_id: str
+    reason: str
+
+
+class HeartbeatEvent(BaseModel):
+    """Heartbeat SSE event."""
+    type: str = "heartbeat"
+    timestamp: str
+
+
+class SharedMemoryResponse(BaseModel):
+    """Shared memory with provenance."""
+    id: str
+    content: str
+    category: str
+    tags: Optional[list[str]]
+    from_agent: AgentInfo
+    privacy_tier: str
+    hop_count: int
+    original_author: Optional[str]
+    confidence: float
+    effective_confidence: float
+    shared_at: str

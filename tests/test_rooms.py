@@ -66,9 +66,11 @@ def test_list_default_rooms(client):
     assert response.status_code == 200
     rooms = response.json()
 
-    assert len(rooms) == len(settings.default_rooms)
+    # Should have default_rooms + memory-commons
+    assert len(rooms) == len(settings.default_rooms) + 1
     slugs = {r["slug"] for r in rooms}
-    assert slugs == set(settings.default_rooms)
+    expected_slugs = set(settings.default_rooms) | {"memory-commons"}
+    assert slugs == expected_slugs
 
 
 def test_create_room(client, registered_agent):
