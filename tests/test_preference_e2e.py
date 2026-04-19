@@ -489,3 +489,217 @@ def test_second_preference_publish_updates_behavior_again(client, kobus_private_
         # ── THE BEHAVIORAL DELTA: Behavior changed TWICE ──
         assert after_v1["text"] != after_v2["text"], "Behavior MUST change: v1 vs v2"
         assert after_v1["language"] != after_v2["language"], "Language changed: af → en"
+
+
+# ── W5 Ship Gate Tests: Signed-Only Behavior Change ──
+
+
+def test_w5_scenario_1_valid_local_signature_changes_behavior(client, kobus_private_key):
+    """W5 Scenario 1: Valid local flow with owner signature activates preference.
+
+    BEFORE: Bot speaks English (default)
+    TRIGGER: Friday publishes preference with valid owner signature
+    AFTER: Bot speaks Afrikaans (behavior changed)
+
+    This proves only signed preferences can change live behavior locally.
+    """
+    with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        import circus.services.preference_admission as admission_module
+        admission_module._SERVER_OWNER = None
+        admission_module._WARN_LOGGED = False
+
+        # ── BEFORE: Default English behavior ──
+        with get_db() as conn:
+            before = mock_bot_response(conn, owner_id="kobus", user_message="Help")
+
+        assert before["language"] == "en", "BEFORE: default English"
+        assert before["text"] == "Yes, here's the answer you requested."
+
+        # ── TRIGGER: Valid signed preference published ──
+        with patch('secrets.token_hex', return_value='w5s1validtest123'):
+            memory_id = "shmem-w5s1validtest123"
+            pref = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Kobus prefers Afrikaans",
+                "confidence": 0.9,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "reasoning": "User explicitly requested Afrikaans",
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id, kobus_private_key)
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "af"
+                },
+            }
+            resp = client.post("/api/v1/memory-commons/publish", json=pref)
+            assert resp.status_code == 200, f"Publish failed: {resp.json()}"
+            assert resp.json()["preference_activated"] is True
+
+        # ── AFTER: Afrikaans behavior (changed) ──
+        with get_db() as fresh_conn:
+            after = mock_bot_response(fresh_conn, owner_id="kobus", user_message="Help")
+
+        assert after["language"] == "af", "AFTER: Afrikaans from signed preference"
+        assert after["text"] == "Ja, dit is reg — hier is die antwoord."
+
+        # ── BEHAVIORAL DELTA: This is the W5 proof ──
+        assert before["text"] != after["text"], "Behavior MUST change with valid signature"
+        assert before["language"] != after["language"], "Language changed: en → af"
+
+
+def test_w5_scenario_2a_missing_binding_rejected_at_publish(client):
+    """W5 Scenario 2a: Missing owner_binding → 400 at publish.
+
+    BEFORE: Bot speaks English (default)
+    TRIGGER: Agent publishes preference WITHOUT owner_binding
+    AFTER: Bot still speaks English (behavior unchanged)
+
+    Proves missing binding is caught early at publish (fail-fast).
+    """
+    with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        import circus.services.preference_admission as admission_module
+        admission_module._SERVER_OWNER = None
+        admission_module._WARN_LOGGED = False
+
+        # ── BEFORE: Default behavior ──
+        with get_db() as conn:
+            before = mock_bot_response(conn, owner_id="kobus", user_message="Help")
+
+        assert before["language"] == "en"
+        assert before["text"] == "Yes, here's the answer you requested."
+
+        # ── TRIGGER: Publish preference without owner_binding → 400 ──
+        pref = {
+            "category": "user_preference",
+            "domain": "preference.user",
+            "content": "Kobus prefers markdown format",
+            "confidence": 0.85,
+            "provenance": {
+                "owner_id": "kobus",
+                "reasoning": "User said so"
+                # NO owner_binding field
+            },
+            "preference": {
+                "field": "user.format_preference",
+                "value": "markdown"
+            },
+        }
+
+        resp = client.post("/api/v1/memory-commons/publish", json=pref)
+        assert resp.status_code == 400, "Missing binding should reject at publish"
+        assert "owner_binding" in resp.json()["detail"].lower()
+
+        # ── AFTER: Behavior unchanged (no memory in DB) ──
+        with get_db() as fresh_conn:
+            after = mock_bot_response(fresh_conn, owner_id="kobus", user_message="Help")
+
+            # Verify no memory in shared_memories
+            cursor = fresh_conn.execute(
+                "SELECT COUNT(*) FROM shared_memories WHERE category = 'user_preference' AND content LIKE '%markdown%'"
+            )
+            count = cursor.fetchone()[0]
+            assert count == 0, "Memory should NOT be in shared_memories (rejected at publish)"
+
+            # Verify no active preference
+            cursor = fresh_conn.execute(
+                "SELECT COUNT(*) FROM active_preferences WHERE field_name = 'user.format_preference'"
+            )
+            count = cursor.fetchone()[0]
+            assert count == 0, "Preference should NOT be activated"
+
+        assert after["text"] == before["text"], "Behavior UNCHANGED: missing binding rejected"
+
+
+def test_w5_scenario_2b_bad_signature_preserved_prior_state(client, kobus_private_key):
+    """W5 Scenario 2b: Bad signature → publish accepts for audit, admission rejects, prior state preserved.
+
+    BEFORE: Valid signed preference (language=af) is active
+    TRIGGER: Attacker publishes preference with bad signature (claims language=en)
+    AFTER: Bot STILL speaks Afrikaans (prior valid preference unchanged)
+
+    THE CRITICAL W5 ASSERTION: Bad input cannot knock out good state.
+    """
+    with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        import circus.services.preference_admission as admission_module
+        admission_module._SERVER_OWNER = None
+        admission_module._WARN_LOGGED = False
+
+        # ── SEED: Publish valid signed preference (language=af) ──
+        with patch('secrets.token_hex', return_value='w5s2bseedvalid00'):
+            memory_id_seed = "shmem-w5s2bseedvalid00"
+            valid_pref = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Kobus prefers Afrikaans",
+                "confidence": 0.9,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "reasoning": "User explicitly requested Afrikaans",
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id_seed, kobus_private_key)
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "af"
+                },
+            }
+            resp = client.post("/api/v1/memory-commons/publish", json=valid_pref)
+            assert resp.status_code == 200
+            assert resp.json()["preference_activated"] is True
+
+        # ── VERIFY: Afrikaans is active ──
+        with get_db() as conn:
+            prefs = get_active_preferences(conn, "kobus")
+            assert prefs.get("user.language_preference") == "af", "Valid preference should be active"
+
+            before = mock_bot_response(conn, owner_id="kobus", user_message="Help")
+
+        assert before["language"] == "af"
+        assert before["text"] == "Ja, dit is reg — hier is die antwoord."
+
+        # ── ATTACK: Publish preference with bad signature (signed with wrong key) ──
+        # Generate a throwaway key (attacker's key, NOT kobus's key)
+        attacker_private_key = Ed25519PrivateKey.generate()
+
+        with patch('secrets.token_hex', return_value='w5s2battackbad00'):
+            memory_id_attack = "shmem-w5s2battackbad00"
+            attack_pref = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Kobus prefers English (attacker claim)",
+                "confidence": 0.95,  # High confidence (would activate if signature valid)
+                "provenance": {
+                    "owner_id": "kobus",  # Claims to be kobus
+                    "reasoning": "Attacker trying to flip preference",
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id_attack, attacker_private_key)  # BAD SIGNATURE
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "en"
+                },
+            }
+
+            resp = client.post("/api/v1/memory-commons/publish", json=attack_pref)
+            assert resp.status_code == 200, "Publish accepts for audit (can't verify all owners at publish)"
+
+            # But preference_activated should be False (admission rejected)
+            assert resp.json()["preference_activated"] is False, "Bad signature should NOT activate"
+
+        # ── AFTER: Prior valid preference STILL ACTIVE (unchanged) ──
+        with get_db() as fresh_conn:
+            after = mock_bot_response(fresh_conn, owner_id="kobus", user_message="Help")
+
+            # Verify attack memory is in shared_memories (audit trail)
+            cursor = fresh_conn.execute(
+                "SELECT id FROM shared_memories WHERE id = ?",
+                (memory_id_attack,)
+            )
+            assert cursor.fetchone() is not None, "Attack memory should be in shared_memories (audit path)"
+
+            # Verify active_preferences STILL has language=af (prior valid state)
+            prefs = get_active_preferences(fresh_conn, "kobus")
+            assert prefs.get("user.language_preference") == "af", "Prior valid preference MUST be preserved"
+
+        assert after["language"] == "af", "AFTER: STILL Afrikaans (bad signature did NOT flip state)"
+        assert after["text"] == before["text"], "Behavior UNCHANGED: bad input cannot knock out good state"
