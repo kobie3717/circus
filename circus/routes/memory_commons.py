@@ -1,8 +1,14 @@
 """Memory Commons API routes - Week 1: Goal Routing + Write-Through."""
 
+import re
 import secrets
 from datetime import datetime, timedelta
 from typing import AsyncIterator, Optional
+
+# W5.1: Valid memory_id format — client-supplied IDs must match this pattern
+# (hex suffix from secrets.token_hex, allowing 16-64 chars to cover both
+# server 8-byte and client 16-byte token lengths).
+_MEMORY_ID_PATTERN = re.compile(r'^shmem-[0-9a-f]{16,64}$')
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -218,8 +224,19 @@ async def publish_memory(
             detail=f"invalid domain: {str(e)}"
         )
 
-    # Generate memory ID early (needed for W5 owner_binding validation)
-    memory_id = f"shmem-{secrets.token_hex(8)}"
+    # Generate memory ID early (needed for W5 owner_binding validation).
+    # W5.1 fix: Accept client-supplied memory_id from owner_binding as
+    # authoritative. Real clients cannot know the server's random memory_id
+    # before signing, so they generate + sign + publish atomically.
+    # Format validated here; uniqueness enforced by DB PRIMARY KEY on insert.
+    _client_memory_id = None
+    if (mem_req.provenance
+            and mem_req.provenance.owner_binding
+            and mem_req.provenance.owner_binding.memory_id
+            and _MEMORY_ID_PATTERN.match(mem_req.provenance.owner_binding.memory_id)):
+        _client_memory_id = mem_req.provenance.owner_binding.memory_id
+
+    memory_id = _client_memory_id or f"shmem-{secrets.token_hex(8)}"
 
     # Week 4: Validate preference memories (publish-side gate)
     if mem_req.category == "user_preference":
@@ -286,11 +303,15 @@ async def publish_memory(
                 detail="owner_binding missing timestamp"
             )
 
-        # R3: Validate owner_binding.memory_id matches the generated memory_id
+        # R3 (W5.1): memory_id format validated above when adopting as
+        # authoritative. If client provided an invalid format, it was ignored
+        # and server generated its own — which won't match binding.memory_id,
+        # so reject here for clarity. This preserves the signed-binding
+        # guarantee (sig always binds to the memory_id that gets persisted).
         if binding.memory_id != memory_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="owner_binding memory_id mismatch"
+                detail="owner_binding memory_id invalid format (expected shmem-[0-9a-f]{16,64})"
             )
 
     with get_db() as conn:
