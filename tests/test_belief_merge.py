@@ -235,6 +235,7 @@ class TestConflictDetection:
             "from_agent_id": "friday-123",
             "content": "Kobus prefers terse replies in chat",
             "category": "user-preferences",
+            "domain": "user-preferences",
             "confidence": 0.95,
             "shared_at": datetime.utcnow().isoformat()
         }
@@ -245,6 +246,7 @@ class TestConflictDetection:
                 "from_agent_id": "friday-123",
                 "content": "Kobus prefers terse replies",  # Very similar
                 "category": "user-preferences",
+                "domain": "user-preferences",
                 "confidence": 0.9,
                 "shared_at": (datetime.utcnow() - timedelta(days=1)).isoformat()
             }
@@ -262,6 +264,7 @@ class TestConflictDetection:
             "from_agent_id": "claw-456",
             "content": "Kobus does not prefer terse replies",
             "category": "user-preferences",
+            "domain": "user-preferences",
             "confidence": 0.8,
             "shared_at": datetime.utcnow().isoformat()
         }
@@ -272,6 +275,7 @@ class TestConflictDetection:
                 "from_agent_id": "friday-123",
                 "content": "Kobus prefers terse replies",
                 "category": "user-preferences",
+                "domain": "user-preferences",
                 "confidence": 0.9,
                 "shared_at": (datetime.utcnow() - timedelta(days=1)).isoformat()
             }
@@ -288,6 +292,7 @@ class TestConflictDetection:
             "from_agent_id": "claw-456",
             "content": "PayFast webhooks use IP whitelist for security",
             "category": "architecture",
+            "domain": "payment-flows",
             "confidence": 0.9,
             "shared_at": datetime.utcnow().isoformat()
         }
@@ -298,6 +303,7 @@ class TestConflictDetection:
                 "from_agent_id": "friday-123",
                 "content": "PayFast webhooks use IP whitelist",
                 "category": "architecture",
+                "domain": "payment-flows",
                 "confidence": 0.9,
                 "shared_at": (datetime.utcnow() - timedelta(days=1)).isoformat()
             }
@@ -314,6 +320,7 @@ class TestConflictDetection:
             "from_agent_id": "friday-123",  # Same author
             "content": "Kobus does not prefer terse replies",  # Negation present
             "category": "user-preferences",
+            "domain": "user-preferences",
             "confidence": 0.9,
             "shared_at": datetime.utcnow().isoformat()
         }
@@ -324,6 +331,7 @@ class TestConflictDetection:
                 "from_agent_id": "friday-123",  # Same author
                 "content": "Kobus prefers terse replies",  # No negation
                 "category": "user-preferences",
+                "domain": "user-preferences",
                 "confidence": 0.9,
                 "shared_at": (datetime.utcnow() - timedelta(days=1)).isoformat()
             }
@@ -597,10 +605,10 @@ class TestConflictResolution:
 
         conn.close()
 
-    def test_category_fallback_logging(self, temp_db, caplog):
-        """Fix F: Verify logger.info fires when category is used as domain fallback."""
+    def test_domain_logging(self, temp_db, caplog):
+        """Week 3: Verify logger.debug fires when resolving conflict on domain."""
         import logging
-        caplog.set_level(logging.INFO)
+        caplog.set_level(logging.DEBUG)
 
         conn = sqlite3.connect(str(temp_db))
 
@@ -609,6 +617,7 @@ class TestConflictResolution:
             "from_agent_id": "friday-123",
             "content": "Test memory",
             "category": "test-category",
+            "domain": "test-domain",
             "effective_confidence": 0.9,
             "shared_at": datetime.utcnow().isoformat()
         }
@@ -618,14 +627,15 @@ class TestConflictResolution:
             "from_agent_id": "claw-456",
             "content": "Test alternative",
             "category": "test-category",
+            "domain": "test-domain",
             "effective_confidence": 0.8,
             "shared_at": datetime.utcnow().isoformat()
         }
 
-        resolve_conflict(conn, memory_a, memory_b, "test-category")
+        resolve_conflict(conn, memory_a, memory_b, "test-domain")
 
-        # Check that logger.info was called with category name
-        assert any("Using category 'test-category' as domain fallback" in record.message for record in caplog.records)
+        # Check that logger.debug was called with domain name
+        assert any("Resolving conflict on domain 'test-domain'" in record.message for record in caplog.records)
 
         conn.close()
 

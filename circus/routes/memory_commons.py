@@ -27,11 +27,11 @@ from circus.models import (
     DomainClaim,
     DomainClaimResponse,
     DomainSteward,
-    ConflictResolution,
 )
 from circus.services.goal_router import goal_router
 from circus.services.provenance import decay_confidence
-from circus.services.belief_merge import detect_conflict, resolve_conflict, apply_merge
+from circus.services.belief_merge import apply_belief_merge_pipeline, ConflictResolution
+from circus.services.domain_validation import validate_domain, InvalidDomainError
 
 import asyncio
 import json
@@ -201,11 +201,21 @@ async def publish_memory(
 
     Memory is routed to matching goal subscriptions via SSE.
     Week 2: Applies confidence decay and detects conflicts.
+    Week 3: Domain field is required and validated.
     """
     if not settings.memory_commons_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Memory Commons is disabled"
+        )
+
+    # Week 3: Validate domain field (required, regex-validated)
+    try:
+        normalized_domain = validate_domain(mem_req.domain)
+    except InvalidDomainError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid domain: {str(e)}"
         )
 
     with get_db() as conn:
@@ -262,15 +272,16 @@ async def publish_memory(
         # Insert into shared_memories (use memory-commons room)
         cursor.execute("""
             INSERT INTO shared_memories (
-                id, room_id, from_agent_id, content, category, tags, provenance,
+                id, room_id, from_agent_id, content, category, domain, tags, provenance,
                 privacy_tier, hop_count, original_author, confidence,
                 age_days, effective_confidence, shared_at, trust_verified
-            ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0)
+            ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0)
         """, (
             memory_id,
             agent_id,
             mem_req.content,
             mem_req.category,
+            normalized_domain,
             json.dumps(mem_req.tags or []),
             json.dumps(provenance_data),
             mem_req.privacy_tier,
@@ -282,105 +293,20 @@ async def publish_memory(
         conn.commit()
 
         # Week 2: Conflict detection
-        conflict_result = None
-        if settings.conflict_detection_enabled:
-            # Fetch recent memories in same category for conflict detection
-            cursor.execute("""
-                SELECT id, from_agent_id, content, category, confidence, shared_at
-                FROM shared_memories
-                WHERE category = ?
-                  AND id != ?
-                  AND privacy_tier IN ('public', 'team')
-                ORDER BY shared_at DESC
-                LIMIT 50
-            """, (mem_req.category, memory_id))
-
-            existing_memories = [
-                {
-                    "id": row[0],
-                    "from_agent_id": row[1],
-                    "content": row[2],
-                    "category": row[3],
-                    "confidence": row[4],
-                    "shared_at": row[5],
-                }
-                for row in cursor.fetchall()
-            ]
-
-            new_memory = {
+        conflict_result = apply_belief_merge_pipeline(
+            conn,
+            new_memory={
                 "id": memory_id,
                 "from_agent_id": agent_id,
                 "content": mem_req.content,
                 "category": mem_req.category,
+                "domain": normalized_domain,
                 "confidence": mem_req.confidence,
                 "shared_at": now.isoformat(),
-            }
-
-            conflict_info = detect_conflict(new_memory, existing_memories)
-
-            if conflict_info:
-                # Fetch full memory data for resolution
-                cursor.execute("""
-                    SELECT id, from_agent_id, content, category, confidence, shared_at
-                    FROM shared_memories
-                    WHERE id = ?
-                """, (conflict_info.memory_a_id,))
-                row = cursor.fetchone()
-                memory_a = {
-                    "id": row[0],
-                    "from_agent_id": row[1],
-                    "content": row[2],
-                    "category": row[3],
-                    "confidence": row[4],
-                    "shared_at": row[5],
-                }
-
-                # Resolve conflict
-                resolution = resolve_conflict(
-                    conn,
-                    memory_a,
-                    new_memory,
-                    conflict_info.domain or mem_req.category
-                )
-
-                # Record conflict in belief_conflicts table
-                cursor.execute("""
-                    INSERT INTO belief_conflicts (
-                        memory_id_a, memory_id_b, conflict_type, detected_at,
-                        resolution, resolved_at, resolved_by_agent_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    conflict_info.memory_a_id,
-                    conflict_info.memory_b_id,
-                    conflict_info.conflict_type,
-                    now.isoformat(),
-                    resolution.strategy if resolution.auto_resolved else None,
-                    now.isoformat() if resolution.auto_resolved else None,
-                    agent_id if resolution.auto_resolved else None,
-                ))
-                conn.commit()
-
-                # Apply merge if auto-resolved
-                if resolution.auto_resolved:
-                    apply_merge(
-                        conn,
-                        resolution.winner_id,
-                        resolution.loser_id,
-                        resolution.strategy
-                    )
-
-                # Build conflict result for response
-                conflict_result = ConflictResolution(
-                    memory_id_a=conflict_info.memory_a_id,
-                    memory_id_b=conflict_info.memory_b_id,
-                    conflict_type=conflict_info.conflict_type,
-                    winner_id=resolution.winner_id,
-                    strategy=resolution.strategy,
-                    auto_resolved=resolution.auto_resolved,
-                    reason=resolution.reason,
-                    authority_score_a=resolution.authority_score_a,
-                    authority_score_b=resolution.authority_score_b,
-                )
+            },
+            agent_id=agent_id,
+            now=now,
+        )
 
         # Semantic routing: find matching goals
         matches = goal_router.find_matching_goals(

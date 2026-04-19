@@ -6,6 +6,9 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+# Import ConflictResolution from belief_merge service (domain concept, not transport DTO)
+from circus.services.belief_merge import ConflictResolution
+
 
 # Request models
 
@@ -301,6 +304,7 @@ class MemoryPublish(BaseModel):
     """Request to publish a memory."""
     content: str = Field(..., min_length=10, max_length=5000)
     category: str = Field(..., min_length=2, max_length=50)
+    domain: str = Field(..., min_length=1, max_length=50)
     tags: Optional[list[str]] = Field(default=None)
     privacy_tier: str = Field(default="team", pattern="^(private|team|public)$")
     provenance: Optional[ProvenanceInfo] = Field(default=None)
@@ -401,19 +405,6 @@ class DomainSteward(BaseModel):
     agent_name: str
     stewardship_level: float
     claimed_at: str
-
-
-class ConflictResolution(BaseModel):
-    """Conflict resolution result."""
-    memory_id_a: str
-    memory_id_b: str
-    conflict_type: str
-    winner_id: str
-    strategy: str
-    auto_resolved: bool
-    reason: str
-    authority_score_a: float
-    authority_score_b: float
 
 
 class PublishResponseWithConflict(BaseModel):

@@ -150,6 +150,7 @@ def test_ship_gate_full_flow(client, setup_agents):
         json={
             "content": "PayFast webhooks require IP whitelist 197.242.158.0/24 for security verification",
             "category": "architecture",
+            "domain": "payment-flows",
             "tags": ["payfast", "webhooks", "security", "ip-whitelist"],
             "privacy_tier": "team",
             "confidence": 0.9

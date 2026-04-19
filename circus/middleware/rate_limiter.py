@@ -57,6 +57,11 @@ async def check_rate_limit(request: Request):
     if request.url.path in ["/health", "/docs", "/openapi.json", "/redoc", "/.well-known/agent.json"]:
         return
 
+    # Skip rate limiting for federation PUSH (has its own per-peer rate limiting).
+    # PULL stays under the generic middleware until per-peer pull limits land.
+    if request.url.path == "/api/v1/federation/push":
+        return
+
     authorization = request.headers.get("authorization")
     agent_id, trust_tier = get_agent_from_token(authorization)
 

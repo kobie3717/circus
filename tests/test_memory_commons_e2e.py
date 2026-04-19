@@ -152,6 +152,7 @@ class TestMemoryCommonsE2E:
                 json={
                     "content": "PayFast webhooks use IP whitelist 197.242.158.0/24",
                     "category": "architecture",
+                    "domain": "payment-flows",
                     "tags": ["payfast", "webhooks", "security"],
                     "privacy_tier": "team",
                     "confidence": 0.9
@@ -201,6 +202,7 @@ class TestMemoryCommonsE2E:
             json={
                 "content": "PayFast webhooks use IP whitelist 197.242.158.0/24 for security",
                 "category": "architecture",
+                "domain": "payment-flows",
                 "tags": ["payfast", "webhooks"],
                 "privacy_tier": "team",
                 "confidence": 0.9
@@ -341,6 +343,7 @@ class TestMemoryCommonsE2E:
             json={
                 "content": "User prefers terse replies and concise communication style",
                 "category": "user-preferences",
+                "domain": "user-preferences",
                 "tags": ["user", "communication", "preferences"],
                 "privacy_tier": "team",
                 "confidence": 0.85
@@ -363,6 +366,7 @@ class TestMemoryCommonsE2E:
             json={
                 "content": "User does not prefer terse replies and likes detailed communication style",
                 "category": "user-preferences",
+                "domain": "user-preferences",
                 "tags": ["user", "communication", "preferences"],
                 "privacy_tier": "team",
                 "confidence": 0.9  # Higher confidence, but no stewardship

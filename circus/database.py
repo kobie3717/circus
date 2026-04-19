@@ -361,6 +361,14 @@ def init_database(db_path: Optional[Path] = None) -> None:
 
     # Run v2 migration for Memory Commons
     run_v2_migration(db_path)
+    # Run v3 migration for Federation
+    run_v3_migration(db_path)
+    # Run v4 migration for Federation dedup
+    run_v4_migration(db_path)
+    # Run v5 migration for Instance identity
+    run_v5_migration(db_path)
+    # Run v6 migration for Federation rate limits
+    run_v6_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -429,9 +437,207 @@ def run_v2_migration(db_path: Optional[Path] = None) -> None:
     conn.close()
 
 
+def run_v3_migration(db_path: Optional[Path] = None) -> None:
+    """Run Memory Commons v3 migration (Federation schema hardening)."""
+    import json
+    import logging
+    import uuid
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v3_federation.sql"
+
+    if not migration_file.exists():
+        return  # Migration file not found, skip
+
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+
+    try:
+        # Check if migration already applied (domain column exists)
+        cursor.execute("PRAGMA table_info(shared_memories)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        domain_already_exists = 'domain' in existing_columns
+
+        # Add domain column if it doesn't exist
+        if not domain_already_exists:
+            cursor.execute("ALTER TABLE shared_memories ADD COLUMN domain TEXT")
+
+        # Execute federation tables SQL first (idempotent with IF NOT EXISTS)
+        with open(migration_file, 'r') as f:
+            migration_sql = f.read()
+        cursor.executescript(migration_sql)
+
+        # Backfill domain from category (idempotent - only NULL domains)
+        # Only backfill if category is valid (non-empty, printable ASCII)
+        cursor.execute("""
+            SELECT id, category FROM shared_memories
+            WHERE domain IS NULL AND category IS NOT NULL AND category != ''
+        """)
+        rows_to_backfill = cursor.fetchall()
+
+        backfilled_count = 0
+        skipped_count = 0
+
+        for row_id, category in rows_to_backfill:
+            # Validate category is domain-name-looking (non-empty, printable ASCII)
+            if category and category.isprintable() and len(category) > 0:
+                cursor.execute("UPDATE shared_memories SET domain = ? WHERE id = ?", (category, row_id))
+                backfilled_count += 1
+            else:
+                # Skip malformed category, log warning
+                skipped_count += 1
+                logger.warning("v3 migration: skipped backfill for memory %s with malformed category: %r",
+                             row_id, category)
+
+        # Create domain index
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_commons_domain ON shared_memories(domain)")
+
+        # Log backfill to federation_audit (only if we actually backfilled something)
+        if backfilled_count > 0 or skipped_count > 0:
+            audit_id = f"audit-{uuid.uuid4().hex[:16]}"
+            now = datetime.utcnow().isoformat()
+            metadata = json.dumps({
+                "rows_backfilled": backfilled_count,
+                "rows_skipped": skipped_count
+            })
+            cursor.execute("""
+                INSERT INTO federation_audit (id, action, actor_passport, target_id, reason, metadata, created_at)
+                VALUES (?, 'backfill_run', NULL, NULL, 'v3 migration domain backfill', ?, ?)
+            """, (audit_id, metadata, now))
+
+            logger.info("v3 federation migration: backfilled %d rows (skipped %d malformed)",
+                       backfilled_count, skipped_count)
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error("v3 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v4_migration(db_path: Optional[Path] = None) -> None:
+    """Run Memory Commons v4 migration (federation_bundles_seen for transport dedup)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v4_bundles_seen.sql"
+
+    if not migration_file.exists():
+        return  # Migration file not found, skip
+
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+
+    try:
+        # Execute migration SQL (idempotent via IF NOT EXISTS)
+        with open(migration_file, 'r') as f:
+            migration_sql = f.read()
+        cursor.executescript(migration_sql)
+
+        conn.commit()
+        logger.info("v4 federation migration: federation_bundles_seen table created")
+    except Exception as e:
+        conn.rollback()
+        logger.error("v4 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v5_migration(db_path: Optional[Path] = None) -> None:
+    """Run v5 migration: instance_config table + keypair bootstrap.
+
+    Idempotent: runs the SQL (IF NOT EXISTS) then calls ensure_instance_keypair
+    which is itself idempotent (loads existing keys, only generates if missing).
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v5_instance_config.sql"
+
+    if not migration_file.exists():
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    try:
+        cursor = conn.cursor()
+        with open(migration_file, 'r') as f:
+            cursor.executescript(f.read())
+
+        # Seed identity (idempotent — no-op if already present)
+        from circus.services.instance_identity import ensure_instance_keypair
+        ensure_instance_keypair(conn)
+
+        conn.commit()
+        logger.info("v5 federation migration: instance_config table created and identity seeded")
+    except Exception as e:
+        conn.rollback()
+        logger.error("v5 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v6_migration(db_path: Optional[Path] = None) -> None:
+    """Run v6 migration: federation_rate_limits table."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v6_federation_rate_limits.sql"
+
+    if not migration_file.exists():
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        with open(migration_file) as f:
+            conn.executescript(f.read())
+        conn.commit()
+        logger.info("v6 migration: rate limits table created")
+    except Exception as e:
+        conn.rollback()
+        logger.error("v6 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
 @contextmanager
 def get_db() -> Generator[sqlite3.Connection, None, None]:
-    """Get database connection context manager."""
+    """Get database connection context manager.
+
+    IMPORTANT — COMMIT DISCIPLINE:
+    This context manager does NOT auto-commit on exit. Writes require an
+    explicit `conn.commit()` before the context block ends, or they will
+    be silently dropped when the connection closes.
+
+    On exception inside the block, SQLite rolls back the open transaction
+    automatically when the connection closes — no explicit rollback needed,
+    but nothing will have persisted either.
+
+    Pattern for writes:
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT ...", (...))
+            conn.commit()   # REQUIRED — do not omit
+
+    Pattern for reads: no commit needed.
+
+    Violating this is the single most common "why didn't it persist?"
+    failure mode in this codebase. If you add a new module that writes
+    through get_db(), also add at least one test that reads the row back
+    to prove the commit landed.
+    """
     conn = sqlite3.connect(str(settings.database_path))
     conn.row_factory = sqlite3.Row
     try:

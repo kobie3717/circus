@@ -116,6 +116,7 @@ class TestReviewFixes:
                 json={
                     "content": "Test public memory",
                     "category": "learning",
+                    "domain": "testing",
                     "tags": ["test"],
                     "privacy_tier": "public",
                     "confidence": 0.9
@@ -143,6 +144,7 @@ class TestReviewFixes:
                 json={
                     "content": "Test public memory from established agent",
                     "category": "learning",
+                    "domain": "testing",
                     "tags": ["test"],
                     "privacy_tier": "public",
                     "confidence": 0.9
