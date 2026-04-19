@@ -1,21 +1,23 @@
-"""Preference admission service for behavior-delta memories (Week 4 sub-step 4.2).
+"""Preference admission service for behavior-delta memories (Week 4 sub-steps 4.2-4.3).
 
 This module controls the consume-side admission gate: when a valid preference memory
 is published (or federated in), decide whether to activate it (write to active_preferences)
-based on same-owner enforcement and confidence threshold (4.3).
+based on same-owner enforcement and confidence threshold.
 
 Trust gates enforced here:
 - Same-owner check: provenance.owner_id == CIRCUS_OWNER_ID (consume-side)
-- (4.3 will add: effective_confidence >= 0.7)
+- Confidence threshold: effective_confidence >= preference_activation_threshold (4.3)
 
 Structured logging for operational visibility:
-- Every skip emits INFO log with reason code (same_owner_failed, provenance_invalid, etc.)
+- Every skip emits INFO log with reason code (same_owner_failed, confidence_below_threshold, etc.)
 """
 
 import logging
 import os
 import sqlite3
 from datetime import datetime
+
+from circus.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +61,7 @@ def admit_preference(
     This is the consume-side trust gate. Checks:
     1. Server owner configured (CIRCUS_OWNER_ID env var)
     2. Same-owner match (owner_id == server's CIRCUS_OWNER_ID)
-    3. TODO(4.3): effective_confidence >= 0.7 threshold
+    3. Confidence threshold (effective_confidence >= preference_activation_threshold)
 
     Args:
         conn: Database connection (transaction-scoped, reused from publish route)
@@ -106,10 +108,21 @@ def admit_preference(
         )
         return False
 
-    # TODO(4.3): Add confidence threshold check here
-    # if effective_confidence < settings.preference_activation_threshold:
-    #     logger.info("preference_skipped", extra={"reason": "confidence_below_threshold", ...})
-    #     return False
+    # Gate 3: Confidence threshold check
+    threshold = settings.preference_activation_threshold
+    if effective_confidence < threshold:
+        logger.info(
+            "preference_skipped",
+            extra={
+                "reason": "confidence_below_threshold",
+                "memory_id": memory_id,
+                "owner_id": owner_id,
+                "field": preference_field,
+                "effective_confidence": float(effective_confidence),
+                "threshold": float(threshold),
+            },
+        )
+        return False
 
     # All gates passed — upsert to active_preferences
     cursor = conn.cursor()

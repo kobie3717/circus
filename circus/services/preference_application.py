@@ -1,4 +1,4 @@
-"""Preference application service for consuming bots (Week 4 sub-step 4.2).
+"""Preference application service for consuming bots (Week 4 sub-steps 4.2-4.3).
 
 This module provides the read path for bots to fetch their active preferences.
 
@@ -6,12 +6,14 @@ Read path contract:
 - Query active_preferences for a given owner_id
 - Return {field_name: value} dict
 - Re-check allowlist on consume-side (defense in depth)
+- Re-check confidence threshold (defense in depth for runtime threshold changes)
 """
 
 import logging
 import os
 import sqlite3
 
+from circus.config import settings
 from circus.services.preference_constants import ALLOWLISTED_PREFERENCE_FIELDS
 
 logger = logging.getLogger(__name__)
@@ -21,7 +23,7 @@ def get_active_preferences(conn: sqlite3.Connection, owner_id: str) -> dict[str,
     """Get active preferences for a given owner.
 
     Queries active_preferences table and returns {field_name: value} dict.
-    Re-checks allowlist on consume-side (defense in depth against malicious federation).
+    Re-checks allowlist and confidence threshold on consume-side (defense in depth).
 
     Args:
         conn: Database connection
@@ -33,11 +35,12 @@ def get_active_preferences(conn: sqlite3.Connection, owner_id: str) -> dict[str,
 
     Side effects:
         - Logs WARNING if any field_name is not in allowlist (indicates schema drift or attack)
+        - Logs INFO if any preference is below current threshold (indicates threshold change)
     """
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT field_name, value
+        SELECT field_name, value, effective_confidence
         FROM active_preferences
         WHERE owner_id = ?
         """,
@@ -46,8 +49,9 @@ def get_active_preferences(conn: sqlite3.Connection, owner_id: str) -> dict[str,
 
     rows = cursor.fetchall()
     result = {}
+    threshold = settings.preference_activation_threshold
 
-    for field_name, value in rows:
+    for field_name, value, effective_confidence in rows:
         # Defense in depth: re-check allowlist
         if field_name not in ALLOWLISTED_PREFERENCE_FIELDS:
             logger.warning(
@@ -57,6 +61,20 @@ def get_active_preferences(conn: sqlite3.Connection, owner_id: str) -> dict[str,
                     "field_name": field_name,
                     "value": value,
                     "message": "Field not in ALLOWLISTED_PREFERENCE_FIELDS — skipping",
+                },
+            )
+            continue
+
+        # Defense in depth: re-check confidence threshold (threshold may have been raised)
+        if effective_confidence < threshold:
+            logger.info(
+                "preference_skipped",
+                extra={
+                    "reason": "confidence_below_threshold",
+                    "owner_id": owner_id,
+                    "field": field_name,
+                    "effective_confidence": float(effective_confidence),
+                    "threshold": float(threshold),
                 },
             )
             continue
