@@ -150,6 +150,20 @@ def client(temp_db, reset_server_owner):
     return client
 
 
+def _make_owner_binding_for_memory_id(memory_id: str) -> dict:
+    """Helper to create a valid (but garbage-signed) owner_binding for testing.
+
+    W5: Publish-side requires owner_binding structure for preference memories.
+    Signature can be garbage since admission-side verification is separate.
+    """
+    return {
+        "agent_id": "agent-test-123",
+        "memory_id": memory_id,
+        "timestamp": "2026-04-19T10:00:00Z",
+        "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"  # garbage base64, admission will skip
+    }
+
+
 # ── Test 1: The Happy Path — THE Core Product Moment ──
 
 def test_friday_publishes_preference_then_claw_behavior_changes(client):
@@ -181,39 +195,49 @@ def test_friday_publishes_preference_then_claw_behavior_changes(client):
         # ── FRIDAY LEARNS: Kobus prefers Afrikaans, terse responses ──
         # Friday publishes two preference memories through the real publish path.
         # In production this would fire after Friday's pattern-learning loop triggers.
-        friday_publishes = [
-            {
+        # W5: Mock memory_id generation to enable owner_binding.memory_id match
+
+        # Publish first preference: language
+        with patch('secrets.token_hex', return_value='e2elang123456789'):
+            memory_id_1 = "shmem-e2elang123456789"
+            pref_1 = {
                 "category": "user_preference",
                 "domain": "preference.user",
                 "content": "Kobus prefers Afrikaans for bot responses",
                 "confidence": 0.85,
                 "provenance": {
                     "owner_id": "kobus",
-                    "reasoning": "User explicitly requested Afrikaans in multiple sessions"
+                    "reasoning": "User explicitly requested Afrikaans in multiple sessions",
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id_1)
                 },
                 "preference": {
                     "field": "user.language_preference",
                     "value": "af"
                 },
-            },
-            {
+            }
+            resp = client.post("/api/v1/memory-commons/publish", json=pref_1)
+            assert resp.status_code == 200, f"Publish failed: {resp.json()}"
+            assert resp.json()["preference_activated"] is True, "Preference should be activated"
+
+        # Publish second preference: verbosity
+        with patch('secrets.token_hex', return_value='e2everb987654321'):
+            memory_id_2 = "shmem-e2everb987654321"
+            pref_2 = {
                 "category": "user_preference",
                 "domain": "preference.user",
                 "content": "Kobus prefers terse responses",
                 "confidence": 0.9,
                 "provenance": {
                     "owner_id": "kobus",
-                    "reasoning": "User frequently says 'just tell me' and 'short answer please'"
+                    "reasoning": "User frequently says 'just tell me' and 'short answer please'",
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id_2)
                 },
                 "preference": {
                     "field": "user.response_verbosity",
                     "value": "terse"
                 },
-            },
-        ]
-
-        for pref in friday_publishes:
-            resp = client.post("/api/v1/memory-commons/publish", json=pref)
+            }
+            resp = client.post("/api/v1/memory-commons/publish", json=pref_2)
             assert resp.status_code == 200, f"Publish failed: {resp.json()}"
             assert resp.json()["preference_activated"] is True, "Preference should be activated"
 
@@ -255,24 +279,28 @@ def test_007_serves_different_owner_ignores_kobus_preferences(client):
         admission_module._WARN_LOGGED = False
 
         # Kobus's preference: Afrikaans
-        kobus_pref = {
-            "category": "user_preference",
-            "domain": "preference.user",
-            "content": "Kobus prefers Afrikaans",
-            "confidence": 0.85,
-            "provenance": {
-                "owner_id": "kobus",
-                "reasoning": "User requested Afrikaans"
-            },
-            "preference": {
-                "field": "user.language_preference",
-                "value": "af"
-            },
-        }
+        # W5: Mock memory_id generation to enable owner_binding.memory_id match
+        with patch('secrets.token_hex', return_value='owner007test12345'):
+            memory_id = "shmem-owner007test12345"
+            kobus_pref = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Kobus prefers Afrikaans",
+                "confidence": 0.85,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "reasoning": "User requested Afrikaans",
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id)
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "af"
+                },
+            }
 
-        resp = client.post("/api/v1/memory-commons/publish", json=kobus_pref)
-        assert resp.status_code == 200, f"Publish failed: {resp.json()}"
-        assert resp.json()["preference_activated"] is True
+            resp = client.post("/api/v1/memory-commons/publish", json=kobus_pref)
+            assert resp.status_code == 200, f"Publish failed: {resp.json()}"
+            assert resp.json()["preference_activated"] is True
 
         # ── VERIFY: Audit trail exists in shared_memories ──
         with get_db() as conn:
@@ -328,24 +356,28 @@ def test_second_preference_publish_updates_behavior_again(client):
         admission_module._WARN_LOGGED = False
 
         # ── PUBLISH V1: Afrikaans (confidence 0.85) ──
-        pref_v1 = {
-            "category": "user_preference",
-            "domain": "preference.user",
-            "content": "Kobus prefers Afrikaans for bot responses",
-            "confidence": 0.85,
-            "provenance": {
-                "owner_id": "kobus",
-                "reasoning": "User requested Afrikaans"
-            },
-            "preference": {
-                "field": "user.language_preference",
-                "value": "af"
-            },
-        }
+        # W5: Mock memory_id generation to enable owner_binding.memory_id match
+        with patch('secrets.token_hex', return_value='secondv1test12345'):
+            v1_memory_id = "shmem-secondv1test12345"
+            pref_v1 = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Kobus prefers Afrikaans for bot responses",
+                "confidence": 0.85,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "reasoning": "User requested Afrikaans",
+                    "owner_binding": _make_owner_binding_for_memory_id(v1_memory_id)
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "af"
+                },
+            }
 
-        resp = client.post("/api/v1/memory-commons/publish", json=pref_v1)
-        assert resp.status_code == 200
-        v1_memory_id = resp.json()["memory_id"]
+            resp = client.post("/api/v1/memory-commons/publish", json=pref_v1)
+            assert resp.status_code == 200
+            assert resp.json()["memory_id"] == v1_memory_id
 
         # ── AFTER V1: Behavior is Afrikaans ──
         with get_db() as fresh_conn:
@@ -355,24 +387,27 @@ def test_second_preference_publish_updates_behavior_again(client):
         assert after_v1["text"] == "Ja, dit is reg — hier is die antwoord.", "After v1: Afrikaans response"
 
         # ── PUBLISH V2: Back to English (confidence 0.9, higher) ──
-        pref_v2 = {
-            "category": "user_preference",
-            "domain": "preference.user",
-            "content": "Kobus changed his mind, prefers English now",
-            "confidence": 0.9,
-            "provenance": {
-                "owner_id": "kobus",
-                "reasoning": "User explicitly said 'speak English please' in latest session"
-            },
-            "preference": {
-                "field": "user.language_preference",
-                "value": "en"
-            },
-        }
+        with patch('secrets.token_hex', return_value='secondv2test67890'):
+            v2_memory_id = "shmem-secondv2test67890"
+            pref_v2 = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Kobus changed his mind, prefers English now",
+                "confidence": 0.9,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "reasoning": "User explicitly said 'speak English please' in latest session",
+                    "owner_binding": _make_owner_binding_for_memory_id(v2_memory_id)
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "en"
+                },
+            }
 
-        resp = client.post("/api/v1/memory-commons/publish", json=pref_v2)
-        assert resp.status_code == 200
-        v2_memory_id = resp.json()["memory_id"]
+            resp = client.post("/api/v1/memory-commons/publish", json=pref_v2)
+            assert resp.status_code == 200
+            assert resp.json()["memory_id"] == v2_memory_id
 
         # ── AFTER V2: Behavior is back to English (latest wins) ──
         with get_db() as fresh_conn:

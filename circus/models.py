@@ -310,11 +310,14 @@ class OwnerBinding(BaseModel):
     1. Owner's public key (from owner_keys table) can verify the signature
     2. memory_id matches the actual memory being admitted
     3. timestamp is within ±5min of shared_at (bidirectional window)
+
+    Note: Fields are Optional to allow Pydantic parsing, but publish-side validation
+    enforces their presence with precise 400 error messages (W5 5.3 requirement).
     """
-    agent_id: str = Field(..., min_length=1)
-    memory_id: str = Field(..., min_length=1)
-    timestamp: str = Field(...)  # ISO8601 timestamp when binding was created
-    signature: str = Field(...)  # base64 Ed25519 signature
+    agent_id: Optional[str] = Field(default=None)
+    memory_id: Optional[str] = Field(default=None)
+    timestamp: Optional[str] = Field(default=None)
+    signature: Optional[str] = Field(default=None)
 
 
 class ProvenanceInfo(BaseModel):

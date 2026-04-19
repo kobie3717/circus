@@ -60,27 +60,39 @@ def client(temp_db):
 
 
 def test_publish_valid_preference_memory(client):
-    """Valid preference memory should be accepted and land in shared_memories."""
-    payload = {
-        "category": "user_preference",
-        "domain": "preference.user",
-        "content": "User prefers Afrikaans for bot responses",
-        "confidence": 0.85,
-        "provenance": {
-            "owner_id": "kobus",
-            "reasoning": "User explicitly requested Afrikaans"
-        },
-        "preference": {
-            "field": "user.language_preference",
-            "value": "af"
-        }
-    }
+    """Valid preference memory should be accepted and land in shared_memories (W5 updated)."""
+    from unittest.mock import patch
 
-    response = client.post("/api/v1/memory-commons/publish", json=payload)
-    assert response.status_code == 200, f"Publish failed: {response.json()}"
-    data = response.json()
-    assert "memory_id" in data
-    assert data["memory_id"].startswith("shmem-")
+    # Mock secrets.token_hex to return a predictable value for owner_binding.memory_id
+    with patch('secrets.token_hex', return_value='validtest123456'):
+        expected_memory_id = "shmem-validtest123456"
+
+        payload = {
+            "category": "user_preference",
+            "domain": "preference.user",
+            "content": "User prefers Afrikaans for bot responses",
+            "confidence": 0.85,
+            "provenance": {
+                "owner_id": "kobus",
+                "reasoning": "User explicitly requested Afrikaans",
+                "owner_binding": {
+                    "agent_id": "agent-test-123",
+                    "memory_id": expected_memory_id,
+                    "timestamp": "2026-04-19T10:00:00Z",
+                    "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"
+                }
+            },
+            "preference": {
+                "field": "user.language_preference",
+                "value": "af"
+            }
+        }
+
+        response = client.post("/api/v1/memory-commons/publish", json=payload)
+        assert response.status_code == 200, f"Publish failed: {response.json()}"
+        data = response.json()
+        assert "memory_id" in data
+        assert data["memory_id"] == expected_memory_id
 
 
 def test_publish_preference_with_invalid_field_rejects(client):
@@ -163,3 +175,238 @@ def test_publish_preference_without_owner_id_rejects(client):
     response = client.post("/api/v1/memory-commons/publish", json=payload)
     assert response.status_code == 400
     assert "requires provenance.owner_id" in response.json()["detail"]
+
+
+# Week 5 (5.3): Publish-side owner_binding validation tests
+
+
+def test_publish_preference_without_owner_binding_returns_400(client):
+    """Preference memory without owner_binding should be rejected with 400 (W5 R1)."""
+    payload = {
+        "category": "user_preference",
+        "domain": "preference.user",
+        "content": "User prefers Afrikaans",
+        "confidence": 0.85,
+        "provenance": {
+            "owner_id": "kobus"
+            # Missing owner_binding
+        },
+        "preference": {
+            "field": "user.language_preference",
+            "value": "af"
+        }
+    }
+
+    response = client.post("/api/v1/memory-commons/publish", json=payload)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "missing owner_binding"
+
+
+def test_publish_preference_with_owner_binding_missing_signature_returns_400(client):
+    """owner_binding without signature should be rejected with 400 (W5 R2)."""
+    payload = {
+        "category": "user_preference",
+        "domain": "preference.user",
+        "content": "User prefers terse responses",
+        "confidence": 0.85,
+        "provenance": {
+            "owner_id": "kobus",
+            "owner_binding": {
+                "agent_id": "agent-test-123",
+                "memory_id": "shmem-abc123",
+                "timestamp": "2026-04-19T10:00:00Z"
+                # Missing signature
+            }
+        },
+        "preference": {
+            "field": "user.response_verbosity",
+            "value": "terse"
+        }
+    }
+
+    response = client.post("/api/v1/memory-commons/publish", json=payload)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "owner_binding missing signature"
+
+
+def test_publish_preference_with_owner_binding_missing_agent_id_returns_400(client):
+    """owner_binding without agent_id should be rejected with 400 (W5 R2)."""
+    payload = {
+        "category": "user_preference",
+        "domain": "preference.user",
+        "content": "User prefers casual tone",
+        "confidence": 0.85,
+        "provenance": {
+            "owner_id": "kobus",
+            "owner_binding": {
+                "memory_id": "shmem-abc123",
+                "timestamp": "2026-04-19T10:00:00Z",
+                "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"
+                # Missing agent_id
+            }
+        },
+        "preference": {
+            "field": "user.tone_preference",
+            "value": "casual"
+        }
+    }
+
+    response = client.post("/api/v1/memory-commons/publish", json=payload)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "owner_binding missing agent_id"
+
+
+def test_publish_preference_with_owner_binding_missing_memory_id_returns_400(client):
+    """owner_binding without memory_id should be rejected with 400 (W5 R2)."""
+    payload = {
+        "category": "user_preference",
+        "domain": "preference.user",
+        "content": "User prefers markdown format",
+        "confidence": 0.85,
+        "provenance": {
+            "owner_id": "kobus",
+            "owner_binding": {
+                "agent_id": "agent-test-123",
+                "timestamp": "2026-04-19T10:00:00Z",
+                "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"
+                # Missing memory_id
+            }
+        },
+        "preference": {
+            "field": "user.format_preference",
+            "value": "markdown"
+        }
+    }
+
+    response = client.post("/api/v1/memory-commons/publish", json=payload)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "owner_binding missing memory_id"
+
+
+def test_publish_preference_with_owner_binding_missing_timestamp_returns_400(client):
+    """owner_binding without timestamp should be rejected with 400 (W5 R2)."""
+    payload = {
+        "category": "user_preference",
+        "domain": "preference.user",
+        "content": "User prefers verbose explanations",
+        "confidence": 0.85,
+        "provenance": {
+            "owner_id": "kobus",
+            "owner_binding": {
+                "agent_id": "agent-test-123",
+                "memory_id": "shmem-abc123",
+                "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"
+                # Missing timestamp
+            }
+        },
+        "preference": {
+            "field": "user.response_verbosity",
+            "value": "verbose"
+        }
+    }
+
+    response = client.post("/api/v1/memory-commons/publish", json=payload)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "owner_binding missing timestamp"
+
+
+def test_publish_preference_with_memory_id_mismatch_returns_400(client):
+    """owner_binding.memory_id not matching actual memory_id should be rejected (W5 R3)."""
+    payload = {
+        "category": "user_preference",
+        "domain": "preference.user",
+        "content": "User prefers Afrikaans",
+        "confidence": 0.85,
+        "provenance": {
+            "owner_id": "kobus",
+            "owner_binding": {
+                "agent_id": "agent-test-123",
+                "memory_id": "shmem-wrongid",  # This won't match the server-generated ID
+                "timestamp": "2026-04-19T10:00:00Z",
+                "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"
+            }
+        },
+        "preference": {
+            "field": "user.language_preference",
+            "value": "af"
+        }
+    }
+
+    response = client.post("/api/v1/memory-commons/publish", json=payload)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "owner_binding memory_id mismatch"
+
+
+def test_publish_preference_with_well_formed_binding_passes_shape_validation(client):
+    """Preference with all owner_binding fields should pass shape validation (W5 R5).
+
+    Note: Signature may be garbage — cryptographic verification is admission's job.
+    This test only validates that publish-side accepts well-formed structure.
+    """
+    # First, make a request to get a memory_id, then use that in the binding
+    # Actually, we need to know the memory_id in advance. Since it's server-generated,
+    # we'll need to mock or pre-determine it. For now, let's test that the validation
+    # logic accepts a properly structured request.
+
+    # Import to generate a predictable memory_id for testing
+    import secrets
+    from unittest.mock import patch
+
+    # Mock secrets.token_hex to return a predictable value
+    with patch('secrets.token_hex', return_value='0123456789abcdef'):
+        expected_memory_id = "shmem-0123456789abcdef"
+
+        payload = {
+            "category": "user_preference",
+            "domain": "preference.user",
+            "content": "User prefers Afrikaans",
+            "confidence": 0.85,
+            "provenance": {
+                "owner_id": "kobus",
+                "owner_binding": {
+                    "agent_id": "agent-test-123",
+                    "memory_id": expected_memory_id,  # Matches the mocked generated ID
+                    "timestamp": "2026-04-19T10:00:00Z",
+                    "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"  # Garbage signature, admission will verify
+                }
+            },
+            "preference": {
+                "field": "user.language_preference",
+                "value": "af"
+            }
+        }
+
+        response = client.post("/api/v1/memory-commons/publish", json=payload)
+        # Should pass publish-side validation (200 or 201)
+        # May be skipped at admission-side due to invalid signature, but that's not this test's concern
+        assert response.status_code == 200, f"Publish failed: {response.json()}"
+        data = response.json()
+        assert data["memory_id"] == expected_memory_id
+
+
+def test_publish_non_preference_with_owner_binding_is_ignored(client):
+    """Non-preference memory with owner_binding should be accepted (W5 R6).
+
+    owner_binding is only required for preference memories. For other categories,
+    it's structurally harmless and should be ignored.
+    """
+    payload = {
+        "category": "belief",
+        "domain": "general.testing",
+        "content": "Testing shows that owner_binding is harmless on non-preferences",
+        "confidence": 0.9,
+        "provenance": {
+            "owner_id": "kobus",
+            "owner_binding": {
+                "agent_id": "agent-test-123",
+                "memory_id": "shmem-whatever",
+                "timestamp": "2026-04-19T10:00:00Z",
+                "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"
+            }
+        }
+    }
+
+    response = client.post("/api/v1/memory-commons/publish", json=payload)
+    assert response.status_code == 200, f"Publish failed: {response.json()}"
+    data = response.json()
+    assert "memory_id" in data

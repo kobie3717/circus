@@ -84,6 +84,20 @@ def client(temp_db, reset_server_owner):
     return client
 
 
+def _make_owner_binding_for_memory_id(memory_id: str) -> dict:
+    """Helper to create a valid (but garbage-signed) owner_binding for testing.
+
+    W5: Publish-side requires owner_binding structure for preference memories.
+    Signature can be garbage since admission-side verification is separate.
+    """
+    return {
+        "agent_id": "agent-test-123",
+        "memory_id": memory_id,
+        "timestamp": "2026-04-19T10:00:00Z",
+        "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"  # garbage base64, admission will skip
+    }
+
+
 def test_preference_flows_through_merge_pipeline(client):
     """Test: preference memory flows through belief merge pipeline without exceptions.
 
@@ -101,31 +115,36 @@ def test_preference_flows_through_merge_pipeline(client):
         admission_module._SERVER_OWNER = None
         admission_module._WARN_LOGGED = False
 
-        payload = {
-            "category": "user_preference",
-            "domain": "preference.user",
-            "content": "User prefers Afrikaans for bot responses",
-            "confidence": 0.85,
-            "provenance": {
-                "owner_id": "kobus",
-                "reasoning": "User explicitly requested Afrikaans"
-            },
-            "preference": {
-                "field": "user.language_preference",
-                "value": "af"
+        # W5: Mock memory_id generation to enable owner_binding.memory_id match
+        with patch('secrets.token_hex', return_value='flowtest12345678'):
+            expected_memory_id = "shmem-flowtest12345678"
+
+            payload = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "User prefers Afrikaans for bot responses",
+                "confidence": 0.85,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "reasoning": "User explicitly requested Afrikaans",
+                    "owner_binding": _make_owner_binding_for_memory_id(expected_memory_id)
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "af"
+                }
             }
-        }
 
-        # Publish preference (goes through merge pipeline + admission)
-        response = client.post("/api/v1/memory-commons/publish", json=payload)
-        assert response.status_code == 200, f"Publish failed: {response.json()}"
+            # Publish preference (goes through merge pipeline + admission)
+            response = client.post("/api/v1/memory-commons/publish", json=payload)
+            assert response.status_code == 200, f"Publish failed: {response.json()}"
 
-        data = response.json()
-        assert "memory_id" in data
-        assert data["memory_id"].startswith("shmem-")
+            data = response.json()
+            assert "memory_id" in data
+            assert data["memory_id"] == expected_memory_id
 
-        # Verify preference_activated is True in response
-        assert data.get("preference_activated") is True, "preference_activated should be True"
+            # Verify preference_activated is True in response
+            assert data.get("preference_activated") is True, "preference_activated should be True"
 
         # Verify memory landed in shared_memories
         with get_db() as conn:
@@ -177,36 +196,41 @@ def test_admission_fires_exactly_once_per_publish(client):
             return original_admit(*args, **kwargs)
 
         with patch.object(preference_admission, "admit_preference", side_effect=counting_wrapper):
-            payload = {
-                "category": "user_preference",
-                "domain": "preference.user",
-                "content": "User prefers terse responses",
-                "confidence": 0.8,
-                "provenance": {
-                    "owner_id": "kobus"
-                },
-                "preference": {
-                    "field": "user.response_verbosity",
-                    "value": "terse"
+            # W5: Mock memory_id generation to enable owner_binding.memory_id match
+            with patch('secrets.token_hex', return_value='oncetest12345678'):
+                expected_memory_id = "shmem-oncetest12345678"
+
+                payload = {
+                    "category": "user_preference",
+                    "domain": "preference.user",
+                    "content": "User prefers terse responses",
+                    "confidence": 0.8,
+                    "provenance": {
+                        "owner_id": "kobus",
+                        "owner_binding": _make_owner_binding_for_memory_id(expected_memory_id)
+                    },
+                    "preference": {
+                        "field": "user.response_verbosity",
+                        "value": "terse"
+                    }
                 }
-            }
 
-            # Publish preference
-            response = client.post("/api/v1/memory-commons/publish", json=payload)
-            assert response.status_code == 200
+                # Publish preference
+                response = client.post("/api/v1/memory-commons/publish", json=payload)
+                assert response.status_code == 200
 
-            # THE assertion: admit_preference called EXACTLY once
-            assert call_count == 1, f"Expected admit_preference to be called exactly once, got {call_count}"
+                # THE assertion: admit_preference called EXACTLY once
+                assert call_count == 1, f"Expected admit_preference to be called exactly once, got {call_count}"
 
-            # Verify active_preferences has exactly 1 row for this owner+field
-            with get_db() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT COUNT(*) FROM active_preferences WHERE owner_id = ? AND field_name = ?",
-                    ("kobus", "user.response_verbosity")
-                )
-                row_count = cursor.fetchone()[0]
-                assert row_count == 1, f"Expected exactly 1 row in active_preferences, got {row_count}"
+                # Verify active_preferences has exactly 1 row for this owner+field
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM active_preferences WHERE owner_id = ? AND field_name = ?",
+                        ("kobus", "user.response_verbosity")
+                    )
+                    row_count = cursor.fetchone()[0]
+                    assert row_count == 1, f"Expected exactly 1 row in active_preferences, got {row_count}"
 
 
 def test_conflict_detection_does_not_corrupt_active_preferences(client):
@@ -257,23 +281,28 @@ def test_conflict_detection_does_not_corrupt_active_preferences(client):
             conn.commit()
 
         # Publish new conflicting preference (same field, different value, higher confidence)
-        payload = {
-            "category": "user_preference",
-            "domain": "preference.user",
-            "content": "User prefers casual tone now",
-            "confidence": 0.85,
-            "provenance": {
-                "owner_id": "kobus"
-            },
-            "preference": {
-                "field": "user.tone_preference",
-                "value": "casual"
-            }
-        }
+        # W5: Mock memory_id generation to enable owner_binding.memory_id match
+        with patch('secrets.token_hex', return_value='conflicttest1234'):
+            expected_memory_id = "shmem-conflicttest1234"
 
-        response = client.post("/api/v1/memory-commons/publish", json=payload)
-        assert response.status_code == 200
-        data = response.json()
+            payload = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "User prefers casual tone now",
+                "confidence": 0.85,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "owner_binding": _make_owner_binding_for_memory_id(expected_memory_id)
+                },
+                "preference": {
+                    "field": "user.tone_preference",
+                    "value": "casual"
+                }
+            }
+
+            response = client.post("/api/v1/memory-commons/publish", json=payload)
+            assert response.status_code == 200
+            data = response.json()
 
         # Verify active_preferences has correct final row
         with get_db() as conn:
@@ -325,42 +354,51 @@ def test_preference_with_update_semantics(client):
         admission_module._WARN_LOGGED = False
 
         # Publish v1
-        payload_v1 = {
-            "category": "user_preference",
-            "domain": "preference.user",
-            "content": "User prefers Afrikaans",
-            "confidence": 0.8,
-            "provenance": {
-                "owner_id": "kobus"
-            },
-            "preference": {
-                "field": "user.language_preference",
-                "value": "af"
-            }
-        }
+        # W5: Mock memory_id generation to enable owner_binding.memory_id match
+        with patch('secrets.token_hex', return_value='updatev1test1234'):
+            memory_id_v1 = "shmem-updatev1test1234"
 
-        response_v1 = client.post("/api/v1/memory-commons/publish", json=payload_v1)
-        assert response_v1.status_code == 200
-        memory_id_v1 = response_v1.json()["memory_id"]
+            payload_v1 = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "User prefers Afrikaans",
+                "confidence": 0.8,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id_v1)
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "af"
+                }
+            }
+
+            response_v1 = client.post("/api/v1/memory-commons/publish", json=payload_v1)
+            assert response_v1.status_code == 200
+            assert response_v1.json()["memory_id"] == memory_id_v1
 
         # Publish v2 (update)
-        payload_v2 = {
-            "category": "user_preference",
-            "domain": "preference.user",
-            "content": "User changed preference to English",
-            "confidence": 0.85,
-            "provenance": {
-                "owner_id": "kobus"
-            },
-            "preference": {
-                "field": "user.language_preference",
-                "value": "en"
-            }
-        }
+        with patch('secrets.token_hex', return_value='updatev2test5678'):
+            memory_id_v2 = "shmem-updatev2test5678"
 
-        response_v2 = client.post("/api/v1/memory-commons/publish", json=payload_v2)
-        assert response_v2.status_code == 200
-        memory_id_v2 = response_v2.json()["memory_id"]
+            payload_v2 = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "User changed preference to English",
+                "confidence": 0.85,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id_v2)
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "en"
+                }
+            }
+
+            response_v2 = client.post("/api/v1/memory-commons/publish", json=payload_v2)
+            assert response_v2.status_code == 200
+            assert response_v2.json()["memory_id"] == memory_id_v2
 
         # Verify active_preferences has exactly 1 row
         with get_db() as conn:
