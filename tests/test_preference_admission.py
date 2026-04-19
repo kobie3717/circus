@@ -687,7 +687,7 @@ def test_missing_owner_binding_at_admission_skips_with_owner_signature_missing(c
                     owner_binding=None  # Missing binding
                 )
 
-                assert result is False, "Should skip with missing owner_binding"
+                assert result.admitted is False, "Should skip with missing owner_binding"
 
         # Check skip log reason
         skip_logs = [rec for rec in caplog.records if rec.levelname == "INFO" and hasattr(rec, 'reason')]

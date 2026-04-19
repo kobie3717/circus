@@ -16,6 +16,7 @@ Structured logging for operational visibility:
 import logging
 import os
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -23,6 +24,16 @@ from circus.config import settings
 from circus.services.owner_verification import verify_owner_binding
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PreferenceDecision:
+    """Result of preference admission with gate-by-gate trace."""
+    admitted: bool
+    gates: list[dict]
+    reason: str | None = None  # skip reason if not admitted
+    field: str | None = None
+    value: str | None = None
 
 # Module-level cached owner ID + warning state
 _SERVER_OWNER: str | None = None
@@ -61,7 +72,7 @@ def admit_preference(
     agent_id: str,
     shared_at: str,
     owner_binding: Optional[dict] = None,
-) -> bool:
+) -> PreferenceDecision:
     """Admit a preference memory to active_preferences (if gates pass).
 
     This is the consume-side trust gate. Checks (W4 + W5):
@@ -83,14 +94,22 @@ def admit_preference(
         owner_binding: Owner signature binding from provenance (W5)
 
     Returns:
-        True if written to active_preferences, False if skipped
+        PreferenceDecision with gates trace and admission result
 
     Side effects:
         - On success: upserts row in active_preferences
         - On skip: logs INFO with structured reason code
     """
+    gates = []
+    threshold = settings.preference_activation_threshold
+
     # Gate 1: Server owner configured
     server_owner = _get_server_owner()
+    gates.append({
+        "gate": "server_owner_configured",
+        "passed": bool(server_owner)
+    })
+
     if not server_owner:
         logger.info(
             "preference_skipped",
@@ -102,10 +121,23 @@ def admit_preference(
                 "effective_confidence": effective_confidence,
             },
         )
-        return False
+        return PreferenceDecision(
+            admitted=False,
+            gates=gates,
+            reason="same_owner_failed",
+            field=preference_field,
+            value=preference_value
+        )
 
     # Gate 2: Same-owner check
-    if owner_id != server_owner:
+    owner_match = owner_id == server_owner
+    gates.append({
+        "gate": "same_owner_match",
+        "passed": owner_match,
+        "owner_id": owner_id if owner_match else None
+    })
+
+    if not owner_match:
         logger.info(
             "preference_skipped",
             extra={
@@ -116,11 +148,21 @@ def admit_preference(
                 "effective_confidence": effective_confidence,
             },
         )
-        return False
+        # Mark remaining gates as not evaluated
+        gates.append({"gate": "owner_signature_valid", "passed": None})
+        gates.append({"gate": "confidence_threshold", "passed": None})
+        return PreferenceDecision(
+            admitted=False,
+            gates=gates,
+            reason="same_owner_failed",
+            field=preference_field,
+            value=preference_value
+        )
 
     # Gate 3 (W5): Owner signature verification
     # Defense in depth: check if owner_binding exists (should be validated at publish, but federation path might bypass)
     if not owner_binding:
+        gates.append({"gate": "owner_signature_valid", "passed": False})
         logger.info(
             "preference_skipped",
             extra={
@@ -131,7 +173,14 @@ def admit_preference(
                 "effective_confidence": effective_confidence,
             },
         )
-        return False
+        gates.append({"gate": "confidence_threshold", "passed": None})
+        return PreferenceDecision(
+            admitted=False,
+            gates=gates,
+            reason="owner_signature_missing",
+            field=preference_field,
+            value=preference_value
+        )
 
     # Verify owner signature (cryptographic gate)
     result = verify_owner_binding(
@@ -144,6 +193,8 @@ def admit_preference(
         conn=conn,
     )
 
+    gates.append({"gate": "owner_signature_valid", "passed": result.valid})
+
     if not result.valid:
         logger.info(
             "preference_skipped",
@@ -155,11 +206,25 @@ def admit_preference(
                 "effective_confidence": effective_confidence,
             },
         )
-        return False
+        gates.append({"gate": "confidence_threshold", "passed": None})
+        return PreferenceDecision(
+            admitted=False,
+            gates=gates,
+            reason=result.reason,
+            field=preference_field,
+            value=preference_value
+        )
 
     # Gate 4: Confidence threshold check
-    threshold = settings.preference_activation_threshold
-    if effective_confidence < threshold:
+    confidence_pass = effective_confidence >= threshold
+    gates.append({
+        "gate": "confidence_threshold",
+        "passed": confidence_pass,
+        "value": float(effective_confidence),
+        "threshold": float(threshold)
+    })
+
+    if not confidence_pass:
         logger.info(
             "preference_skipped",
             extra={
@@ -171,7 +236,13 @@ def admit_preference(
                 "threshold": float(threshold),
             },
         )
-        return False
+        return PreferenceDecision(
+            admitted=False,
+            gates=gates,
+            reason="confidence_below_threshold",
+            field=preference_field,
+            value=preference_value
+        )
 
     # All gates passed — upsert to active_preferences
     cursor = conn.cursor()
@@ -189,4 +260,10 @@ def admit_preference(
         (owner_id, preference_field, preference_value, memory_id, effective_confidence, now.isoformat()),
     )
 
-    return True
+    return PreferenceDecision(
+        admitted=True,
+        gates=gates,
+        reason=None,
+        field=preference_field,
+        value=preference_value
+    )

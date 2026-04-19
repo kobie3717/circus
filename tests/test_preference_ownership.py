@@ -121,7 +121,7 @@ def test_same_owner_success(reset_server_owner):
             )
 
             # Should succeed
-            assert result is True
+            assert result.admitted is True
 
             # Verify row in active_preferences
             cursor = conn.cursor()
@@ -160,7 +160,7 @@ def test_same_owner_mismatch(reset_server_owner):
             )
 
             # Should be rejected (at same-owner gate, before signature check)
-            assert result is False
+            assert result.admitted is False
 
             # Verify NO row in active_preferences for jaco
             cursor = conn.cursor()
@@ -266,7 +266,7 @@ def test_preference_memory_audit_trail_preserved_on_skip(reset_server_owner):
             )
 
             # Should be rejected
-            assert result is False
+            assert result.admitted is False
 
             # Verify memory STILL exists in shared_memories
             cursor.execute("SELECT id FROM shared_memories WHERE id = ?", (unique_id,))

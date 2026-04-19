@@ -454,3 +454,4 @@ class PublishResponseWithConflict(BaseModel):
     match_scores: list[float]
     conflict_resolution: Optional[ConflictResolution] = None
     preference_activated: Optional[bool] = None  # Week 4: True if preference was admitted to active_preferences
+    decision_trace: Optional[dict[str, Any]] = None  # Week 6: Gate-by-gate preference admission trace

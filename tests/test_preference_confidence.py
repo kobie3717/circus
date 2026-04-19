@@ -120,7 +120,7 @@ def test_preference_above_threshold_admitted(reset_server_owner):
             )
 
             # Should succeed
-            assert result is True
+            assert result.admitted is True
 
             # Verify row in active_preferences
             cursor = conn.cursor()
@@ -200,7 +200,7 @@ def test_preference_below_threshold_skipped(reset_server_owner, caplog):
                 )
 
             # Should be rejected
-            assert result is False
+            assert result.admitted is False
 
             # Verify NO row in active_preferences
             cursor.execute(
@@ -271,7 +271,7 @@ def test_preference_at_exact_threshold_admitted(reset_server_owner):
             )
 
             # Should succeed (>= semantics)
-            assert result is True
+            assert result.admitted is True
 
             # Verify row in active_preferences
             cursor = conn.cursor()

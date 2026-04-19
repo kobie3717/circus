@@ -414,7 +414,9 @@ async def publish_memory(
         )
 
         # Week 4 (4.2): Preference admission (if user_preference memory)
+        # Week 6: Returns decision trace for observability
         preference_activated = None
+        decision_trace = None
         if mem_req.category == "user_preference" and mem_req.preference:
             from circus.services.preference_admission import admit_preference
 
@@ -428,7 +430,7 @@ async def publish_memory(
                     "signature": mem_req.provenance.owner_binding.signature,
                 }
 
-            preference_activated = admit_preference(
+            decision = admit_preference(
                 conn,
                 memory_id=memory_id,
                 owner_id=mem_req.provenance.owner_id,  # Already validated to exist (gate 4 above)
@@ -442,6 +444,15 @@ async def publish_memory(
             )
             # 4.4 coexistence: commit admission write (get_db() context doesn't auto-commit)
             conn.commit()
+
+            # W6: Build decision trace for response
+            preference_activated = decision.admitted
+            decision_trace = {
+                "gates": decision.gates,
+                "outcome": "activated" if decision.admitted else decision.reason,
+                "field": decision.field,
+                "value": decision.value
+            }
 
         # Semantic routing: find matching goals
         matches = goal_router.find_matching_goals(
@@ -473,13 +484,19 @@ async def publish_memory(
                 match_score=match['match_score']
             )
 
-        return PublishResponseWithConflict(
-            memory_id=memory_id,
-            routed_to=[m['goal_id'] for m in matches],
-            match_scores=[m['match_score'] for m in matches],
-            conflict_resolution=conflict_result,
-            preference_activated=preference_activated
-        )
+        response_data = {
+            "memory_id": memory_id,
+            "routed_to": [m['goal_id'] for m in matches],
+            "match_scores": [m['match_score'] for m in matches],
+            "conflict_resolution": conflict_result,
+            "preference_activated": preference_activated
+        }
+
+        # W6: Add decision_trace if available
+        if decision_trace:
+            response_data["decision_trace"] = decision_trace
+
+        return PublishResponseWithConflict(**response_data)
 
 
 @router.get("/stream")
@@ -791,3 +808,81 @@ async def release_domain_claim(
         conn.commit()
 
         return {"status": "released", "claim_id": claim_id}
+
+
+# Preference Inspector API endpoints (Week 6)
+
+
+@router.get("/preferences/{owner_id}")
+async def list_preferences(
+    owner_id: str,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    List active preferences for an owner.
+
+    Requires ring token auth. Returns all active preferences.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT field_name, value, effective_confidence, updated_at
+            FROM active_preferences
+            WHERE owner_id = ?
+            ORDER BY updated_at DESC
+        """, (owner_id,))
+
+        preferences = []
+        for row in cursor.fetchall():
+            preferences.append({
+                "field": row[0],
+                "value": row[1],
+                "confidence": row[2],
+                "updated_at": row[3]
+            })
+
+        return {
+            "owner_id": owner_id,
+            "preferences": preferences,
+            "count": len(preferences)
+        }
+
+
+@router.delete("/preferences/{owner_id}/{field_name}")
+async def clear_preference(
+    owner_id: str,
+    field_name: str,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Clear (delete) a specific preference for an owner.
+
+    Operator override — requires ring token auth.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Check if preference exists
+        cursor.execute("""
+            SELECT 1 FROM active_preferences
+            WHERE owner_id = ? AND field_name = ?
+        """, (owner_id, field_name))
+
+        if not cursor.fetchone():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Preference not found"
+            )
+
+        # Delete preference
+        cursor.execute("""
+            DELETE FROM active_preferences
+            WHERE owner_id = ? AND field_name = ?
+        """, (owner_id, field_name))
+        conn.commit()
+
+        return {
+            "status": "cleared",
+            "owner_id": owner_id,
+            "field_name": field_name
+        }

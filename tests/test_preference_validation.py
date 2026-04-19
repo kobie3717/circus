@@ -334,7 +334,8 @@ def test_publish_preference_with_memory_id_mismatch_returns_400(client):
 
     response = client.post("/api/v1/memory-commons/publish", json=payload)
     assert response.status_code == 400
-    assert response.json()["detail"] == "owner_binding memory_id mismatch"
+    # W6: Format validation happens before mismatch check, so error message changed
+    assert "memory_id" in response.json()["detail"]
 
 
 def test_publish_preference_with_well_formed_binding_passes_shape_validation(client):

@@ -391,6 +391,145 @@ class CircusCLI:
         print(f"  Public key file: {public_key_file}")
         print(f"  DB row inserted: owner_keys.owner_id = {args.owner}")
 
+    def preference_list(self, args):
+        """List active preferences for an owner."""
+        from circus.database import get_db
+
+        owner_filter = args.owner if args.owner else None
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            if owner_filter:
+                cursor.execute("""
+                    SELECT owner_id, field_name, value, effective_confidence, updated_at
+                    FROM active_preferences
+                    WHERE owner_id = ?
+                    ORDER BY owner_id, field_name
+                """, (owner_filter,))
+            else:
+                cursor.execute("""
+                    SELECT owner_id, field_name, value, effective_confidence, updated_at
+                    FROM active_preferences
+                    ORDER BY owner_id, field_name
+                """)
+
+            rows = cursor.fetchall()
+
+            if not rows:
+                print("No active preferences found")
+                return
+
+            # Pretty print table
+            print(f"\nActive Preferences ({len(rows)}):\n")
+            print(f"{'Owner':<15} {'Field':<30} {'Value':<20} {'Confidence':<12} {'Updated':<20}")
+            print("-" * 100)
+
+            for row in rows:
+                owner_id = row[0]
+                field_name = row[1]
+                value = row[2][:17] + "..." if len(row[2]) > 20 else row[2]
+                confidence = f"{row[3]:.2f}"
+                updated = row[4][:19] if row[4] else "N/A"
+
+                print(f"{owner_id:<15} {field_name:<30} {value:<20} {confidence:<12} {updated:<20}")
+
+    def preference_clear(self, args):
+        """Clear (delete) a preference from active_preferences."""
+        from circus.database import get_db
+
+        owner = args.owner if args.owner else None
+        field = args.field
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            if owner:
+                # Clear specific owner's preference
+                cursor.execute("""
+                    DELETE FROM active_preferences
+                    WHERE owner_id = ? AND field_name = ?
+                """, (owner, field))
+            else:
+                # Clear preference for all owners
+                cursor.execute("""
+                    DELETE FROM active_preferences
+                    WHERE field_name = ?
+                """, (field,))
+
+            deleted = cursor.rowcount
+            conn.commit()
+
+            if deleted == 0:
+                print(f"No preferences found for field '{field}'")
+            else:
+                print(f"✓ Cleared {deleted} preference(s) for field '{field}'")
+
+    def preference_history(self, args):
+        """Show preference change history from shared_memories audit trail."""
+        from circus.database import get_db
+
+        field_filter = args.field if args.field else None
+        owner_filter = args.owner if args.owner else None
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            # Build query with filters
+            query = """
+                SELECT id, from_agent_id, content, confidence, shared_at, provenance
+                FROM shared_memories
+                WHERE category = 'user_preference'
+            """
+            params = []
+
+            if owner_filter:
+                query += " AND json_extract(provenance, '$.owner_id') = ?"
+                params.append(owner_filter)
+
+            query += " ORDER BY shared_at DESC LIMIT 50"
+
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+
+            if not rows:
+                print("No preference history found")
+                return
+
+            # Parse and filter by field if specified
+            import json
+            filtered_rows = []
+
+            for row in rows:
+                try:
+                    # Try to extract field from content (format varies)
+                    provenance = json.loads(row[5]) if row[5] else {}
+                    # Field info is in the memory content, not stored separately
+                    # For now, show all if no field filter, or include if field_filter in content
+                    if not field_filter or (field_filter in row[2]):
+                        filtered_rows.append(row)
+                except:
+                    pass
+
+            if not filtered_rows:
+                print(f"No preference history found for field '{field_filter}'")
+                return
+
+            # Pretty print
+            print(f"\nPreference History ({len(filtered_rows)} entries):\n")
+            print(f"{'Memory ID':<20} {'Agent':<20} {'Confidence':<12} {'Shared At':<20}")
+            print("-" * 80)
+
+            for row in filtered_rows:
+                mem_id = row[0][:17] + "..."
+                agent_id = row[1][:17] + "..."
+                confidence = f"{row[3]:.2f}"
+                shared_at = row[4][:19]
+
+                print(f"{mem_id:<20} {agent_id:<20} {confidence:<12} {shared_at:<20}")
+                print(f"  Content: {row[2][:70]}...")
+                print()
+
 
 def main():
     """Main CLI entry point."""
@@ -485,6 +624,24 @@ def main():
     add_parser.add_argument("--public-key-file", required=True, help="Path to public key file")
     add_parser.add_argument("--description", help="Optional description")
 
+    # Preference command (Week 6)
+    preference_parser = subparsers.add_parser("preference", help="Preference inspector commands")
+    preference_subparsers = preference_parser.add_subparsers(dest="preference_command", help="Preference subcommands")
+
+    # preference list
+    pref_list_parser = preference_subparsers.add_parser("list", help="List active preferences")
+    pref_list_parser.add_argument("--owner", help="Filter by owner ID")
+
+    # preference clear
+    pref_clear_parser = preference_subparsers.add_parser("clear", help="Clear a preference")
+    pref_clear_parser.add_argument("field", help="Preference field name to clear")
+    pref_clear_parser.add_argument("--owner", help="Owner ID (if omitted, clears for all owners)")
+
+    # preference history
+    pref_history_parser = preference_subparsers.add_parser("history", help="Show preference history")
+    pref_history_parser.add_argument("--field", help="Filter by field name")
+    pref_history_parser.add_argument("--owner", help="Filter by owner ID")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -515,6 +672,19 @@ def main():
         cli.owner_keygen(args)
     elif args.command == "owner-add":
         cli.owner_add(args)
+    elif args.command == "preference":
+        if not hasattr(args, 'preference_command') or not args.preference_command:
+            print("Usage: circus preference {list|clear|history} [options]", file=sys.stderr)
+            sys.exit(1)
+        elif args.preference_command == "list":
+            cli.preference_list(args)
+        elif args.preference_command == "clear":
+            cli.preference_clear(args)
+        elif args.preference_command == "history":
+            cli.preference_history(args)
+        else:
+            print("Unknown preference subcommand", file=sys.stderr)
+            sys.exit(1)
     elif args.command == "hull":
         from circus.services.hull_integrity import (
             check_session, scan_session_dir, readiness_board, build_report
