@@ -1,40 +1,123 @@
-"""Tests for same-owner enforcement in preference admission (Week 4 sub-step 4.2)."""
+"""Tests for same-owner enforcement in preference admission (Week 4 sub-step 4.2, Week 5 5.4 update)."""
 
+import base64
 import os
 from datetime import datetime
 from unittest.mock import patch
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 
 from circus.database import get_db
 from circus.services.preference_admission import admit_preference
 from circus.services.preference_application import get_active_preferences
+from circus.services.bundle_signing import canonicalize_for_signing
 
 
 @pytest.fixture
 def reset_server_owner():
-    """Reset the cached server owner between tests."""
+    """Reset the cached server owner between tests and clean owner_keys table."""
     import circus.services.preference_admission as admission_module
     admission_module._SERVER_OWNER = None
     admission_module._WARN_LOGGED = False
+    # Clean owner_keys before test to avoid UNIQUE constraint failures
+    with get_db() as conn:
+        conn.execute("DELETE FROM owner_keys")
+        conn.commit()
     yield
     admission_module._SERVER_OWNER = None
     admission_module._WARN_LOGGED = False
+    # Clean up after test too
+    with get_db() as conn:
+        conn.execute("DELETE FROM owner_keys")
+        conn.commit()
+
+
+def _generate_test_keypair():
+    """Generate Ed25519 keypair for testing."""
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    private_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    public_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+
+    return private_key, private_bytes, public_bytes
+
+
+def _insert_owner_key(conn, owner_id: str, public_key_b64: str):
+    """Helper to insert owner key into DB."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO owner_keys (owner_id, public_key, created_at) VALUES (?, ?, ?)",
+        (owner_id, public_key_b64, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+
+
+def _sign_owner_binding(private_key, owner_id: str, agent_id: str, memory_id: str, timestamp: str) -> str:
+    """Sign owner binding payload and return base64 signature."""
+    payload = {
+        "agent_id": agent_id,
+        "memory_id": memory_id,
+        "owner_id": owner_id,
+        "timestamp": timestamp,
+    }
+    canonical_bytes = canonicalize_for_signing(payload)
+    signature = private_key.sign(canonical_bytes)
+    return base64.b64encode(signature).decode('ascii')
 
 
 def test_same_owner_success(reset_server_owner):
-    """Test: server with CIRCUS_OWNER_ID=kobus admits preference with owner_id=kobus."""
+    """Test: server with CIRCUS_OWNER_ID=kobus admits preference with owner_id=kobus (W5: with valid signature)."""
     with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # W5: Generate owner keypair and insert
+        private_key, _, public_bytes = _generate_test_keypair()
+        public_key_b64 = base64.b64encode(public_bytes).decode('ascii')
+
         with get_db() as conn:
+            _insert_owner_key(conn, "kobus", public_key_b64)
+
+            # W5: Create valid owner_binding
+            memory_id = "shmem-test-123"
+            now = datetime.utcnow()
+            timestamp = now.isoformat()
+            shared_at = timestamp
+
+            signature = _sign_owner_binding(
+                private_key,
+                owner_id="kobus",
+                agent_id="agent-test",
+                memory_id=memory_id,
+                timestamp=timestamp
+            )
+
+            owner_binding = {
+                "agent_id": "agent-test",
+                "memory_id": memory_id,
+                "timestamp": timestamp,
+                "signature": signature
+            }
+
             # Admit preference for kobus
             result = admit_preference(
                 conn,
-                memory_id="shmem-test-123",
+                memory_id=memory_id,
                 owner_id="kobus",
                 preference_field="user.language_preference",
                 preference_value="af",
                 effective_confidence=0.85,
-                now=datetime.utcnow(),
+                now=now,
+                agent_id="agent-test",
+                shared_at=shared_at,
+                owner_binding=owner_binding,
             )
 
             # Should succeed
@@ -55,9 +138,13 @@ def test_same_owner_success(reset_server_owner):
 
 
 def test_same_owner_mismatch(reset_server_owner):
-    """Test: server with CIRCUS_OWNER_ID=kobus rejects preference with owner_id=jaco."""
+    """Test: server with CIRCUS_OWNER_ID=kobus rejects preference with owner_id=jaco (fails before signature check)."""
     with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
         with get_db() as conn:
+            # W5: owner_binding required but won't be checked (fails at same-owner gate first)
+            # Pass minimal params to avoid errors
+            now = datetime.utcnow()
+
             # Admit preference for jaco (different owner)
             result = admit_preference(
                 conn,
@@ -66,10 +153,13 @@ def test_same_owner_mismatch(reset_server_owner):
                 preference_field="user.tone_preference",
                 preference_value="formal",
                 effective_confidence=0.75,
-                now=datetime.utcnow(),
+                now=now,
+                agent_id="agent-jaco",
+                shared_at=now.isoformat(),
+                owner_binding=None,  # Will fail before signature check anyway
             )
 
-            # Should be rejected
+            # Should be rejected (at same-owner gate, before signature check)
             assert result is False
 
             # Verify NO row in active_preferences for jaco
@@ -83,18 +173,47 @@ def test_same_owner_mismatch(reset_server_owner):
 
 
 def test_get_active_preferences_owner_isolation(reset_server_owner):
-    """Test: get_active_preferences returns only the requested owner's prefs."""
+    """Test: get_active_preferences returns only the requested owner's prefs (W5: with valid signature)."""
     with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # W5: Generate owner keypair and insert
+        private_key, _, public_bytes = _generate_test_keypair()
+        public_key_b64 = base64.b64encode(public_bytes).decode('ascii')
+
         with get_db() as conn:
+            _insert_owner_key(conn, "kobus", public_key_b64)
+
+            # W5: Create valid owner_binding
+            memory_id = "shmem-kobus-pref"
+            now = datetime.utcnow()
+            timestamp = now.isoformat()
+
+            signature = _sign_owner_binding(
+                private_key,
+                owner_id="kobus",
+                agent_id="agent-test",
+                memory_id=memory_id,
+                timestamp=timestamp
+            )
+
+            owner_binding = {
+                "agent_id": "agent-test",
+                "memory_id": memory_id,
+                "timestamp": timestamp,
+                "signature": signature
+            }
+
             # Admit preference for kobus
             admit_preference(
                 conn,
-                memory_id="shmem-kobus-pref",
+                memory_id=memory_id,
                 owner_id="kobus",
                 preference_field="user.language_preference",
                 preference_value="af",
                 effective_confidence=0.85,
-                now=datetime.utcnow(),
+                now=now,
+                agent_id="agent-test",
+                shared_at=timestamp,
+                owner_binding=owner_binding,
             )
             conn.commit()
 
@@ -117,6 +236,7 @@ def test_preference_memory_audit_trail_preserved_on_skip(reset_server_owner):
         with get_db() as conn:
             # Manually insert a preference memory with owner_id=jaco
             cursor = conn.cursor()
+            now = datetime.utcnow()
             cursor.execute(
                 """
                 INSERT INTO shared_memories (
@@ -127,11 +247,11 @@ def test_preference_memory_audit_trail_preserved_on_skip(reset_server_owner):
                           'preference.user', '[]', '{"owner_id": "jaco"}', 'team', 1, 'agent-test',
                           0.8, 0, 0.8, ?, 0)
                 """,
-                (unique_id, datetime.utcnow().isoformat()),
+                (unique_id, now.isoformat()),
             )
             conn.commit()
 
-            # Try to admit (should skip due to owner mismatch)
+            # Try to admit (should skip due to owner mismatch - before signature check)
             result = admit_preference(
                 conn,
                 memory_id=unique_id,
@@ -139,7 +259,10 @@ def test_preference_memory_audit_trail_preserved_on_skip(reset_server_owner):
                 preference_field="user.response_verbosity",
                 preference_value="terse",
                 effective_confidence=0.8,
-                now=datetime.utcnow(),
+                now=now,
+                agent_id="agent-test",
+                shared_at=now.isoformat(),
+                owner_binding=None,  # Will fail at same-owner gate first
             )
 
             # Should be rejected

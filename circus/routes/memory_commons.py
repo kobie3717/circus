@@ -397,6 +397,16 @@ async def publish_memory(
         if mem_req.category == "user_preference" and mem_req.preference:
             from circus.services.preference_admission import admit_preference
 
+            # W5: Extract owner_binding from provenance for signature verification
+            owner_binding_dict = None
+            if mem_req.provenance and mem_req.provenance.owner_binding:
+                owner_binding_dict = {
+                    "agent_id": mem_req.provenance.owner_binding.agent_id,
+                    "memory_id": mem_req.provenance.owner_binding.memory_id,
+                    "timestamp": mem_req.provenance.owner_binding.timestamp,
+                    "signature": mem_req.provenance.owner_binding.signature,
+                }
+
             preference_activated = admit_preference(
                 conn,
                 memory_id=memory_id,
@@ -405,6 +415,9 @@ async def publish_memory(
                 preference_value=mem_req.preference.value,
                 effective_confidence=effective_conf,
                 now=now,
+                agent_id=agent_id,
+                shared_at=now.isoformat(),
+                owner_binding=owner_binding_dict,
             )
             # 4.4 coexistence: commit admission write (get_db() context doesn't auto-commit)
             conn.commit()

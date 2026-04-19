@@ -45,14 +45,50 @@ def reset_server_owner():
     import circus.services.preference_admission as admission_module
     admission_module._SERVER_OWNER = None
     admission_module._WARN_LOGGED = False
+    # Clean owner_keys before test to avoid UNIQUE constraint failures
+    with get_db() as conn:
+        conn.execute("DELETE FROM owner_keys")
+        conn.commit()
     yield
     admission_module._SERVER_OWNER = None
     admission_module._WARN_LOGGED = False
+    # Clean up after test too
+    with get_db() as conn:
+        conn.execute("DELETE FROM owner_keys")
+        conn.commit()
+
+
+# W5: Global test owner keypair (persistent across tests in this module for performance)
+_TEST_OWNER_PRIVATE_KEY = None
+_TEST_OWNER_PUBLIC_KEY_B64 = None
+
+
+def _ensure_test_owner_key():
+    """Generate or return cached test owner keypair."""
+    global _TEST_OWNER_PRIVATE_KEY, _TEST_OWNER_PUBLIC_KEY_B64
+
+    if _TEST_OWNER_PRIVATE_KEY is None:
+        import base64
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+
+        private_key = Ed25519PrivateKey.generate()
+        public_key = private_key.public_key()
+
+        public_bytes = public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+        _TEST_OWNER_PRIVATE_KEY = private_key
+        _TEST_OWNER_PUBLIC_KEY_B64 = base64.b64encode(public_bytes).decode('ascii')
+
+    return _TEST_OWNER_PRIVATE_KEY, _TEST_OWNER_PUBLIC_KEY_B64
 
 
 @pytest.fixture
 def client(temp_db, reset_server_owner):
-    """Test client with fresh database."""
+    """Test client with fresh database and test owner key registered."""
     client = TestClient(app)
 
     # Register test agent with proper passport
@@ -81,20 +117,46 @@ def client(temp_db, reset_server_owner):
     # Store token for tests
     client.headers = {"Authorization": f"Bearer {token}"}
 
+    # W5: Register test owner key for kobus (for signature verification)
+    _, public_key_b64 = _ensure_test_owner_key()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO owner_keys (owner_id, public_key, created_at) VALUES (?, ?, ?)",
+            ("kobus", public_key_b64, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+
     return client
 
 
 def _make_owner_binding_for_memory_id(memory_id: str) -> dict:
-    """Helper to create a valid (but garbage-signed) owner_binding for testing.
+    """Helper to create a VALID owner_binding with real signature (W5 update).
 
-    W5: Publish-side requires owner_binding structure for preference memories.
-    Signature can be garbage since admission-side verification is separate.
+    W5 5.4: admission-side now verifies signatures, so tests need valid signatures.
+    Uses cached test owner keypair for performance.
     """
+    from circus.services.bundle_signing import canonicalize_for_signing
+    import base64
+
+    private_key, _ = _ensure_test_owner_key()
+    timestamp = datetime.utcnow().isoformat()
+
+    payload = {
+        "agent_id": "agent-test-123",
+        "memory_id": memory_id,
+        "owner_id": "kobus",
+        "timestamp": timestamp,
+    }
+    canonical_bytes = canonicalize_for_signing(payload)
+    signature = private_key.sign(canonical_bytes)
+    signature_b64 = base64.b64encode(signature).decode('ascii')
+
     return {
         "agent_id": "agent-test-123",
         "memory_id": memory_id,
-        "timestamp": "2026-04-19T10:00:00Z",
-        "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"  # garbage base64, admission will skip
+        "timestamp": timestamp,
+        "signature": signature_b64
     }
 
 
@@ -429,3 +491,459 @@ def test_preference_with_update_semantics(client):
             )
             mem_rows = cursor.fetchall()
             assert len(mem_rows) == 2, "Both v1 and v2 should exist in shared_memories (audit trail)"
+
+
+# ===== Week 5 (5.4): Admission-side owner signature verification tests =====
+
+
+def _generate_test_keypair():
+    """Generate Ed25519 keypair for testing (helper from test_owner_verification.py)."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    private_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    public_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+
+    return private_key, private_bytes, public_bytes
+
+
+def _insert_owner_key(conn, owner_id: str, public_key_b64: str):
+    """Helper to insert owner key into DB."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO owner_keys (owner_id, public_key, created_at) VALUES (?, ?, ?)",
+        (owner_id, public_key_b64, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+
+
+def _sign_owner_binding(private_key, owner_id: str, agent_id: str, memory_id: str, timestamp: str) -> str:
+    """Sign owner binding payload and return base64 signature."""
+    import base64
+    from circus.services.bundle_signing import canonicalize_for_signing
+
+    payload = {
+        "agent_id": agent_id,
+        "memory_id": memory_id,
+        "owner_id": owner_id,
+        "timestamp": timestamp,
+    }
+    canonical_bytes = canonicalize_for_signing(payload)
+    signature = private_key.sign(canonical_bytes)
+    return base64.b64encode(signature).decode('ascii')
+
+
+def test_bad_signature_leaves_shared_memories_but_not_active_preferences(client, caplog):
+    """KOBUS'S CORE NEGATIVE-PATH TEST (W5 ship gate).
+
+    Given:
+    - Preference with correct same-owner string (owner_id=kobus matches server)
+    - Valid shape (all owner_binding fields present)
+    - BAD signature (signed with wrong key)
+
+    Expected:
+    - HTTP publish returns 200 (shape validation passes at publish)
+    - Memory IS present in shared_memories (fresh-connection query)
+    - active_preferences table does NOT contain this (owner_id, field) row
+    - caplog captured ONE INFO record with reason="owner_signature_invalid"
+
+    This is the core W5 negative-path proof.
+    """
+    with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # Reset cached owner
+        import circus.services.preference_admission as admission_module
+        admission_module._SERVER_OWNER = None
+        admission_module._WARN_LOGGED = False
+
+        # NOTE: client fixture already registered kobus owner key
+        # Generate WRONG keypair for signing (attacker scenario)
+        private_key_wrong, _, _ = _generate_test_keypair()
+
+        # Mock memory_id generation
+        with patch('secrets.token_hex', return_value='badsigtest123456'):
+            expected_memory_id = "shmem-badsigtest123456"
+            timestamp = datetime.utcnow().isoformat()
+
+            # Sign with WRONG key (malicious agent scenario)
+            bad_signature = _sign_owner_binding(
+                private_key_wrong,  # WRONG key
+                owner_id="kobus",
+                agent_id="agent-attacker",
+                memory_id=expected_memory_id,
+                timestamp=timestamp
+            )
+
+            payload = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Attacker tries to inject preference",
+                "confidence": 0.9,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "owner_binding": {
+                        "agent_id": "agent-attacker",
+                        "memory_id": expected_memory_id,
+                        "timestamp": timestamp,
+                        "signature": bad_signature  # BAD signature
+                    }
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "en"
+                }
+            }
+
+            # Publish should succeed (shape validation passes)
+            with caplog.at_level("INFO"):
+                response = client.post("/api/v1/memory-commons/publish", json=payload)
+                assert response.status_code == 200, f"Publish should succeed with 200, got {response.status_code}"
+
+        # CRITICAL ASSERTIONS: Memory is in shared_memories, NOT in active_preferences
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            # Memory IS present in shared_memories
+            cursor.execute("SELECT id FROM shared_memories WHERE id = ?", (expected_memory_id,))
+            mem_row = cursor.fetchone()
+            assert mem_row is not None, "Memory should be in shared_memories (published successfully)"
+
+            # active_preferences does NOT contain this preference
+            cursor.execute(
+                "SELECT COUNT(*) FROM active_preferences WHERE owner_id = ? AND field_name = ?",
+                ("kobus", "user.language_preference")
+            )
+            pref_count = cursor.fetchone()[0]
+            assert pref_count == 0, "active_preferences should NOT contain preference with bad signature"
+
+        # Log should contain ONE INFO record with reason="owner_signature_invalid"
+        skip_logs = [rec for rec in caplog.records if rec.levelname == "INFO" and "preference_skipped" in rec.getMessage()]
+        assert len(skip_logs) >= 1, "Should have at least one skip log"
+
+        # Find the skip log with owner_signature_invalid
+        invalid_sig_logs = [rec for rec in skip_logs if hasattr(rec, 'reason') and rec.reason == "owner_signature_invalid"]
+        assert len(invalid_sig_logs) == 1, f"Should have exactly one owner_signature_invalid log, got {len(invalid_sig_logs)}"
+        assert invalid_sig_logs[0].memory_id == expected_memory_id
+
+
+def test_missing_owner_binding_at_admission_skips_with_owner_signature_missing(client, caplog):
+    """Test: missing owner_binding at admission skips with owner_signature_missing.
+
+    Scenario: Memory somehow gets to admission without owner_binding (defense in depth).
+    This shouldn't happen after 5.3 publish validation, but federation/legacy might bypass.
+    """
+    with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # Reset cached owner
+        import circus.services.preference_admission as admission_module
+        admission_module._SERVER_OWNER = None
+        admission_module._WARN_LOGGED = False
+
+        # NOTE: client fixture already registered kobus owner key
+
+        with get_db() as conn:
+            # Manually insert memory into shared_memories WITHOUT owner_binding
+            memory_id = "shmem-no-binding"
+            cursor = conn.cursor()
+            now = datetime.utcnow().isoformat()
+
+            cursor.execute(
+                """
+                INSERT INTO shared_memories (
+                    id, room_id, from_agent_id, content, category, domain, tags, provenance,
+                    privacy_tier, hop_count, original_author, confidence,
+                    age_days, effective_confidence, shared_at, trust_verified
+                ) VALUES (?, 'room-memory-commons', 'agent-test', 'Test content', 'user_preference',
+                          'preference.user', '[]', '{"owner_id": "kobus"}', 'team', 1, 'agent-test',
+                          0.85, 0, 0.85, ?, 0)
+                """,
+                (memory_id, now)
+            )
+            conn.commit()
+
+        # Try to admit preference directly (bypassing publish)
+        from circus.services.preference_admission import admit_preference
+
+        with get_db() as conn:
+            with caplog.at_level("INFO"):
+                result = admit_preference(
+                    conn,
+                    memory_id=memory_id,
+                    owner_id="kobus",
+                    preference_field="user.format_preference",
+                    preference_value="markdown",
+                    effective_confidence=0.85,
+                    now=datetime.utcnow(),
+                    agent_id="agent-test",
+                    shared_at=now,
+                    owner_binding=None  # Missing binding
+                )
+
+                assert result is False, "Should skip with missing owner_binding"
+
+        # Check skip log reason
+        skip_logs = [rec for rec in caplog.records if rec.levelname == "INFO" and hasattr(rec, 'reason')]
+        missing_logs = [rec for rec in skip_logs if rec.reason == "owner_signature_missing"]
+        assert len(missing_logs) == 1, f"Should have one owner_signature_missing log, got {len(missing_logs)}"
+
+
+def test_unknown_owner_skips_with_owner_key_unknown(client, caplog):
+    """Test: unknown owner (not in owner_keys) skips with owner_key_unknown."""
+    with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # Reset cached owner
+        import circus.services.preference_admission as admission_module
+        admission_module._SERVER_OWNER = None
+        admission_module._WARN_LOGGED = False
+
+        # Delete the owner key that client fixture inserted (to simulate unknown owner)
+        with get_db() as conn:
+            conn.execute("DELETE FROM owner_keys WHERE owner_id = ?", ("kobus",))
+            conn.commit()
+
+        # Generate a keypair and sign (but owner not registered)
+        import base64
+        private_key, _, _ = _generate_test_keypair()
+
+        with patch('secrets.token_hex', return_value='unknownowner1234'):
+            expected_memory_id = "shmem-unknownowner1234"
+            timestamp = datetime.utcnow().isoformat()
+
+            # Sign with valid key, but owner is unknown
+            signature = _sign_owner_binding(
+                private_key,
+                owner_id="kobus",
+                agent_id="agent-test",
+                memory_id=expected_memory_id,
+                timestamp=timestamp
+            )
+
+            payload = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Unknown owner test",
+                "confidence": 0.85,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "owner_binding": {
+                        "agent_id": "agent-test",
+                        "memory_id": expected_memory_id,
+                        "timestamp": timestamp,
+                        "signature": signature
+                    }
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "en"
+                }
+            }
+
+            with caplog.at_level("INFO"):
+                response = client.post("/api/v1/memory-commons/publish", json=payload)
+                assert response.status_code == 200
+
+        # Check skip log
+        skip_logs = [rec for rec in caplog.records if rec.levelname == "INFO" and hasattr(rec, 'reason')]
+        unknown_logs = [rec for rec in skip_logs if rec.reason == "owner_key_unknown"]
+        assert len(unknown_logs) == 1, f"Should have one owner_key_unknown log, got {len(unknown_logs)}"
+
+        # Verify not in active_preferences
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM active_preferences WHERE owner_id = ? AND field_name = ?",
+                ("kobus", "user.language_preference")
+            )
+            assert cursor.fetchone()[0] == 0
+
+
+def test_expired_timestamp_skips_with_owner_binding_expired(client, caplog):
+    """Test: binding timestamp too old (>5min before shared_at) skips with owner_binding_expired."""
+    with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # Reset cached owner
+        import circus.services.preference_admission as admission_module
+        admission_module._SERVER_OWNER = None
+        admission_module._WARN_LOGGED = False
+
+        # NOTE: client fixture already registered kobus owner key
+        # Use the same test owner key for signing
+        import base64
+        private_key, _ = _ensure_test_owner_key()
+
+        # Create timestamp 10 minutes in the past (expired)
+        from datetime import timedelta
+        now = datetime.utcnow()
+        old_timestamp = (now - timedelta(minutes=10)).isoformat()
+        shared_at = now.isoformat()
+
+        with patch('secrets.token_hex', return_value='expiredtest12345'):
+            expected_memory_id = "shmem-expiredtest12345"
+
+            signature = _sign_owner_binding(
+                private_key,
+                owner_id="kobus",
+                agent_id="agent-test",
+                memory_id=expected_memory_id,
+                timestamp=old_timestamp  # Expired timestamp
+            )
+
+            payload = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Expired timestamp test",
+                "confidence": 0.85,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "owner_binding": {
+                        "agent_id": "agent-test",
+                        "memory_id": expected_memory_id,
+                        "timestamp": old_timestamp,
+                        "signature": signature
+                    }
+                },
+                "preference": {
+                    "field": "user.response_verbosity",
+                    "value": "terse"
+                }
+            }
+
+            with caplog.at_level("INFO"):
+                response = client.post("/api/v1/memory-commons/publish", json=payload)
+                assert response.status_code == 200
+
+        # Check skip log
+        skip_logs = [rec for rec in caplog.records if rec.levelname == "INFO" and hasattr(rec, 'reason')]
+        expired_logs = [rec for rec in skip_logs if rec.reason == "owner_binding_expired"]
+        assert len(expired_logs) == 1, f"Should have one owner_binding_expired log, got {len(expired_logs)}"
+
+
+def test_future_timestamp_skips_with_owner_binding_future_timestamp(client, caplog):
+    """Test: binding timestamp too far ahead (>5min after shared_at) skips with owner_binding_future_timestamp."""
+    with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # Reset cached owner
+        import circus.services.preference_admission as admission_module
+        admission_module._SERVER_OWNER = None
+        admission_module._WARN_LOGGED = False
+
+        # NOTE: client fixture already registered kobus owner key
+        # Use the same test owner key for signing
+        import base64
+        private_key, _ = _ensure_test_owner_key()
+
+        # Create timestamp 10 minutes in the future
+        from datetime import timedelta
+        now = datetime.utcnow()
+        future_timestamp = (now + timedelta(minutes=10)).isoformat()
+
+        with patch('secrets.token_hex', return_value='futuretest123456'):
+            expected_memory_id = "shmem-futuretest123456"
+
+            signature = _sign_owner_binding(
+                private_key,
+                owner_id="kobus",
+                agent_id="agent-test",
+                memory_id=expected_memory_id,
+                timestamp=future_timestamp  # Future timestamp
+            )
+
+            payload = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Future timestamp test",
+                "confidence": 0.85,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "owner_binding": {
+                        "agent_id": "agent-test",
+                        "memory_id": expected_memory_id,
+                        "timestamp": future_timestamp,
+                        "signature": signature
+                    }
+                },
+                "preference": {
+                    "field": "user.tone_preference",
+                    "value": "formal"
+                }
+            }
+
+            with caplog.at_level("INFO"):
+                response = client.post("/api/v1/memory-commons/publish", json=payload)
+                assert response.status_code == 200
+
+        # Check skip log
+        skip_logs = [rec for rec in caplog.records if rec.levelname == "INFO" and hasattr(rec, 'reason')]
+        future_logs = [rec for rec in skip_logs if rec.reason == "owner_binding_future_timestamp"]
+        assert len(future_logs) == 1, f"Should have one owner_binding_future_timestamp log, got {len(future_logs)}"
+
+
+def test_valid_signature_activates_preference(client):
+    """Test: valid owner signature → preference lands in active_preferences (happy path)."""
+    with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # Reset cached owner
+        import circus.services.preference_admission as admission_module
+        admission_module._SERVER_OWNER = None
+        admission_module._WARN_LOGGED = False
+
+        # NOTE: client fixture already registered kobus owner key
+        # Use the same test owner key for signing
+        import base64
+        private_key, _ = _ensure_test_owner_key()
+
+        # Create valid signature
+        now = datetime.utcnow()
+        timestamp = now.isoformat()
+
+        with patch('secrets.token_hex', return_value='validtest1234567'):
+            expected_memory_id = "shmem-validtest1234567"
+
+            signature = _sign_owner_binding(
+                private_key,
+                owner_id="kobus",
+                agent_id="agent-test",
+                memory_id=expected_memory_id,
+                timestamp=timestamp
+            )
+
+            payload = {
+                "category": "user_preference",
+                "domain": "preference.user",
+                "content": "Valid signature test",
+                "confidence": 0.85,
+                "provenance": {
+                    "owner_id": "kobus",
+                    "owner_binding": {
+                        "agent_id": "agent-test",
+                        "memory_id": expected_memory_id,
+                        "timestamp": timestamp,
+                        "signature": signature
+                    }
+                },
+                "preference": {
+                    "field": "user.language_preference",
+                    "value": "af"
+                }
+            }
+
+            response = client.post("/api/v1/memory-commons/publish", json=payload)
+            assert response.status_code == 200
+            data = response.json()
+            assert data.get("preference_activated") is True
+
+        # Verify preference in active_preferences
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT field_name, value FROM active_preferences WHERE owner_id = ?",
+                ("kobus",)
+            )
+            row = cursor.fetchone()
+            assert row is not None
+            assert row[0] == "user.language_preference"
+            assert row[1] == "af"

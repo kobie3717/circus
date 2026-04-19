@@ -27,11 +27,15 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch
 from fastapi.testclient import TestClient
+import base64
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 
 from circus.app import app
 from circus.database import init_database, get_db
 from circus.config import settings
 from circus.services.preference_application import get_active_preferences
+from circus.services.bundle_signing import canonicalize_for_signing
 
 
 # ── Bot Harness: Mock Bot That Consumes Preferences ──
@@ -117,7 +121,32 @@ def reset_server_owner():
 
 
 @pytest.fixture
-def client(temp_db, reset_server_owner):
+def kobus_private_key(temp_db):
+    """Generate Ed25519 keypair and seed owner_keys table for 'kobus' in temp DB."""
+    from datetime import datetime
+    private_key = Ed25519PrivateKey.generate()
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+    public_key_b64 = base64.b64encode(public_bytes).decode('ascii')
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO owner_keys (owner_id, public_key, created_at) VALUES (?, ?, ?)",
+            ("kobus", public_key_b64, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+
+    yield private_key
+
+    with get_db() as conn:
+        conn.execute("DELETE FROM owner_keys WHERE owner_id = 'kobus'")
+        conn.commit()
+
+
+@pytest.fixture
+def client(temp_db, reset_server_owner, kobus_private_key):
     """Test client with fresh database and registered agent."""
     client = TestClient(app)
 
@@ -150,23 +179,29 @@ def client(temp_db, reset_server_owner):
     return client
 
 
-def _make_owner_binding_for_memory_id(memory_id: str) -> dict:
-    """Helper to create a valid (but garbage-signed) owner_binding for testing.
-
-    W5: Publish-side requires owner_binding structure for preference memories.
-    Signature can be garbage since admission-side verification is separate.
-    """
+def _make_owner_binding_for_memory_id(memory_id: str, private_key: Ed25519PrivateKey) -> dict:
+    """Create a valid signed owner_binding for testing."""
+    from datetime import datetime
+    timestamp = datetime.utcnow().isoformat()
+    payload = {
+        "agent_id": "agent-test-123",
+        "memory_id": memory_id,
+        "owner_id": "kobus",
+        "timestamp": timestamp,
+    }
+    canonical_bytes = canonicalize_for_signing(payload)
+    signature = private_key.sign(canonical_bytes)
     return {
         "agent_id": "agent-test-123",
         "memory_id": memory_id,
-        "timestamp": "2026-04-19T10:00:00Z",
-        "signature": "dGVzdC1zaWduYXR1cmUtYmFzZTY0"  # garbage base64, admission will skip
+        "timestamp": timestamp,
+        "signature": base64.b64encode(signature).decode('ascii')
     }
 
 
 # ── Test 1: The Happy Path — THE Core Product Moment ──
 
-def test_friday_publishes_preference_then_claw_behavior_changes(client):
+def test_friday_publishes_preference_then_claw_behavior_changes(client, kobus_private_key):
     """The Week 4 product moment.
 
     Friday learns a preference for Kobus. Circus federates the truth.
@@ -208,7 +243,7 @@ def test_friday_publishes_preference_then_claw_behavior_changes(client):
                 "provenance": {
                     "owner_id": "kobus",
                     "reasoning": "User explicitly requested Afrikaans in multiple sessions",
-                    "owner_binding": _make_owner_binding_for_memory_id(memory_id_1)
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id_1, kobus_private_key)
                 },
                 "preference": {
                     "field": "user.language_preference",
@@ -230,7 +265,7 @@ def test_friday_publishes_preference_then_claw_behavior_changes(client):
                 "provenance": {
                     "owner_id": "kobus",
                     "reasoning": "User frequently says 'just tell me' and 'short answer please'",
-                    "owner_binding": _make_owner_binding_for_memory_id(memory_id_2)
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id_2, kobus_private_key)
                 },
                 "preference": {
                     "field": "user.response_verbosity",
@@ -260,7 +295,7 @@ def test_friday_publishes_preference_then_claw_behavior_changes(client):
 
 # ── Test 2: The Negative Path — Different Owner Sees Nothing ──
 
-def test_007_serves_different_owner_ignores_kobus_preferences(client):
+def test_007_serves_different_owner_ignores_kobus_preferences(client, kobus_private_key):
     """Owner isolation test: Jaco's bot ignores Kobus's preferences.
 
     Proves:
@@ -290,7 +325,7 @@ def test_007_serves_different_owner_ignores_kobus_preferences(client):
                 "provenance": {
                     "owner_id": "kobus",
                     "reasoning": "User requested Afrikaans",
-                    "owner_binding": _make_owner_binding_for_memory_id(memory_id)
+                    "owner_binding": _make_owner_binding_for_memory_id(memory_id, kobus_private_key)
                 },
                 "preference": {
                     "field": "user.language_preference",
@@ -338,7 +373,7 @@ def test_007_serves_different_owner_ignores_kobus_preferences(client):
 
 # ── Test 3: Latest-Wins Control Plane — Live Updates ──
 
-def test_second_preference_publish_updates_behavior_again(client):
+def test_second_preference_publish_updates_behavior_again(client, kobus_private_key):
     """Latest-wins test: control plane is live, not static.
 
     Proves:
@@ -367,7 +402,7 @@ def test_second_preference_publish_updates_behavior_again(client):
                 "provenance": {
                     "owner_id": "kobus",
                     "reasoning": "User requested Afrikaans",
-                    "owner_binding": _make_owner_binding_for_memory_id(v1_memory_id)
+                    "owner_binding": _make_owner_binding_for_memory_id(v1_memory_id, kobus_private_key)
                 },
                 "preference": {
                     "field": "user.language_preference",
@@ -397,7 +432,7 @@ def test_second_preference_publish_updates_behavior_again(client):
                 "provenance": {
                     "owner_id": "kobus",
                     "reasoning": "User explicitly said 'speak English please' in latest session",
-                    "owner_binding": _make_owner_binding_for_memory_id(v2_memory_id)
+                    "owner_binding": _make_owner_binding_for_memory_id(v2_memory_id, kobus_private_key)
                 },
                 "preference": {
                     "field": "user.language_preference",
