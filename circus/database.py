@@ -367,6 +367,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v4_migration(db_path)
     # Run v5 migration for Instance identity
     run_v5_migration(db_path)
+    # Run v6 migration for Federation rate limits
+    run_v6_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -579,6 +581,31 @@ def run_v5_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v5 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v6_migration(db_path: Optional[Path] = None) -> None:
+    """Run v6 migration: federation_rate_limits table."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v6_federation_rate_limits.sql"
+
+    if not migration_file.exists():
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        with open(migration_file) as f:
+            conn.executescript(f.read())
+        conn.commit()
+        logger.info("v6 migration: rate limits table created")
+    except Exception as e:
+        conn.rollback()
+        logger.error("v6 migration failed: %s", e)
         raise
     finally:
         conn.close()

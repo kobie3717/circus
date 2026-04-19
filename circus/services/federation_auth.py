@@ -1,14 +1,14 @@
-"""Challenge-based peer authentication for federation PULL endpoint.
+"""Challenge-based peer authentication for federation PULL and PUSH endpoints.
 
 Authentication protocol:
 - Peer signs a time-bucketed challenge string with their Ed25519 private key
-- Challenge format: "pull:{peer_id}:{minute_bucket}"
+- Challenge format: "{action}:{peer_id}:{minute_bucket}" (action = "pull" or "push")
 - Minute buckets provide replay resistance (±1 minute clock skew tolerance)
 - Public key verified against federation_peers table
 - Peer must be registered and active
 
 This module handles ONLY authentication logic. Bundle construction and
-query logic are separate (federation_pull module).
+query logic are separate (federation_pull/federation_admission modules).
 """
 
 import base64
@@ -30,15 +30,17 @@ class AuthError(Exception):
         self.status_code = status_code
 
 
-def verify_pull_challenge(
+def verify_peer_challenge(
+    action: str,
     peer_id: str,
     signature_b64: str,
     *,
     now: Optional[float] = None
 ) -> tuple[bool, Optional[str]]:
-    """Verify peer's signature over time-bucketed pull challenge.
+    """Verify peer's signature over time-bucketed challenge.
 
     Args:
+        action: Action prefix ("pull" or "push")
         peer_id: Peer identifier from X-Peer-Id header
         signature_b64: Base64-encoded Ed25519 signature from X-Peer-Signature header
         now: Unix timestamp for testing (defaults to current time)
@@ -102,7 +104,7 @@ def verify_pull_challenge(
     public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
 
     for bucket in valid_buckets:
-        challenge = f"pull:{peer_id}:{bucket}"
+        challenge = f"{action}:{peer_id}:{bucket}"
         challenge_bytes = challenge.encode('utf-8')
 
         try:

@@ -14,7 +14,7 @@ import pytest
 from circus.database import init_database, run_v2_migration, run_v3_migration, run_v4_migration, run_v5_migration
 from circus.services.bundle_signing import canonicalize_for_signing
 from circus.services.federation_admission import admit_bundle
-from circus.services.federation_auth import verify_pull_challenge, AuthError
+from circus.services.federation_auth import verify_peer_challenge, AuthError
 from circus.services.federation_pull import (
     encode_cursor, decode_cursor, CursorError,
     get_cached_passport, build_outgoing_bundle, pull_bundles
@@ -134,7 +134,7 @@ def test_verify_pull_challenge_missing_peer(test_db):
     signature_b64 = base64.b64encode(b"fake-sig").decode('ascii')
 
     with pytest.raises(AuthError) as exc_info:
-        verify_pull_challenge(peer_id, signature_b64)
+        verify_peer_challenge("pull", peer_id, signature_b64)
 
     assert exc_info.value.status_code == 403
     assert "not registered" in str(exc_info.value).lower()
@@ -159,7 +159,7 @@ def test_verify_pull_challenge_inactive_peer(test_db, valid_keypair):
     signature_b64 = base64.b64encode(b"fake-sig").decode('ascii')
 
     with pytest.raises(AuthError) as exc_info:
-        verify_pull_challenge(peer_id, signature_b64)
+        verify_peer_challenge("pull", peer_id, signature_b64)
 
     assert exc_info.value.status_code == 403
     assert "inactive" in str(exc_info.value).lower()
@@ -178,7 +178,7 @@ def test_verify_pull_challenge_invalid_signature(test_db, registered_peer, valid
     signature_b64 = base64.b64encode(signature_bytes).decode('ascii')
 
     with pytest.raises(AuthError) as exc_info:
-        verify_pull_challenge(peer_id, signature_b64)
+        verify_peer_challenge("pull", peer_id, signature_b64)
 
     assert exc_info.value.status_code == 401
     assert "invalid" in str(exc_info.value).lower()
@@ -197,7 +197,7 @@ def test_verify_pull_challenge_expired_timestamp(test_db, registered_peer, valid
     signature_b64 = base64.b64encode(signature_bytes).decode('ascii')
 
     with pytest.raises(AuthError) as exc_info:
-        verify_pull_challenge(peer_id, signature_b64)
+        verify_peer_challenge("pull", peer_id, signature_b64)
 
     assert exc_info.value.status_code == 401
     assert "invalid" in str(exc_info.value).lower() or "expired" in str(exc_info.value).lower()
@@ -215,7 +215,7 @@ def test_verify_pull_challenge_valid(test_db, registered_peer, valid_keypair):
     signature_bytes = private_key.sign(challenge.encode('utf-8'))
     signature_b64 = base64.b64encode(signature_bytes).decode('ascii')
 
-    success, verified_peer_id = verify_pull_challenge(peer_id, signature_b64)
+    success, verified_peer_id = verify_peer_challenge("pull", peer_id, signature_b64)
 
     assert success is True
     assert verified_peer_id == peer_id
@@ -235,7 +235,7 @@ def test_verify_pull_challenge_clock_skew_tolerance(test_db, registered_peer, va
     sig_prev = private_key.sign(challenge_prev.encode('utf-8'))
     sig_prev_b64 = base64.b64encode(sig_prev).decode('ascii')
 
-    success, _ = verify_pull_challenge(peer_id, sig_prev_b64)
+    success, _ = verify_peer_challenge("pull", peer_id, sig_prev_b64)
     assert success is True
 
     # Test +1 minute skew (sign with next bucket, verify with current time)
@@ -243,7 +243,7 @@ def test_verify_pull_challenge_clock_skew_tolerance(test_db, registered_peer, va
     sig_next = private_key.sign(challenge_next.encode('utf-8'))
     sig_next_b64 = base64.b64encode(sig_next).decode('ascii')
 
-    success, _ = verify_pull_challenge(peer_id, sig_next_b64)
+    success, _ = verify_peer_challenge("pull", peer_id, sig_next_b64)
     assert success is True
 
 
