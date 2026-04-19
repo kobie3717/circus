@@ -365,6 +365,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v3_migration(db_path)
     # Run v4 migration for Federation dedup
     run_v4_migration(db_path)
+    # Run v5 migration for Instance identity
+    run_v5_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -540,6 +542,43 @@ def run_v4_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v4 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v5_migration(db_path: Optional[Path] = None) -> None:
+    """Run v5 migration: instance_config table + keypair bootstrap.
+
+    Idempotent: runs the SQL (IF NOT EXISTS) then calls ensure_instance_keypair
+    which is itself idempotent (loads existing keys, only generates if missing).
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v5_instance_config.sql"
+
+    if not migration_file.exists():
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    try:
+        cursor = conn.cursor()
+        with open(migration_file, 'r') as f:
+            cursor.executescript(f.read())
+
+        # Seed identity (idempotent — no-op if already present)
+        from circus.services.instance_identity import ensure_instance_keypair
+        ensure_instance_keypair(conn)
+
+        conn.commit()
+        logger.info("v5 federation migration: instance_config table created and identity seeded")
+    except Exception as e:
+        conn.rollback()
+        logger.error("v5 migration failed: %s", e)
         raise
     finally:
         conn.close()
