@@ -127,6 +127,9 @@ def admit_and_merge(bundle: dict, peer_id: str, now: datetime) -> list[ConflictR
                         # Lazy import to avoid cycle risk
                         from circus.services.preference_admission import admit_preference
 
+                        # W5: Extract owner_binding from stored provenance for signature verification
+                        owner_binding_dict = updated_provenance.get("owner_binding")
+
                         admit_preference(
                             conn,
                             memory_id=memory["id"],
@@ -135,6 +138,9 @@ def admit_and_merge(bundle: dict, peer_id: str, now: datetime) -> list[ConflictR
                             preference_value=preference["value"],
                             effective_confidence=effective_conf,  # Final stored value (post-decay)
                             now=now,
+                            agent_id=incoming_provenance.get("original_author", ""),
+                            shared_at=now.isoformat(),
+                            owner_binding=owner_binding_dict,
                         )
                         # Commit preference admission write (same pattern as publish route, line 360)
                         conn.commit()

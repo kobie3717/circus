@@ -371,6 +371,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v6_migration(db_path)
     # Run v7 migration for Active preferences
     run_v7_migration(db_path)
+    # Run v8 migration for Owner keys
+    run_v8_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -633,6 +635,41 @@ def run_v7_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v7 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v8_migration(db_path: Optional[Path] = None) -> None:
+    """Run v8 migration: owner_keys table + clear active_preferences."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v8_owner_keys.sql"
+
+    if not migration_file.exists():
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # Count rows in active_preferences before clearing
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM active_preferences")
+        rows_before = cursor.fetchone()[0]
+
+        # Run migration
+        with open(migration_file) as f:
+            conn.executescript(f.read())
+        conn.commit()
+
+        logger.info(
+            "v8 migration: owner_keys table created, cleared %d rows from active_preferences",
+            rows_before
+        )
+    except Exception as e:
+        conn.rollback()
+        logger.error("v8 migration failed: %s", e)
         raise
     finally:
         conn.close()

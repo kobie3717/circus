@@ -1,40 +1,122 @@
-"""Tests for confidence threshold in preference admission (Week 4 sub-step 4.3)."""
+"""Tests for confidence threshold in preference admission (Week 4 sub-step 4.3, Week 5 5.4 update)."""
 
+import base64
 import os
 from datetime import datetime
 from unittest.mock import patch
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 
 from circus.database import get_db
 from circus.services.preference_admission import admit_preference
 from circus.services.preference_application import get_active_preferences
+from circus.services.bundle_signing import canonicalize_for_signing
 
 
 @pytest.fixture
 def reset_server_owner():
-    """Reset the cached server owner between tests."""
+    """Reset the cached server owner between tests and clean owner_keys table."""
     import circus.services.preference_admission as admission_module
     admission_module._SERVER_OWNER = None
     admission_module._WARN_LOGGED = False
+    # Clean owner_keys before test to avoid UNIQUE constraint failures
+    with get_db() as conn:
+        conn.execute("DELETE FROM owner_keys")
+        conn.commit()
     yield
     admission_module._SERVER_OWNER = None
     admission_module._WARN_LOGGED = False
+    # Clean up after test too
+    with get_db() as conn:
+        conn.execute("DELETE FROM owner_keys")
+        conn.commit()
+
+
+def _generate_test_keypair():
+    """Generate Ed25519 keypair for testing."""
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    private_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    public_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+
+    return private_key, private_bytes, public_bytes
+
+
+def _insert_owner_key(conn, owner_id: str, public_key_b64: str):
+    """Helper to insert owner key into DB."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO owner_keys (owner_id, public_key, created_at) VALUES (?, ?, ?)",
+        (owner_id, public_key_b64, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+
+
+def _sign_owner_binding(private_key, owner_id: str, agent_id: str, memory_id: str, timestamp: str) -> str:
+    """Sign owner binding payload and return base64 signature."""
+    payload = {
+        "agent_id": agent_id,
+        "memory_id": memory_id,
+        "owner_id": owner_id,
+        "timestamp": timestamp,
+    }
+    canonical_bytes = canonicalize_for_signing(payload)
+    signature = private_key.sign(canonical_bytes)
+    return base64.b64encode(signature).decode('ascii')
 
 
 def test_preference_above_threshold_admitted(reset_server_owner):
-    """Test: preference with effective_confidence=0.75 (above 0.7) is admitted."""
+    """Test: preference with effective_confidence=0.75 (above 0.7) is admitted (W5: with valid signature)."""
     with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # W5: Generate owner keypair and insert
+        private_key, _, public_bytes = _generate_test_keypair()
+        public_key_b64 = base64.b64encode(public_bytes).decode('ascii')
+
         with get_db() as conn:
+            _insert_owner_key(conn, "kobus", public_key_b64)
+
+            # W5: Create valid owner_binding
+            memory_id = "shmem-high-conf"
+            now = datetime.utcnow()
+            timestamp = now.isoformat()
+
+            signature = _sign_owner_binding(
+                private_key,
+                owner_id="kobus",
+                agent_id="agent-test",
+                memory_id=memory_id,
+                timestamp=timestamp
+            )
+
+            owner_binding = {
+                "agent_id": "agent-test",
+                "memory_id": memory_id,
+                "timestamp": timestamp,
+                "signature": signature
+            }
+
             # Admit preference with confidence above threshold
             result = admit_preference(
                 conn,
-                memory_id="shmem-high-conf",
+                memory_id=memory_id,
                 owner_id="kobus",
                 preference_field="user.language_preference",
                 preference_value="af",
                 effective_confidence=0.75,
-                now=datetime.utcnow(),
+                now=now,
+                agent_id="agent-test",
+                shared_at=timestamp,
+                owner_binding=owner_binding,
             )
 
             # Should succeed
@@ -55,14 +137,23 @@ def test_preference_above_threshold_admitted(reset_server_owner):
 
 
 def test_preference_below_threshold_skipped(reset_server_owner, caplog):
-    """Test: preference with effective_confidence=0.65 (below 0.7) is skipped."""
+    """Test: preference with effective_confidence=0.65 (below 0.7) is skipped (W5: valid signature but low confidence)."""
     import secrets
     unique_id = f"shmem-low-conf-{secrets.token_hex(8)}"
 
     with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # W5: Generate owner keypair and insert (so signature check passes, but confidence check fails)
+        private_key, _, public_bytes = _generate_test_keypair()
+        public_key_b64 = base64.b64encode(public_bytes).decode('ascii')
+
         with get_db() as conn:
+            _insert_owner_key(conn, "kobus", public_key_b64)
+
             # Manually insert preference memory with low confidence
             cursor = conn.cursor()
+            now = datetime.utcnow()
+            timestamp = now.isoformat()
+
             cursor.execute(
                 """
                 INSERT INTO shared_memories (
@@ -73,9 +164,25 @@ def test_preference_below_threshold_skipped(reset_server_owner, caplog):
                           'preference.user', '[]', '{"owner_id": "kobus"}', 'team', 0, 'agent-test',
                           0.65, 0, 0.65, ?, 0)
                 """,
-                (unique_id, datetime.utcnow().isoformat()),
+                (unique_id, timestamp),
             )
             conn.commit()
+
+            # W5: Create valid owner_binding (signature will pass, confidence will fail)
+            signature = _sign_owner_binding(
+                private_key,
+                owner_id="kobus",
+                agent_id="agent-test",
+                memory_id=unique_id,
+                timestamp=timestamp
+            )
+
+            owner_binding = {
+                "agent_id": "agent-test",
+                "memory_id": unique_id,
+                "timestamp": timestamp,
+                "signature": signature
+            }
 
             # Try to admit (should skip due to low confidence)
             with caplog.at_level("INFO"):
@@ -86,7 +193,10 @@ def test_preference_below_threshold_skipped(reset_server_owner, caplog):
                     preference_field="user.tone_preference",
                     preference_value="formal",
                     effective_confidence=0.65,
-                    now=datetime.utcnow(),
+                    now=now,
+                    agent_id="agent-test",
+                    shared_at=timestamp,
+                    owner_binding=owner_binding,
                 )
 
             # Should be rejected
@@ -117,18 +227,47 @@ def test_preference_below_threshold_skipped(reset_server_owner, caplog):
 
 
 def test_preference_at_exact_threshold_admitted(reset_server_owner):
-    """Test: preference with effective_confidence=0.7 (EXACTLY at threshold) is admitted (>= semantics)."""
+    """Test: preference with effective_confidence=0.7 (EXACTLY at threshold) is admitted (>= semantics, W5: with valid signature)."""
     with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
+        # W5: Generate owner keypair and insert
+        private_key, _, public_bytes = _generate_test_keypair()
+        public_key_b64 = base64.b64encode(public_bytes).decode('ascii')
+
         with get_db() as conn:
+            _insert_owner_key(conn, "kobus", public_key_b64)
+
+            # W5: Create valid owner_binding
+            memory_id = "shmem-exact-threshold"
+            now = datetime.utcnow()
+            timestamp = now.isoformat()
+
+            signature = _sign_owner_binding(
+                private_key,
+                owner_id="kobus",
+                agent_id="agent-test",
+                memory_id=memory_id,
+                timestamp=timestamp
+            )
+
+            owner_binding = {
+                "agent_id": "agent-test",
+                "memory_id": memory_id,
+                "timestamp": timestamp,
+                "signature": signature
+            }
+
             # Admit preference with confidence exactly at threshold
             result = admit_preference(
                 conn,
-                memory_id="shmem-exact-threshold",
+                memory_id=memory_id,
                 owner_id="kobus",
                 preference_field="user.response_verbosity",
                 preference_value="terse",
                 effective_confidence=0.7,
-                now=datetime.utcnow(),
+                now=now,
+                agent_id="agent-test",
+                shared_at=timestamp,
+                owner_binding=owner_binding,
             )
 
             # Should succeed (>= semantics)

@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
-# Circus Memory Commons — Week 4 Preference Demo
+# Circus Memory Commons — Week 5 Preference Demo
 # Wrapper script for the Python demo
 
 set -euo pipefail
+
+# W5 REQUIREMENT: Check for owner private key env var
+if [ -z "${CIRCUS_OWNER_PRIVATE_KEY_PATH:-}" ]; then
+  echo "ERROR: CIRCUS_OWNER_PRIVATE_KEY_PATH is not set." >&2
+  echo "Run: python -m circus.cli owner-keygen --owner demo-owner --output /tmp/demo-owner.key" >&2
+  echo "Then: export CIRCUS_OWNER_PRIVATE_KEY_PATH=/tmp/demo-owner.key" >&2
+  echo "Then: export CIRCUS_OWNER_ID=demo-owner" >&2
+  exit 1
+fi
 
 cd "$(dirname "$0")/.."
 

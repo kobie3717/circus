@@ -1,23 +1,26 @@
-"""Preference admission service for behavior-delta memories (Week 4 sub-steps 4.2-4.3).
+"""Preference admission service for behavior-delta memories (Week 4 sub-steps 4.2-4.3, Week 5 5.4).
 
 This module controls the consume-side admission gate: when a valid preference memory
 is published (or federated in), decide whether to activate it (write to active_preferences)
 based on same-owner enforcement and confidence threshold.
 
-Trust gates enforced here:
-- Same-owner check: provenance.owner_id == CIRCUS_OWNER_ID (consume-side)
-- Confidence threshold: effective_confidence >= preference_activation_threshold (4.3)
+Trust gates enforced here (W4 + W5):
+- Same-owner check: provenance.owner_id == CIRCUS_OWNER_ID (consume-side, W4 gate 4)
+- Owner signature verify: cryptographic proof of owner authorization (W5 gate 5)
+- Confidence threshold: effective_confidence >= preference_activation_threshold (W4 gate 6)
 
 Structured logging for operational visibility:
-- Every skip emits INFO log with reason code (same_owner_failed, confidence_below_threshold, etc.)
+- Every skip emits INFO log with reason code (same_owner_failed, owner_signature_invalid, etc.)
 """
 
 import logging
 import os
 import sqlite3
 from datetime import datetime
+from typing import Optional
 
 from circus.config import settings
+from circus.services.owner_verification import verify_owner_binding
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +58,17 @@ def admit_preference(
     preference_value: str,
     effective_confidence: float,
     now: datetime,
+    agent_id: str,
+    shared_at: str,
+    owner_binding: Optional[dict] = None,
 ) -> bool:
     """Admit a preference memory to active_preferences (if gates pass).
 
-    This is the consume-side trust gate. Checks:
+    This is the consume-side trust gate. Checks (W4 + W5):
     1. Server owner configured (CIRCUS_OWNER_ID env var)
-    2. Same-owner match (owner_id == server's CIRCUS_OWNER_ID)
-    3. Confidence threshold (effective_confidence >= preference_activation_threshold)
+    2. Same-owner match (owner_id == server's CIRCUS_OWNER_ID) — W4 gate 4
+    3. Owner signature valid (verify_owner_binding) — W5 gate 5
+    4. Confidence threshold (effective_confidence >= preference_activation_threshold) — W4 gate 6
 
     Args:
         conn: Database connection (transaction-scoped, reused from publish route)
@@ -71,6 +78,9 @@ def admit_preference(
         preference_value: Preference value (e.g., "af")
         effective_confidence: Post-decay, post-trust-adjustment confidence
         now: Current timestamp (for updated_at)
+        agent_id: Publishing agent ID (from memory envelope)
+        shared_at: ISO8601 timestamp when memory was shared
+        owner_binding: Owner signature binding from provenance (W5)
 
     Returns:
         True if written to active_preferences, False if skipped
@@ -108,7 +118,46 @@ def admit_preference(
         )
         return False
 
-    # Gate 3: Confidence threshold check
+    # Gate 3 (W5): Owner signature verification
+    # Defense in depth: check if owner_binding exists (should be validated at publish, but federation path might bypass)
+    if not owner_binding:
+        logger.info(
+            "preference_skipped",
+            extra={
+                "reason": "owner_signature_missing",
+                "memory_id": memory_id,
+                "owner_id": owner_id,
+                "field": preference_field,
+                "effective_confidence": effective_confidence,
+            },
+        )
+        return False
+
+    # Verify owner signature (cryptographic gate)
+    result = verify_owner_binding(
+        claimed_owner_id=owner_id,
+        claimed_agent_id=owner_binding.get("agent_id", ""),
+        claimed_memory_id=owner_binding.get("memory_id", ""),
+        claimed_timestamp=owner_binding.get("timestamp", ""),
+        signature_b64=owner_binding.get("signature", ""),
+        shared_at=shared_at,
+        conn=conn,
+    )
+
+    if not result.valid:
+        logger.info(
+            "preference_skipped",
+            extra={
+                "reason": result.reason,  # Propagate verifier reason code directly
+                "memory_id": memory_id,
+                "owner_id": owner_id,
+                "field": preference_field,
+                "effective_confidence": effective_confidence,
+            },
+        )
+        return False
+
+    # Gate 4: Confidence threshold check
     threshold = settings.preference_activation_threshold
     if effective_confidence < threshold:
         logger.info(

@@ -218,6 +218,9 @@ async def publish_memory(
             detail=f"invalid domain: {str(e)}"
         )
 
+    # Generate memory ID early (needed for W5 owner_binding validation)
+    memory_id = f"shmem-{secrets.token_hex(8)}"
+
     # Week 4: Validate preference memories (publish-side gate)
     if mem_req.category == "user_preference":
         from circus.services.preference_constants import ALLOWLISTED_PREFERENCE_FIELDS
@@ -250,6 +253,46 @@ async def publish_memory(
                 detail="category=user_preference requires provenance.owner_id"
             )
 
+        # Week 5 (5.3): Shape-validate owner_binding (cryptographic verification is admission's job)
+        # R1: Require owner_binding for preference memories
+        if not mem_req.provenance.owner_binding:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="missing owner_binding"
+            )
+
+        binding = mem_req.provenance.owner_binding
+
+        # R2: Validate owner_binding structure (Pydantic already enforces required fields,
+        # but provide precise error messages if fields are missing via explicit checks)
+        if not binding.signature:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="owner_binding missing signature"
+            )
+        if not binding.agent_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="owner_binding missing agent_id"
+            )
+        if not binding.memory_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="owner_binding missing memory_id"
+            )
+        if not binding.timestamp:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="owner_binding missing timestamp"
+            )
+
+        # R3: Validate owner_binding.memory_id matches the generated memory_id
+        if binding.memory_id != memory_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="owner_binding memory_id mismatch"
+            )
+
     with get_db() as conn:
         cursor = conn.cursor()
 
@@ -274,8 +317,7 @@ async def publish_memory(
                 detail="Established tier or higher required to publish public memories"
             )
 
-        # Generate memory ID
-        memory_id = f"shmem-{secrets.token_hex(8)}"
+        # memory_id already generated earlier (before W5 validation)
         now = datetime.utcnow()
 
         # Build provenance JSON
@@ -294,6 +336,14 @@ async def publish_memory(
                 provenance_data["reasoning"] = mem_req.provenance.reasoning
             if mem_req.provenance.owner_id:
                 provenance_data["owner_id"] = mem_req.provenance.owner_id
+            if mem_req.provenance.owner_binding:
+                # Week 5: Store owner_binding for admission-side verification
+                provenance_data["owner_binding"] = {
+                    "agent_id": mem_req.provenance.owner_binding.agent_id,
+                    "memory_id": mem_req.provenance.owner_binding.memory_id,
+                    "timestamp": mem_req.provenance.owner_binding.timestamp,
+                    "signature": mem_req.provenance.owner_binding.signature,
+                }
 
         # Compute effective_confidence with decay (hop=1, age=0 at publish time)
         effective_conf = decay_confidence(
@@ -347,6 +397,16 @@ async def publish_memory(
         if mem_req.category == "user_preference" and mem_req.preference:
             from circus.services.preference_admission import admit_preference
 
+            # W5: Extract owner_binding from provenance for signature verification
+            owner_binding_dict = None
+            if mem_req.provenance and mem_req.provenance.owner_binding:
+                owner_binding_dict = {
+                    "agent_id": mem_req.provenance.owner_binding.agent_id,
+                    "memory_id": mem_req.provenance.owner_binding.memory_id,
+                    "timestamp": mem_req.provenance.owner_binding.timestamp,
+                    "signature": mem_req.provenance.owner_binding.signature,
+                }
+
             preference_activated = admit_preference(
                 conn,
                 memory_id=memory_id,
@@ -355,6 +415,9 @@ async def publish_memory(
                 preference_value=mem_req.preference.value,
                 effective_confidence=effective_conf,
                 now=now,
+                agent_id=agent_id,
+                shared_at=now.isoformat(),
+                owner_binding=owner_binding_dict,
             )
             # 4.4 coexistence: commit admission write (get_db() context doesn't auto-commit)
             conn.commit()
