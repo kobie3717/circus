@@ -116,4 +116,37 @@ def admit_and_merge(bundle: dict, peer_id: str, now: datetime) -> list[ConflictR
             if conflict:
                 results.append(conflict)
 
+            # Week 4 (4.5): Preference admission for federated user_preference memories
+            # CRITICAL: Use final stored effective_confidence (post-decay), not pre-decay value
+            if memory.get("category") == "user_preference":
+                preference = memory.get("preference")
+                if preference and "field" in preference and "value" in preference:
+                    # Extract owner_id from stored provenance (preserved from original publish)
+                    owner_id = updated_provenance.get("owner_id")
+                    if owner_id:
+                        # Lazy import to avoid cycle risk
+                        from circus.services.preference_admission import admit_preference
+
+                        admit_preference(
+                            conn,
+                            memory_id=memory["id"],
+                            owner_id=owner_id,
+                            preference_field=preference["field"],
+                            preference_value=preference["value"],
+                            effective_confidence=effective_conf,  # Final stored value (post-decay)
+                            now=now,
+                        )
+                        # Commit preference admission write (same pattern as publish route, line 360)
+                        conn.commit()
+                    else:
+                        logger.warning(
+                            "Federated preference memory missing owner_id in provenance, skipping admission",
+                            extra={"memory_id": memory["id"]}
+                        )
+                else:
+                    logger.warning(
+                        "Federated preference memory malformed (missing preference.field or .value), skipping admission",
+                        extra={"memory_id": memory["id"]}
+                    )
+
     return results
