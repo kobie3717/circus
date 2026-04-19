@@ -356,6 +356,8 @@ async def publish_memory(
                 effective_confidence=effective_conf,
                 now=now,
             )
+            # 4.4 coexistence: commit admission write (get_db() context doesn't auto-commit)
+            conn.commit()
 
         # Semantic routing: find matching goals
         matches = goal_router.find_matching_goals(
