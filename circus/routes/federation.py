@@ -1,4 +1,4 @@
-"""Federation routes for cross-Circus agent discovery (TRQP)."""
+"""Federation routes for cross-Circus agent discovery (TRQP) and Memory Commons."""
 
 import json
 import secrets
@@ -6,13 +6,15 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Response
 
 from circus.database import get_db
 from circus.models import AgentResponse
 from circus.routes.agents import verify_token
 from circus.services.signing import encode_public_key, decode_public_key
 from circus.services.trust import can_moderate
+from circus.services.federation_auth import verify_pull_challenge, AuthError
+from circus.services.federation_pull import pull_bundles, CursorError
 
 router = APIRouter()
 
@@ -199,4 +201,84 @@ async def federated_discovery(
             "local": sum(1 for a in all_agents if a["source"] == "local"),
             "remote": sum(1 for a in all_agents if a["source"] != "local")
         }
+    }
+
+
+@router.get("/pull")
+async def pull_federation_bundles(
+    response: Response,
+    since: Optional[str] = Query(None, description="Opaque cursor for pagination"),
+    limit: int = Query(50, ge=1, le=100, description="Page size (max 100)"),
+    domain: Optional[str] = Query(None, description="Filter by memory domain"),
+    peer_id: str = Header(..., alias="X-Peer-Id"),
+    peer_signature: str = Header(..., alias="X-Peer-Signature"),
+):
+    """Federation PULL endpoint — emit signed bundles to peers.
+
+    Clients MUST verify each returned bundle via admit_bundle() before
+    trusting its contents. This endpoint is transport-only, NOT a trust
+    boundary.
+
+    Authentication: Challenge-based Ed25519 signature over "pull:{peer_id}:{minute_bucket}"
+    with ±1 minute clock skew tolerance.
+
+    Response header X-Admission-Required: true indicates receiver must run
+    full verification pipeline (signature + passport + peer trust) via
+    admit_bundle() on each bundle.
+
+    Args:
+        since: Opaque cursor from previous response (exclusive pagination)
+        limit: Max bundles to return (clamped to 100)
+        domain: Optional domain filter (narrows to matching memories only)
+        peer_id: Pulling peer's identifier (X-Peer-Id header)
+        peer_signature: Ed25519 signature over challenge (X-Peer-Signature header)
+
+    Returns:
+        JSON with bundles[], next_cursor, has_more, server_time
+
+    Raises:
+        401: Invalid/missing signature or expired timestamp
+        403: Peer not registered or inactive
+        400: Malformed cursor
+        500: Internal error (DB/signing failure)
+    """
+    # Add response header
+    response.headers["X-Admission-Required"] = "true"
+
+    # 1. Validate authentication
+    try:
+        verify_pull_challenge(peer_id, peer_signature)
+    except AuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+
+    # 2. Query bundles
+    try:
+        with get_db() as conn:
+            bundles, next_cursor, has_more = pull_bundles(
+                conn,
+                puller_peer_id=peer_id,
+                since_cursor=since,
+                limit=limit,
+                domain=domain
+            )
+            conn.commit()  # Passport cache writes need commit
+
+    except CursorError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        # Log internal error
+        import logging
+        logging.getLogger(__name__).error(
+            "PULL endpoint internal error: %s",
+            exc,
+            exc_info=True
+        )
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    # 3. Build response
+    return {
+        "bundles": bundles,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "server_time": datetime.utcnow().isoformat(),
     }
