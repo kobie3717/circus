@@ -362,6 +362,32 @@ def admit_bundle(
             bundle_hash=bundle_hash,
         )
 
+    # Step 7b: Verify hop_count boundary (bundle-level)
+    # If ANY memory in bundle would cross max_hop_count after increment,
+    # quarantine the ENTIRE bundle. Bundle-level not per-memory for MVP.
+    from circus.config import settings
+    memories = bundle.get("memories", [])
+    for memory in memories:
+        incoming_hop = memory.get("provenance", {}).get("hop_count", 1)
+        if incoming_hop + 1 > settings.max_hop_count:
+            return _persist_and_return(
+                decision="quarantined",
+                reason="hop_count_exceeded",
+                stage="verify_hop_count",
+                peer_id=peer_id,
+                bundle_id=bundle_id,
+                bundle=bundle,
+                detail=f"memory {memory.get('id')} would exceed max_hop_count "
+                       f"({incoming_hop} + 1 > {settings.max_hop_count})",
+                now=now,
+                metadata={
+                    "violating_memory_id": memory.get("id"),
+                    "incoming_hop_count": incoming_hop,
+                    "max_hop_count": settings.max_hop_count,
+                },
+                bundle_hash=bundle_hash,
+            )
+
     # Step 8: All verifications passed → prepare for admission with semantic dedup
     # Determine final decision (admitted vs quarantined based on previous checks)
     decision = "admitted"

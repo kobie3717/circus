@@ -894,3 +894,173 @@ def test_audit_metadata_includes_stage_and_detail(test_db, registered_peer, sign
 
     assert metadata["stage_reached"] == "admitted"
     assert metadata["detail"] == "all verifications passed"
+
+
+# hop_count boundary tests (Week 3 Sub-step 3.6)
+
+def test_hop_count_boundary_quarantines_bundle(test_db, registered_peer, valid_bundle, valid_keypair):
+    """Bundle with hop_count=5 should be quarantined (5+1=6 > max_hop_count=5)."""
+    peer_id, _ = registered_peer
+    private_key_bytes, _ = valid_keypair
+    now = datetime.utcnow()
+
+    # Create bundle with single memory at hop_count=5
+    bundle = {**valid_bundle}
+    bundle["memories"][0]["provenance"] = {
+        "hop_count": 5,
+        "original_author": "agent-source-001",
+        "original_timestamp": (now - timedelta(days=1)).isoformat(),
+        "confidence": 0.9,
+    }
+
+    # Re-sign the bundle
+    canonical_bytes = canonicalize_for_signing(bundle)
+    private_key = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
+    signature_bytes = private_key.sign(canonical_bytes)
+    bundle["signature"] = base64.b64encode(signature_bytes).decode('ascii')
+
+    result = admit_bundle(bundle, now=now)
+
+    # Assert quarantined with hop_count_exceeded reason
+    assert result.decision == "quarantined"
+    assert result.reason == "hop_count_exceeded"
+    assert result.stage_reached == "verify_hop_count"
+
+    # Verify quarantine row written
+    cursor = test_db.cursor()
+    cursor.execute("SELECT COUNT(*) as count FROM federation_quarantine WHERE reason = 'hop_count_exceeded'")
+    assert cursor.fetchone()["count"] == 1
+
+    # Verify quarantine row has full bundle payload
+    cursor.execute("SELECT payload, source_instance FROM federation_quarantine WHERE id = ?",
+                   (result.quarantine_id,))
+    row = cursor.fetchone()
+    payload = json.loads(row["payload"])
+    assert payload["bundle_id"] == bundle["bundle_id"]
+    assert row["source_instance"] == peer_id
+
+    # Verify audit metadata contains violating memory info
+    cursor.execute("SELECT metadata FROM federation_audit WHERE id = ?", (result.audit_id,))
+    metadata = json.loads(cursor.fetchone()["metadata"])
+    assert metadata["violating_memory_id"] == bundle["memories"][0]["id"]
+    assert metadata["incoming_hop_count"] == 5
+    assert metadata["max_hop_count"] == 5
+
+    # Verify NO shared_memories rows written
+    cursor.execute("SELECT COUNT(*) as count FROM shared_memories WHERE id = ?",
+                   (bundle["memories"][0]["id"],))
+    assert cursor.fetchone()["count"] == 0
+
+    # Verify admit_and_merge NOT called (by absence of shared_memories row)
+    # Already verified above
+
+
+def test_hop_count_boundary_just_under_admits(test_db, registered_peer, valid_bundle, valid_keypair):
+    """Bundle with hop_count=4 should be admitted (4+1=5 <= max_hop_count=5)."""
+    peer_id, _ = registered_peer
+    private_key_bytes, _ = valid_keypair
+    now = datetime.utcnow()
+
+    # Create bundle with single memory at hop_count=4
+    bundle = {**valid_bundle}
+    bundle["memories"][0]["provenance"] = {
+        "hop_count": 4,
+        "original_author": "agent-source-001",
+        "original_timestamp": (now - timedelta(days=1)).isoformat(),
+        "confidence": 0.9,
+    }
+
+    # Re-sign the bundle
+    canonical_bytes = canonicalize_for_signing(bundle)
+    private_key = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
+    signature_bytes = private_key.sign(canonical_bytes)
+    bundle["signature"] = base64.b64encode(signature_bytes).decode('ascii')
+
+    result = admit_bundle(bundle, now=now)
+
+    # Assert admitted (4+1=5 <= 5)
+    assert result.decision == "admitted"
+    assert result.stage_reached == "admitted"
+
+    # Verify NO quarantine rows
+    cursor = test_db.cursor()
+    cursor.execute("SELECT COUNT(*) as count FROM federation_quarantine WHERE reason = 'hop_count_exceeded'")
+    assert cursor.fetchone()["count"] == 0
+
+
+def test_hop_count_boundary_mixed_bundle_quarantines_entire(test_db, registered_peer, valid_bundle, valid_keypair):
+    """Bundle with mixed hop_counts [3, 5, 4] should be quarantined (one violator)."""
+    peer_id, _ = registered_peer
+    private_key_bytes, _ = valid_keypair
+    now = datetime.utcnow()
+
+    # Create bundle with 3 memories: hop_count = [3, 5, 4]
+    bundle = {**valid_bundle}
+    bundle["memories"] = [
+        {
+            "id": "mem-test-001",
+            "content": "Memory at hop 3",
+            "category": "tech",
+            "privacy_tier": "public",
+            "provenance": {
+                "hop_count": 3,
+                "original_author": "agent-source-001",
+                "original_timestamp": (now - timedelta(days=1)).isoformat(),
+                "confidence": 0.9,
+            },
+        },
+        {
+            "id": "mem-test-002",
+            "content": "Memory at hop 5 (violator)",
+            "category": "tech",
+            "privacy_tier": "public",
+            "provenance": {
+                "hop_count": 5,
+                "original_author": "agent-source-002",
+                "original_timestamp": (now - timedelta(days=2)).isoformat(),
+                "confidence": 0.8,
+            },
+        },
+        {
+            "id": "mem-test-003",
+            "content": "Memory at hop 4",
+            "category": "tech",
+            "privacy_tier": "public",
+            "provenance": {
+                "hop_count": 4,
+                "original_author": "agent-source-003",
+                "original_timestamp": (now - timedelta(days=3)).isoformat(),
+                "confidence": 0.85,
+            },
+        },
+    ]
+
+    # Re-sign the bundle
+    canonical_bytes = canonicalize_for_signing(bundle)
+    private_key = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
+    signature_bytes = private_key.sign(canonical_bytes)
+    bundle["signature"] = base64.b64encode(signature_bytes).decode('ascii')
+
+    result = admit_bundle(bundle, now=now)
+
+    # Assert entire bundle quarantined (bundle-level, not per-memory)
+    assert result.decision == "quarantined"
+    assert result.reason == "hop_count_exceeded"
+    assert result.stage_reached == "verify_hop_count"
+
+    # Verify audit metadata contains violating memory (the hop=5 one)
+    cursor = test_db.cursor()
+    cursor.execute("SELECT metadata FROM federation_audit WHERE id = ?", (result.audit_id,))
+    metadata = json.loads(cursor.fetchone()["metadata"])
+    assert metadata["violating_memory_id"] == "mem-test-002"  # The hop=5 memory
+    assert metadata["incoming_hop_count"] == 5
+
+    # Verify ZERO shared_memories rows written (not even the compliant memories)
+    cursor.execute("SELECT COUNT(*) as count FROM shared_memories WHERE id IN (?, ?, ?)",
+                   ("mem-test-001", "mem-test-002", "mem-test-003"))
+    assert cursor.fetchone()["count"] == 0
+
+    # Verify full bundle preserved in quarantine payload
+    cursor.execute("SELECT payload FROM federation_quarantine WHERE id = ?", (result.quarantine_id,))
+    payload = json.loads(cursor.fetchone()["payload"])
+    assert len(payload["memories"]) == 3

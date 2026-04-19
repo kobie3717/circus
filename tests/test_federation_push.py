@@ -521,16 +521,56 @@ def test_push_rate_limit_under_quota(client, test_db, registered_peer, valid_key
 
 
 def test_push_rate_limit_exceeded(client, test_db, registered_peer, valid_keypair):
-    """Push 101 bundles → first 100 OK, 101st → 429 with Retry-After: 60."""
+    """Push 101 bundles → first 100 OK, 101st → 429 with Retry-After: 60.
+
+    Time is pinned via mock so the burst stays inside one rate-limit window.
+    Needed because 3.6 added per-push work (shared_memories INSERT +
+    belief_merge_pipeline) that pushes the 100-bundle loop close to 60s.
+    Production rate-limit logic is unchanged; this just makes the test's
+    window invariant explicit instead of wall-clock-dependent.
+    """
     peer_id, _ = registered_peer
     private_key_bytes, _ = valid_keypair
 
-    # Push 100 bundles
-    for i in range(100):
-        bucket = int(time.time() / 60)
+    frozen_time = time.time()
+    frozen_bucket = int(frozen_time / 60)
+
+    with patch("circus.routes.federation.time.time", return_value=frozen_time):
+        # Push 100 bundles — all land in the same rate-limit bucket
+        for i in range(100):
+            memory = {
+                "id": f"shmem-limit-test-{i}",
+                "content": f"Limit test {i}",
+                "category": "testing",
+                "domain": "test-domain",
+                "tags": ["limit"],
+                "provenance": {
+                    "hop_count": 1,
+                    "original_author": peer_id,
+                    "original_timestamp": datetime.utcnow().isoformat(),
+                    "confidence": 0.9,
+                },
+                "privacy_tier": "public",
+            }
+
+            bundle = build_test_bundle(peer_id, private_key_bytes, [memory])
+            signature = sign_push_challenge(peer_id, private_key_bytes, frozen_bucket)
+
+            response = client.post(
+                "/api/v1/federation/push",
+                json=bundle,
+                headers={
+                    "X-Peer-Id": peer_id,
+                    "X-Peer-Signature": signature,
+                }
+            )
+
+            assert response.status_code == 200, f"push {i} failed: {response.status_code} {response.json()}"
+
+        # 101st push → rate limited (same frozen bucket)
         memory = {
-            "id": f"shmem-limit-test-{i}",
-            "content": f"Limit test {i}",
+            "id": "shmem-limit-101",
+            "content": "Should be rate limited",
             "category": "testing",
             "domain": "test-domain",
             "tags": ["limit"],
@@ -544,7 +584,7 @@ def test_push_rate_limit_exceeded(client, test_db, registered_peer, valid_keypai
         }
 
         bundle = build_test_bundle(peer_id, private_key_bytes, [memory])
-        signature = sign_push_challenge(peer_id, private_key_bytes, bucket)
+        signature = sign_push_challenge(peer_id, private_key_bytes, frozen_bucket)
 
         response = client.post(
             "/api/v1/federation/push",
@@ -555,40 +595,9 @@ def test_push_rate_limit_exceeded(client, test_db, registered_peer, valid_keypai
             }
         )
 
-        assert response.status_code == 200
-
-    # 101st push → rate limited
-    bucket = int(time.time() / 60)
-    memory = {
-        "id": "shmem-limit-101",
-        "content": "Should be rate limited",
-        "category": "testing",
-        "domain": "test-domain",
-        "tags": ["limit"],
-        "provenance": {
-            "hop_count": 1,
-            "original_author": peer_id,
-            "original_timestamp": datetime.utcnow().isoformat(),
-            "confidence": 0.9,
-        },
-        "privacy_tier": "public",
-    }
-
-    bundle = build_test_bundle(peer_id, private_key_bytes, [memory])
-    signature = sign_push_challenge(peer_id, private_key_bytes, bucket)
-
-    response = client.post(
-        "/api/v1/federation/push",
-        json=bundle,
-        headers={
-            "X-Peer-Id": peer_id,
-            "X-Peer-Signature": signature,
-        }
-    )
-
-    assert response.status_code == 429
-    assert "Retry-After" in response.headers
-    assert response.headers["Retry-After"] == "60"
+        assert response.status_code == 429
+        assert "Retry-After" in response.headers
+        assert response.headers["Retry-After"] == "60"
 
 
 def test_push_rate_limit_resets_next_window(client, test_db, registered_peer, valid_keypair):

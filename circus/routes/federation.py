@@ -18,6 +18,7 @@ from circus.services.trust import can_moderate
 from circus.services.federation_auth import verify_peer_challenge, AuthError
 from circus.services.federation_pull import pull_bundles, CursorError
 from circus.services.federation_admission import admit_bundle
+from circus.services.federation_wiring import admit_and_merge
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -412,13 +413,23 @@ async def push_federation_bundle(
         )
 
     # 7. Admission
+    now = datetime.utcnow()
     try:
-        result = admit_bundle(bundle, now=datetime.utcnow())
+        result = admit_bundle(bundle, now=now)
     except Exception as exc:
         logger.error("admit_bundle raised: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal error")
 
-    # 8. Map result to response
+    # 8. Wiring (if admitted)
+    conflicts = []
+    if result.decision == "admitted":
+        try:
+            conflicts = admit_and_merge(bundle, peer_id=bundle_peer_id, now=now)
+        except Exception as exc:
+            logger.error("admit_and_merge raised: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail="Internal error")
+
+    # 9. Map result to response
     if result.decision == "infra_error":
         raise HTTPException(
             status_code=500,
@@ -437,6 +448,7 @@ async def push_federation_bundle(
             "memories_total": result.memories_total,
             "memories_new": result.memories_new,
             "memories_skipped": result.memories_skipped,
+            "conflicts_detected": len(conflicts),
         })
     if result.detail:
         resp["detail"] = result.detail
