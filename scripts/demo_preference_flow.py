@@ -178,7 +178,7 @@ def run_demo():
     owner_public_b64 = encode_public_key(owner_public_bytes)
 
     # Insert owner public key into owner_keys table (for this demo session)
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -256,8 +256,8 @@ def run_demo():
         # Mock secrets.token_hex to make memory_id deterministic
         # This allows us to sign the owner_binding with the correct memory_id before publishing
         expected_memory_id = f"shmem-{token_suffix}"
-        # Use utcnow() to match what the server expects (timezone-naive timestamps)
-        timestamp = datetime.utcnow().isoformat()
+        # Use timezone-aware UTC timestamp (fixed in 5.4.1 hotfix)
+        timestamp = datetime.now(timezone.utc).isoformat()
 
         # Sign the owner binding with the expected memory_id
         signature = sign_owner_binding(

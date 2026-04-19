@@ -51,6 +51,44 @@ from circus.services.bundle_signing import canonicalize_for_signing
 OWNER_BINDING_TIMESTAMP_WINDOW_SECONDS = 300
 
 
+def _parse_iso8601_to_utc(ts: str) -> Optional[datetime]:
+    """Parse ISO8601 timestamp to UTC-aware datetime.
+
+    Handles three common variants:
+    - Zulu suffix: "2026-04-19T10:00:00Z"
+    - UTC offset: "2026-04-19T10:00:00+00:00"
+    - Naive (assumes UTC): "2026-04-19T10:00:00"
+
+    This normalizes all inputs to UTC-aware datetimes for consistent comparison,
+    preventing "can't subtract offset-naive and offset-aware datetimes" errors.
+
+    Args:
+        ts: ISO8601 timestamp string
+
+    Returns:
+        UTC-aware datetime on success, None on parse failure
+    """
+    if not ts:
+        return None
+
+    try:
+        # Normalize Z suffix to +00:00 for Python 3.10 compatibility
+        # (fromisoformat only handles Z in Python 3.11+)
+        normalized = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+        dt = datetime.fromisoformat(normalized)
+
+        # If naive, assume UTC (common convention for ISO8601 without tz info)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        # Normalize to UTC (handles non-UTC offsets like +02:00)
+        return dt.astimezone(timezone.utc)
+
+    except (ValueError, TypeError, AttributeError):
+        # Parse failure (malformed timestamp, wrong type, etc.)
+        return None
+
+
 @dataclass(frozen=True)
 class VerificationResult:
     """Result of owner signature verification.
@@ -108,6 +146,7 @@ def verify_owner_binding(
 
     Reason codes:
         - owner_key_unknown: claimed_owner_id not in owner_keys table
+        - owner_binding_invalid_timestamp: malformed timestamp (parse failure)
         - owner_binding_expired: timestamp too old (>5min before shared_at)
         - owner_binding_future_timestamp: timestamp too far ahead (>5min after shared_at)
         - owner_signature_invalid: signature verification failed (bad sig OR field mismatch)
@@ -142,28 +181,27 @@ def verify_owner_binding(
         raise
 
     # Step 2: Check timestamp window (bidirectional, ±5min)
-    # Parse timestamps to datetime objects for comparison
-    try:
-        binding_time = datetime.fromisoformat(claimed_timestamp.replace('Z', '+00:00'))
-        shared_time = datetime.fromisoformat(shared_at.replace('Z', '+00:00'))
-    except ValueError:
-        # Malformed ISO8601 timestamp — fail closed
+    # Parse timestamps to UTC-aware datetime objects for consistent comparison
+    # This prevents "can't subtract offset-naive and offset-aware datetimes" errors
+    # Normalization basis: UTC-aware (handles Z, +HH:MM, and naive timestamps)
+    binding_time = _parse_iso8601_to_utc(claimed_timestamp)
+    shared_time = _parse_iso8601_to_utc(shared_at)
+
+    # Fail closed on parse failure (malformed timestamps)
+    if binding_time is None or shared_time is None:
         return VerificationResult(
             valid=False,
-            reason="owner_signature_invalid"  # treat as bad input
+            reason="owner_binding_invalid_timestamp"
         )
 
-    # Calculate time delta (absolute difference)
-    time_delta_seconds = abs((shared_time - binding_time).total_seconds())
-
-    # Check if binding is too old
+    # Check if binding is too old (>5min before shared_at)
     if (shared_time - binding_time).total_seconds() > OWNER_BINDING_TIMESTAMP_WINDOW_SECONDS:
         return VerificationResult(
             valid=False,
             reason="owner_binding_expired"
         )
 
-    # Check if binding is too far in the future
+    # Check if binding is too far in the future (>5min after shared_at)
     if (binding_time - shared_time).total_seconds() > OWNER_BINDING_TIMESTAMP_WINDOW_SECONDS:
         return VerificationResult(
             valid=False,
