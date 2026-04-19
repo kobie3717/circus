@@ -4,11 +4,14 @@ Implements domain authority-based conflict resolution as specified in
 Circus Memory Commons spec §6.
 """
 
+import json
 import logging
 import re
 import sqlite3
 from datetime import datetime
 from typing import Optional
+
+from pydantic import BaseModel
 
 from circus.services.embeddings import embed_text
 
@@ -76,6 +79,19 @@ class ResolutionResult:
         self.reason = reason
         self.authority_score_a = authority_score_a
         self.authority_score_b = authority_score_b
+
+
+class ConflictResolution(BaseModel):
+    """Conflict resolution result."""
+    memory_id_a: str
+    memory_id_b: str
+    conflict_type: str
+    winner_id: str
+    strategy: str
+    auto_resolved: bool
+    reason: str
+    authority_score_a: float
+    authority_score_b: float
 
 
 def detect_conflict(
@@ -156,6 +172,125 @@ def detect_conflict(
             )
 
     return None
+
+
+def apply_belief_merge_pipeline(
+    conn: sqlite3.Connection,
+    new_memory: dict,  # Keys: id, from_agent_id, content, category, domain, confidence, shared_at
+    agent_id: str,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[ConflictResolution]:
+    """Run conflict detection + resolution + merge for newly-inserted memory.
+
+    PRE: new_memory MUST exist in shared_memories (caller INSERTs before calling).
+    POST: If conflict detected, belief_conflicts row written + merge applied if auto_resolved.
+    COMMIT: Function commits internally (matches current line 376 behavior).
+
+    Returns ConflictResolution if conflict found, else None.
+    Returns None if conflict_detection_enabled=False.
+    """
+    from circus.config import settings
+
+    if now is None:
+        now = datetime.utcnow()
+
+    conflict_result = None
+    if settings.conflict_detection_enabled:
+        cursor = conn.cursor()
+
+        # Fetch recent memories in same category for conflict detection
+        cursor.execute("""
+            SELECT id, from_agent_id, content, category, domain, confidence, shared_at
+            FROM shared_memories
+            WHERE category = ?
+              AND id != ?
+              AND privacy_tier IN ('public', 'team')
+            ORDER BY shared_at DESC
+            LIMIT 50
+        """, (new_memory["category"], new_memory["id"]))
+
+        existing_memories = [
+            {
+                "id": row[0],
+                "from_agent_id": row[1],
+                "content": row[2],
+                "category": row[3],
+                "domain": row[4],
+                "confidence": row[5],
+                "shared_at": row[6],
+            }
+            for row in cursor.fetchall()
+        ]
+
+        conflict_info = detect_conflict(new_memory, existing_memories)
+
+        if conflict_info:
+            # Fetch full memory data for resolution
+            cursor.execute("""
+                SELECT id, from_agent_id, content, category, domain, confidence, shared_at
+                FROM shared_memories
+                WHERE id = ?
+            """, (conflict_info.memory_a_id,))
+            row = cursor.fetchone()
+            memory_a = {
+                "id": row[0],
+                "from_agent_id": row[1],
+                "content": row[2],
+                "category": row[3],
+                "domain": row[4],
+                "confidence": row[5],
+                "shared_at": row[6],
+            }
+
+            # Resolve conflict (domain is now required)
+            resolution = resolve_conflict(
+                conn,
+                memory_a,
+                new_memory,
+                conflict_info.domain
+            )
+
+            # Record conflict in belief_conflicts table
+            cursor.execute("""
+                INSERT INTO belief_conflicts (
+                    memory_id_a, memory_id_b, conflict_type, detected_at,
+                    resolution, resolved_at, resolved_by_agent_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                conflict_info.memory_a_id,
+                conflict_info.memory_b_id,
+                conflict_info.conflict_type,
+                now.isoformat(),
+                resolution.strategy if resolution.auto_resolved else None,
+                now.isoformat() if resolution.auto_resolved else None,
+                agent_id if resolution.auto_resolved else None,
+            ))
+            conn.commit()
+
+            # Apply merge if auto-resolved
+            if resolution.auto_resolved:
+                apply_merge(
+                    conn,
+                    resolution.winner_id,
+                    resolution.loser_id,
+                    resolution.strategy
+                )
+
+            # Build conflict result for response
+            conflict_result = ConflictResolution(
+                memory_id_a=conflict_info.memory_a_id,
+                memory_id_b=conflict_info.memory_b_id,
+                conflict_type=conflict_info.conflict_type,
+                winner_id=resolution.winner_id,
+                strategy=resolution.strategy,
+                auto_resolved=resolution.auto_resolved,
+                reason=resolution.reason,
+                authority_score_a=resolution.authority_score_a,
+                authority_score_b=resolution.authority_score_b,
+            )
+
+    return conflict_result
 
 
 def resolve_conflict(

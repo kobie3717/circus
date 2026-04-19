@@ -6,6 +6,9 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+# Import ConflictResolution from belief_merge service (domain concept, not transport DTO)
+from circus.services.belief_merge import ConflictResolution
+
 
 # Request models
 
@@ -402,19 +405,6 @@ class DomainSteward(BaseModel):
     agent_name: str
     stewardship_level: float
     claimed_at: str
-
-
-class ConflictResolution(BaseModel):
-    """Conflict resolution result."""
-    memory_id_a: str
-    memory_id_b: str
-    conflict_type: str
-    winner_id: str
-    strategy: str
-    auto_resolved: bool
-    reason: str
-    authority_score_a: float
-    authority_score_b: float
 
 
 class PublishResponseWithConflict(BaseModel):

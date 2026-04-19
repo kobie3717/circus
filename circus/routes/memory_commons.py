@@ -27,11 +27,10 @@ from circus.models import (
     DomainClaim,
     DomainClaimResponse,
     DomainSteward,
-    ConflictResolution,
 )
 from circus.services.goal_router import goal_router
 from circus.services.provenance import decay_confidence
-from circus.services.belief_merge import detect_conflict, resolve_conflict, apply_merge
+from circus.services.belief_merge import apply_belief_merge_pipeline, ConflictResolution
 from circus.services.domain_validation import validate_domain, InvalidDomainError
 
 import asyncio
@@ -294,33 +293,9 @@ async def publish_memory(
         conn.commit()
 
         # Week 2: Conflict detection
-        conflict_result = None
-        if settings.conflict_detection_enabled:
-            # Fetch recent memories in same category for conflict detection
-            cursor.execute("""
-                SELECT id, from_agent_id, content, category, domain, confidence, shared_at
-                FROM shared_memories
-                WHERE category = ?
-                  AND id != ?
-                  AND privacy_tier IN ('public', 'team')
-                ORDER BY shared_at DESC
-                LIMIT 50
-            """, (mem_req.category, memory_id))
-
-            existing_memories = [
-                {
-                    "id": row[0],
-                    "from_agent_id": row[1],
-                    "content": row[2],
-                    "category": row[3],
-                    "domain": row[4],
-                    "confidence": row[5],
-                    "shared_at": row[6],
-                }
-                for row in cursor.fetchall()
-            ]
-
-            new_memory = {
+        conflict_result = apply_belief_merge_pipeline(
+            conn,
+            new_memory={
                 "id": memory_id,
                 "from_agent_id": agent_id,
                 "content": mem_req.content,
@@ -328,74 +303,10 @@ async def publish_memory(
                 "domain": normalized_domain,
                 "confidence": mem_req.confidence,
                 "shared_at": now.isoformat(),
-            }
-
-            conflict_info = detect_conflict(new_memory, existing_memories)
-
-            if conflict_info:
-                # Fetch full memory data for resolution
-                cursor.execute("""
-                    SELECT id, from_agent_id, content, category, domain, confidence, shared_at
-                    FROM shared_memories
-                    WHERE id = ?
-                """, (conflict_info.memory_a_id,))
-                row = cursor.fetchone()
-                memory_a = {
-                    "id": row[0],
-                    "from_agent_id": row[1],
-                    "content": row[2],
-                    "category": row[3],
-                    "domain": row[4],
-                    "confidence": row[5],
-                    "shared_at": row[6],
-                }
-
-                # Resolve conflict (domain is now required)
-                resolution = resolve_conflict(
-                    conn,
-                    memory_a,
-                    new_memory,
-                    conflict_info.domain
-                )
-
-                # Record conflict in belief_conflicts table
-                cursor.execute("""
-                    INSERT INTO belief_conflicts (
-                        memory_id_a, memory_id_b, conflict_type, detected_at,
-                        resolution, resolved_at, resolved_by_agent_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    conflict_info.memory_a_id,
-                    conflict_info.memory_b_id,
-                    conflict_info.conflict_type,
-                    now.isoformat(),
-                    resolution.strategy if resolution.auto_resolved else None,
-                    now.isoformat() if resolution.auto_resolved else None,
-                    agent_id if resolution.auto_resolved else None,
-                ))
-                conn.commit()
-
-                # Apply merge if auto-resolved
-                if resolution.auto_resolved:
-                    apply_merge(
-                        conn,
-                        resolution.winner_id,
-                        resolution.loser_id,
-                        resolution.strategy
-                    )
-
-                # Build conflict result for response
-                conflict_result = ConflictResolution(
-                    memory_id_a=conflict_info.memory_a_id,
-                    memory_id_b=conflict_info.memory_b_id,
-                    conflict_type=conflict_info.conflict_type,
-                    winner_id=resolution.winner_id,
-                    strategy=resolution.strategy,
-                    auto_resolved=resolution.auto_resolved,
-                    reason=resolution.reason,
-                    authority_score_a=resolution.authority_score_a,
-                    authority_score_b=resolution.authority_score_b,
-                )
+            },
+            agent_id=agent_id,
+            now=now,
+        )
 
         # Semantic routing: find matching goals
         matches = goal_router.find_matching_goals(
