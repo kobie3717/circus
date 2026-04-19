@@ -54,13 +54,13 @@ class TestValidateFederatedMemory:
     def test_leading_hyphen(self):
         """Leading hyphen should raise InvalidDomainError."""
         payload = {"domain": "-payment-flows", "content": "test"}
-        with pytest.raises(InvalidDomainError, match="no leading/trailing hyphen"):
+        with pytest.raises(InvalidDomainError, match="no leading/trailing separator"):
             validate_federated_memory(payload)
 
     def test_trailing_hyphen(self):
         """Trailing hyphen should raise InvalidDomainError."""
         payload = {"domain": "payment-flows-", "content": "test"}
-        with pytest.raises(InvalidDomainError, match="no leading/trailing hyphen"):
+        with pytest.raises(InvalidDomainError, match="no leading/trailing separator"):
             validate_federated_memory(payload)
 
     def test_preserves_other_fields(self):

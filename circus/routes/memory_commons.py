@@ -218,6 +218,38 @@ async def publish_memory(
             detail=f"invalid domain: {str(e)}"
         )
 
+    # Week 4: Validate preference memories (publish-side gate)
+    if mem_req.category == "user_preference":
+        from circus.services.preference_constants import ALLOWLISTED_PREFERENCE_FIELDS
+
+        # Gate 1: preference object must exist
+        if not mem_req.preference:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="category=user_preference requires preference object"
+            )
+
+        # Gate 2: field must be in allowlist
+        if mem_req.preference.field not in ALLOWLISTED_PREFERENCE_FIELDS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"preference.field={mem_req.preference.field} not in allowlist"
+            )
+
+        # Gate 3: domain must be "preference.user"
+        if normalized_domain != "preference.user":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"category=user_preference requires domain=preference.user (got {normalized_domain})"
+            )
+
+        # Gate 4: provenance.owner_id must exist
+        if not mem_req.provenance or not mem_req.provenance.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="category=user_preference requires provenance.owner_id"
+            )
+
     with get_db() as conn:
         cursor = conn.cursor()
 
@@ -260,6 +292,8 @@ async def publish_memory(
                 provenance_data["citations"] = mem_req.provenance.citations
             if mem_req.provenance.reasoning:
                 provenance_data["reasoning"] = mem_req.provenance.reasoning
+            if mem_req.provenance.owner_id:
+                provenance_data["owner_id"] = mem_req.provenance.owner_id
 
         # Compute effective_confidence with decay (hop=1, age=0 at publish time)
         effective_conf = decay_confidence(

@@ -298,6 +298,17 @@ class ProvenanceInfo(BaseModel):
     derived_from: Optional[list[str]] = Field(default=None)
     citations: Optional[list[str]] = Field(default=None)
     reasoning: Optional[str] = Field(default=None)
+    owner_id: Optional[str] = Field(default=None)  # Week 4: owner identifier for preference memories
+
+
+class PreferenceField(BaseModel):
+    """Preference field within a behavior-delta memory (Week 4).
+
+    Represents a mutable user preference that affects bot behavior at runtime.
+    Field names must start with "user." and be in the allowlist.
+    """
+    field: str = Field(..., pattern=r"^user\.")
+    value: str = Field(..., min_length=1, max_length=100)
 
 
 class MemoryPublish(BaseModel):
@@ -309,6 +320,7 @@ class MemoryPublish(BaseModel):
     privacy_tier: str = Field(default="team", pattern="^(private|team|public)$")
     provenance: Optional[ProvenanceInfo] = Field(default=None)
     confidence: float = Field(default=0.9, ge=0.1, le=1.0)
+    preference: Optional[PreferenceField] = Field(default=None)  # Week 4: behavior-delta preference
 
 
 class PublishResponse(BaseModel):

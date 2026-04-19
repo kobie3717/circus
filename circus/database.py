@@ -369,6 +369,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v5_migration(db_path)
     # Run v6 migration for Federation rate limits
     run_v6_migration(db_path)
+    # Run v7 migration for Active preferences
+    run_v7_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -606,6 +608,31 @@ def run_v6_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v6 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v7_migration(db_path: Optional[Path] = None) -> None:
+    """Run v7 migration: active_preferences table."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v7_active_preferences.sql"
+
+    if not migration_file.exists():
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        with open(migration_file) as f:
+            conn.executescript(f.read())
+        conn.commit()
+        logger.info("v7 migration: active_preferences table created")
+    except Exception as e:
+        conn.rollback()
+        logger.error("v7 migration failed: %s", e)
         raise
     finally:
         conn.close()
