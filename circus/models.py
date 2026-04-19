@@ -425,3 +425,4 @@ class PublishResponseWithConflict(BaseModel):
     routed_to: list[str]
     match_scores: list[float]
     conflict_resolution: Optional[ConflictResolution] = None
+    preference_activated: Optional[bool] = None  # Week 4: True if preference was admitted to active_preferences

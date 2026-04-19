@@ -342,6 +342,21 @@ async def publish_memory(
             now=now,
         )
 
+        # Week 4 (4.2): Preference admission (if user_preference memory)
+        preference_activated = None
+        if mem_req.category == "user_preference" and mem_req.preference:
+            from circus.services.preference_admission import admit_preference
+
+            preference_activated = admit_preference(
+                conn,
+                memory_id=memory_id,
+                owner_id=mem_req.provenance.owner_id,  # Already validated to exist (gate 4 above)
+                preference_field=mem_req.preference.field,
+                preference_value=mem_req.preference.value,
+                effective_confidence=effective_conf,
+                now=now,
+            )
+
         # Semantic routing: find matching goals
         matches = goal_router.find_matching_goals(
             conn,
@@ -376,7 +391,8 @@ async def publish_memory(
             memory_id=memory_id,
             routed_to=[m['goal_id'] for m in matches],
             match_scores=[m['match_score'] for m in matches],
-            conflict_resolution=conflict_result
+            conflict_resolution=conflict_result,
+            preference_activated=preference_activated
         )
 
 
