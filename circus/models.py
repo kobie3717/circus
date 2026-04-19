@@ -293,12 +293,37 @@ class GoalInfo(BaseModel):
     is_active: bool
 
 
+class OwnerBinding(BaseModel):
+    """Owner signature binding for preference memories (Week 5).
+
+    Cryptographic proof that a publishing agent is authorized to act on
+    behalf of the claimed owner. Prevents agent spoofing attacks where
+    malicious agents publish preferences claiming owner_id without authority.
+
+    All four fields are included in the signed payload to prevent replay:
+    - agent_id: binds signature to specific agent (audit trail)
+    - memory_id: binds signature to specific memory (prevents cross-memory replay)
+    - timestamp: binds signature to time window (prevents indefinite replay)
+    - signature: Ed25519 signature over canonical JSON of above 3 + owner_id
+
+    Verification ensures:
+    1. Owner's public key (from owner_keys table) can verify the signature
+    2. memory_id matches the actual memory being admitted
+    3. timestamp is within ±5min of shared_at (bidirectional window)
+    """
+    agent_id: str = Field(..., min_length=1)
+    memory_id: str = Field(..., min_length=1)
+    timestamp: str = Field(...)  # ISO8601 timestamp when binding was created
+    signature: str = Field(...)  # base64 Ed25519 signature
+
+
 class ProvenanceInfo(BaseModel):
     """Provenance metadata for memory."""
     derived_from: Optional[list[str]] = Field(default=None)
     citations: Optional[list[str]] = Field(default=None)
     reasoning: Optional[str] = Field(default=None)
     owner_id: Optional[str] = Field(default=None)  # Week 4: owner identifier for preference memories
+    owner_binding: Optional[OwnerBinding] = Field(default=None)  # Week 5: cryptographic owner proof
 
 
 class PreferenceField(BaseModel):
