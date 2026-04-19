@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     max_domains_per_agent: int = 5
     conflict_similarity_threshold: float = 0.8
 
+    # Week 4: Preference activation
+    # Minimum effective_confidence for preference activation. Configurable per deployment.
+    preference_activation_threshold: float = 0.7
+
     # CORS
     cors_origins: list[str] = [
         "http://localhost:3000",

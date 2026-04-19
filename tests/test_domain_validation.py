@@ -103,18 +103,19 @@ class TestInvalidDomains:
             validate_domain("with_underscore")
 
     def test_with_dot(self):
-        """Dot should be invalid."""
-        with pytest.raises(InvalidDomainError, match="invalid.*lowercase alphanumeric"):
-            validate_domain("with.dot")
+        """Dot should be valid (Week 4: preference.user domain needs dots)."""
+        # Dots are now allowed as separators (Week 4 requirement)
+        result = validate_domain("with.dot")
+        assert result == "with.dot"
 
     def test_leading_hyphen(self):
         """Leading hyphen should be invalid."""
-        with pytest.raises(InvalidDomainError, match="invalid.*no leading/trailing hyphen"):
+        with pytest.raises(InvalidDomainError, match="invalid.*no leading/trailing separator"):
             validate_domain("-leading")
 
     def test_trailing_hyphen(self):
         """Trailing hyphen should be invalid."""
-        with pytest.raises(InvalidDomainError, match="invalid.*no leading/trailing hyphen"):
+        with pytest.raises(InvalidDomainError, match="invalid.*no leading/trailing separator"):
             validate_domain("trailing-")
 
     def test_consecutive_hyphens(self):
@@ -129,7 +130,7 @@ class TestInvalidDomains:
 
     def test_both_hyphens(self):
         """Both leading and trailing hyphens should be invalid."""
-        with pytest.raises(InvalidDomainError, match="invalid.*no leading/trailing hyphen"):
+        with pytest.raises(InvalidDomainError, match="invalid.*no leading/trailing separator"):
             validate_domain("-both-")
 
     def test_special_chars(self):
