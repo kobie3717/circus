@@ -641,7 +641,7 @@ def run_v7_migration(db_path: Optional[Path] = None) -> None:
 
 
 def run_v8_migration(db_path: Optional[Path] = None) -> None:
-    """Run v8 migration: owner_keys table."""
+    """Run v8 migration: owner_keys table + clear active_preferences."""
     import logging
 
     logger = logging.getLogger(__name__)
@@ -653,10 +653,20 @@ def run_v8_migration(db_path: Optional[Path] = None) -> None:
 
     conn = sqlite3.connect(str(db_path))
     try:
+        # Count rows in active_preferences before clearing
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM active_preferences")
+        rows_before = cursor.fetchone()[0]
+
+        # Run migration
         with open(migration_file) as f:
             conn.executescript(f.read())
         conn.commit()
-        logger.info("v8 migration: owner_keys table created")
+
+        logger.info(
+            "v8 migration: owner_keys table created, cleared %d rows from active_preferences",
+            rows_before
+        )
     except Exception as e:
         conn.rollback()
         logger.error("v8 migration failed: %s", e)
