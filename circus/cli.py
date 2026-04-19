@@ -312,6 +312,85 @@ class CircusCLI:
             log_level="info"
         )
 
+    def owner_keygen(self, args):
+        """Generate owner keypair and insert into database."""
+        import stat
+        from datetime import datetime
+
+        from circus.services.signing import generate_keypair, encode_public_key
+        from circus.database import get_db
+
+        output_path = Path(args.output)
+        private_key_path = output_path
+        public_key_path = output_path.with_suffix('.pub')
+
+        # Check if files exist (refuse to overwrite unless --force)
+        if not args.force:
+            if private_key_path.exists():
+                print(f"Error: Private key file already exists: {private_key_path}", file=sys.stderr)
+                print("Use --force to overwrite", file=sys.stderr)
+                sys.exit(1)
+            if public_key_path.exists():
+                print(f"Error: Public key file already exists: {public_key_path}", file=sys.stderr)
+                print("Use --force to overwrite", file=sys.stderr)
+                sys.exit(1)
+
+        # Generate keypair
+        private_bytes, public_bytes = generate_keypair()
+        private_b64 = encode_public_key(private_bytes)  # reuse encoding function
+        public_b64 = encode_public_key(public_bytes)
+
+        # Write private key with 600 permissions
+        private_key_path.write_text(private_b64 + '\n')
+        private_key_path.chmod(0o600)
+
+        # Write public key with 644 permissions
+        public_key_path.write_text(public_b64 + '\n')
+        public_key_path.chmod(0o644)
+
+        # Insert into database
+        now = datetime.utcnow().isoformat()
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO owner_keys (owner_id, public_key, created_at, description)
+                VALUES (?, ?, ?, ?)
+            """, (args.owner, public_b64, now, args.description))
+            conn.commit()
+
+        print(f"✓ Owner keypair generated for '{args.owner}'")
+        print(f"  Private key: {private_key_path} (mode 600)")
+        print(f"  Public key: {public_key_path} (mode 644)")
+        print(f"  DB row inserted: owner_keys.owner_id = {args.owner}")
+
+    def owner_add(self, args):
+        """Import owner public key from file (consuming agent path)."""
+        from datetime import datetime
+
+        from circus.database import get_db
+
+        public_key_file = Path(args.public_key_file)
+        if not public_key_file.exists():
+            print(f"Error: Public key file not found: {public_key_file}", file=sys.stderr)
+            sys.exit(1)
+
+        # Read public key (expect single base64 line)
+        public_b64 = public_key_file.read_text().strip()
+
+        # Insert into database
+        now = datetime.utcnow().isoformat()
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO owner_keys (owner_id, public_key, created_at, description)
+                VALUES (?, ?, ?, ?)
+            """, (args.owner, public_b64, now, args.description))
+            conn.commit()
+
+        print(f"✓ Owner public key imported for '{args.owner}'")
+        print(f"  Public key file: {public_key_file}")
+        print(f"  DB row inserted: owner_keys.owner_id = {args.owner}")
+
 
 def main():
     """Main CLI entry point."""
@@ -393,6 +472,19 @@ def main():
     serve_parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     serve_parser.add_argument("--port", type=int, default=6200, help="Port to bind to")
 
+    # Owner keygen command
+    keygen_parser = subparsers.add_parser("owner-keygen", help="Generate owner keypair")
+    keygen_parser.add_argument("--owner", required=True, help="Owner ID (e.g., 'kobus')")
+    keygen_parser.add_argument("--output", required=True, help="Output path for private key (public key gets .pub suffix)")
+    keygen_parser.add_argument("--description", help="Optional description")
+    keygen_parser.add_argument("--force", action="store_true", help="Overwrite existing files")
+
+    # Owner add command
+    add_parser = subparsers.add_parser("owner-add", help="Import owner public key from file")
+    add_parser.add_argument("--owner", required=True, help="Owner ID (e.g., 'kobus')")
+    add_parser.add_argument("--public-key-file", required=True, help="Path to public key file")
+    add_parser.add_argument("--description", help="Optional description")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -419,6 +511,10 @@ def main():
         cli.rooms(args)
     elif args.command == "serve":
         cli.serve(args)
+    elif args.command == "owner-keygen":
+        cli.owner_keygen(args)
+    elif args.command == "owner-add":
+        cli.owner_add(args)
     elif args.command == "hull":
         from circus.services.hull_integrity import (
             check_session, scan_session_dir, readiness_board, build_report
