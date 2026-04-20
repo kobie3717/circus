@@ -13,6 +13,7 @@ Structured logging for operational visibility:
 - Every skip emits INFO log with reason code (same_owner_failed, owner_signature_invalid, etc.)
 """
 
+import json
 import logging
 import os
 import sqlite3
@@ -23,6 +24,7 @@ from typing import Optional
 from circus.config import settings
 from circus.services.owner_verification import verify_owner_binding
 from circus.services.conflict_detection import detect_and_resolve_conflict
+from circus.services.quarantine import quarantine_memory, write_audit_event
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +270,36 @@ def admit_preference(
     })
 
     if not confidence_pass:
+        # W11: Quarantine borderline confidence (0.5 <= conf < threshold)
+        # Instead of silently discarding, send to quarantine for operator review
+        if 0.5 <= effective_confidence < threshold:
+            quar_id = quarantine_memory(
+                conn,
+                memory_id=memory_id,
+                owner_id=owner_id,
+                reason="confidence_borderline",
+            )
+            logger.info(
+                "preference_quarantined",
+                extra={
+                    "quarantine_id": quar_id,
+                    "reason": "confidence_borderline",
+                    "memory_id": memory_id,
+                    "owner_id": owner_id,
+                    "field": preference_field,
+                    "effective_confidence": float(effective_confidence),
+                    "threshold": float(threshold),
+                },
+            )
+            return PreferenceDecision(
+                admitted=False,
+                gates=gates,
+                reason="confidence_borderline_quarantined",
+                field=preference_field,
+                value=preference_value
+            )
+
+        # Below 0.5 — just skip (junk)
         logger.info(
             "preference_skipped",
             extra={
@@ -321,6 +353,31 @@ def admit_preference(
             """,
             (owner_id, preference_field, preference_value, memory_id, effective_confidence, now.isoformat()),
         )
+
+    # W11: Write audit event for preference activation
+    write_audit_event(
+        conn,
+        event_type="preference_activated",
+        actor=agent_id,
+        owner_id=owner_id,
+        detail=json.dumps({
+            "memory_id": memory_id,
+            "field": preference_field,
+            "value": preference_value,
+            "confidence": float(effective_confidence),
+            "conflict": conflict.has_conflict,
+        })
+    )
+
+    logger.info(
+        "preference_activated",
+        extra={
+            "memory_id": memory_id,
+            "owner_id": owner_id,
+            "field": preference_field,
+            "effective_confidence": float(effective_confidence),
+        }
+    )
 
     return PreferenceDecision(
         admitted=True,

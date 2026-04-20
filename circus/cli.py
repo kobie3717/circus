@@ -784,6 +784,101 @@ class CircusCLI:
             print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
             sys.exit(1)
 
+    def governance_quarantine(self, args):
+        """List quarantined memories."""
+        params = {}
+        if args.owner:
+            params["owner_id"] = args.owner
+
+        response = self.client.get(f"{self.base_url}/api/v1/governance/quarantine", params=params)
+
+        if response.status_code == 200:
+            result = response.json()
+            entries = result.get("quarantined", [])
+
+            if not entries:
+                print("No quarantined memories found.")
+                return
+
+            print(f"\nQuarantined Memories ({result['count']}):\n")
+            for entry in entries:
+                print(f"ID: {entry['id']}")
+                print(f"  Memory ID: {entry['memory_id']}")
+                print(f"  Owner: {entry['owner_id']}")
+                print(f"  Reason: {entry['reason']}")
+                print(f"  Quarantined: {entry['quarantined_at']}")
+                if entry.get('memory'):
+                    mem = entry['memory']
+                    print(f"  Content: {mem.get('content', '')[:80]}...")
+                    print(f"  Category: {mem.get('category')}")
+                print()
+        else:
+            print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+    def governance_release(self, args):
+        """Release a quarantined memory."""
+        data = {
+            "admit": args.admit,
+            "reason": args.reason or "Manual review passed"
+        }
+
+        response = self.client.post(
+            f"{self.base_url}/api/v1/governance/quarantine/{args.quarantine_id}/release",
+            json=data
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            print(f"✓ Released quarantine entry: {args.quarantine_id}")
+            if result.get("admitted"):
+                print("  Preference activated successfully")
+            else:
+                print("  Released without activation")
+        else:
+            print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+    def governance_discard(self, args):
+        """Discard a quarantined memory."""
+        response = self.client.post(
+            f"{self.base_url}/api/v1/governance/quarantine/{args.quarantine_id}/discard"
+        )
+
+        if response.status_code == 200:
+            print(f"✓ Discarded quarantine entry: {args.quarantine_id}")
+        else:
+            print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+    def governance_audit(self, args):
+        """Show governance audit log."""
+        params = {"limit": args.limit}
+        if args.owner:
+            params["owner_id"] = args.owner
+
+        response = self.client.get(f"{self.base_url}/api/v1/governance/audit", params=params)
+
+        if response.status_code == 200:
+            result = response.json()
+            events = result.get("events", [])
+
+            if not events:
+                print("No audit events found.")
+                return
+
+            print(f"\nGovernance Audit Log ({result['count']} events):\n")
+            for event in events:
+                print(f"[{event['happened_at']}] {event['event_type']}")
+                print(f"  Actor: {event.get('actor', 'N/A')}")
+                print(f"  Owner: {event.get('owner_id', 'N/A')}")
+                if event.get('detail'):
+                    print(f"  Detail: {json.dumps(event['detail'], indent=4)}")
+                print()
+        else:
+            print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
+            sys.exit(1)
+
 
 def main():
     """Main CLI entry point."""
@@ -932,6 +1027,29 @@ def main():
     fed_add_peer_parser.add_argument("url", help="Peer base URL (e.g., http://peer:6200)")
     fed_add_peer_parser.add_argument("--name", help="Optional human name")
 
+    # Governance commands (W11)
+    governance_parser = subparsers.add_parser("governance", help="Governance commands (quarantine + audit)")
+    governance_subparsers = governance_parser.add_subparsers(dest="governance_command", help="Governance subcommands")
+
+    # Quarantine list
+    gov_quarantine_parser = governance_subparsers.add_parser("quarantine", help="List quarantined memories")
+    gov_quarantine_parser.add_argument("--owner", help="Filter by owner ID")
+
+    # Release from quarantine
+    gov_release_parser = governance_subparsers.add_parser("release", help="Release quarantined memory")
+    gov_release_parser.add_argument("quarantine_id", help="Quarantine entry ID")
+    gov_release_parser.add_argument("--admit", action="store_true", help="Force-activate the preference")
+    gov_release_parser.add_argument("--reason", help="Release reason")
+
+    # Discard from quarantine
+    gov_discard_parser = governance_subparsers.add_parser("discard", help="Discard quarantined memory")
+    gov_discard_parser.add_argument("quarantine_id", help="Quarantine entry ID")
+
+    # Audit log
+    gov_audit_parser = governance_subparsers.add_parser("audit", help="Show governance audit log")
+    gov_audit_parser.add_argument("--owner", help="Filter by owner ID")
+    gov_audit_parser.add_argument("--limit", type=int, default=20, help="Max entries (default: 20)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1002,6 +1120,21 @@ def main():
             cli.federation_add_peer(args)
         else:
             print("Unknown federation subcommand", file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "governance":
+        if not hasattr(args, 'governance_command') or not args.governance_command:
+            print("Usage: circus governance {quarantine|release|discard|audit} [options]", file=sys.stderr)
+            sys.exit(1)
+        elif args.governance_command == "quarantine":
+            cli.governance_quarantine(args)
+        elif args.governance_command == "release":
+            cli.governance_release(args)
+        elif args.governance_command == "discard":
+            cli.governance_discard(args)
+        elif args.governance_command == "audit":
+            cli.governance_audit(args)
+        else:
+            print("Unknown governance subcommand", file=sys.stderr)
             sys.exit(1)
     elif args.command == "hull":
         from circus.services.hull_integrity import (

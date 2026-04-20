@@ -379,6 +379,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v10_migration(db_path)
     # Run v11 migration for Federation outbox
     run_v11_migration(db_path)
+    # Run v12 migration for Quarantine and governance audit
+    run_v12_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -801,6 +803,44 @@ def run_v11_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v11 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v12_migration(db_path: Optional[Path] = None) -> None:
+    """Run v12 migration: Quarantine system + governance audit (W11)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v12_quarantine.sql"
+
+    if not migration_file.exists():
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if migration already applied (quarantine table exists)
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='quarantine'")
+        quarantine_exists = cursor.fetchone() is not None
+
+        if not quarantine_exists:
+            # Run migration SQL
+            with open(migration_file, 'r') as f:
+                migration_sql = f.read()
+            cursor.executescript(migration_sql)
+
+            conn.commit()
+            logger.info("v12 migration: quarantine + governance_audit tables created")
+        else:
+            logger.debug("v12 migration: quarantine table already exists, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v12 migration failed: %s", e)
         raise
     finally:
         conn.close()
