@@ -256,6 +256,15 @@ async def publish_memory(
                 detail=f"preference.field={mem_req.preference.field} not in allowlist"
             )
 
+        # Gate 2b: value must be valid (if field has valid_values constraint)
+        from circus.services.preference_constants import PREFERENCE_REGISTRY
+        field_meta = PREFERENCE_REGISTRY.get(mem_req.preference.field)
+        if field_meta and field_meta.valid_values is not None and mem_req.preference.value not in field_meta.valid_values:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"preference.value={mem_req.preference.value!r} not in valid_values={field_meta.valid_values} for {mem_req.preference.field}"
+            )
+
         # Gate 3: domain must be "preference.user"
         if normalized_domain != "preference.user":
             raise HTTPException(
@@ -925,3 +934,42 @@ async def get_conflicts(
             "conflicts": conflicts,
             "count": len(conflicts)
         }
+
+
+@router.get("/allowlist")
+async def get_allowlist():
+    """Get full preference field registry (W8). Public — no auth required."""
+    from circus.services.preference_constants import PREFERENCE_REGISTRY
+
+    fields = [
+        {
+            "name": f.name,
+            "description": f.description,
+            "valid_values": f.valid_values,
+            "default": f.default,
+            "activation_threshold": f.activation_threshold,
+            "category": f.category,
+        }
+        for f in PREFERENCE_REGISTRY.values()
+    ]
+    return {"fields": fields, "count": len(fields)}
+
+
+@router.get("/allowlist/{field_name}")
+async def get_allowlist_field(field_name: str):
+    """Get single preference field details (W8). Public — no auth required."""
+    from circus.services.preference_constants import PREFERENCE_REGISTRY
+
+    field = PREFERENCE_REGISTRY.get(field_name)
+    if not field:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Field '{field_name}' not in allowlist")
+
+    return {
+        "name": field.name,
+        "description": field.description,
+        "valid_values": field.valid_values,
+        "default": field.default,
+        "activation_threshold": field.activation_threshold,
+        "category": field.category,
+    }

@@ -21,7 +21,7 @@ def isolate_database(tmp_path_factory):
     circus-api, friday-bot, claw-bot, etc.). Applies before any test runs.
     """
     from circus.config import settings
-    from circus.database import init_database
+    from circus.database import init_database, seed_default_rooms
 
     original_path = settings.database_path
     tmp_db = tmp_path_factory.mktemp("circus-test-db") / "circus.db"
@@ -29,6 +29,8 @@ def isolate_database(tmp_path_factory):
 
     # Build schema + run all migrations on the isolated DB
     init_database(tmp_db)
+    # Seed circus-system agent and room-memory-commons (required for FK constraints)
+    seed_default_rooms()
 
     yield tmp_db
 

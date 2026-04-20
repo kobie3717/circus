@@ -113,9 +113,11 @@ def client(temp_db, reset_server_owner):
     response = client.post("/api/v1/agents/register", json=register_payload)
     assert response.status_code == 201, f"Registration failed: {response.json()}"
     token = response.json()["ring_token"]
+    agent_id = response.json()["agent_id"]
 
-    # Store token for tests
+    # Store token and agent_id for tests
     client.headers = {"Authorization": f"Bearer {token}"}
+    client.agent_id = agent_id  # Store for use in tests that seed DB directly
 
     # W5: Register test owner key for kobus (for signature verification)
     _, public_key_b64 = _ensure_test_owner_key()
@@ -325,11 +327,11 @@ def test_conflict_detection_does_not_corrupt_active_preferences(client):
                     id, room_id, from_agent_id, content, category, domain, tags, provenance,
                     privacy_tier, hop_count, original_author, confidence,
                     age_days, effective_confidence, shared_at, trust_verified
-                ) VALUES (?, 'room-memory-commons', 'agent-test', 'User wants formal tone', 'user_preference',
-                          'preference.user', '[]', '{"owner_id": "kobus"}', 'team', 1, 'agent-test',
+                ) VALUES (?, 'room-memory-commons', ?, 'User wants formal tone', 'user_preference',
+                          'preference.user', '[]', '{"owner_id": "kobus"}', 'team', 1, ?,
                           0.75, 0, 0.75, ?, 0)
                 """,
-                (memory_id_old, now)
+                (memory_id_old, client.agent_id, client.agent_id, now)
             )
 
             # Manually insert into active_preferences (simulating previous admission)
@@ -661,11 +663,11 @@ def test_missing_owner_binding_at_admission_skips_with_owner_signature_missing(c
                     id, room_id, from_agent_id, content, category, domain, tags, provenance,
                     privacy_tier, hop_count, original_author, confidence,
                     age_days, effective_confidence, shared_at, trust_verified
-                ) VALUES (?, 'room-memory-commons', 'agent-test', 'Test content', 'user_preference',
-                          'preference.user', '[]', '{"owner_id": "kobus"}', 'team', 1, 'agent-test',
+                ) VALUES (?, 'room-memory-commons', ?, 'Test content', 'user_preference',
+                          'preference.user', '[]', '{"owner_id": "kobus"}', 'team', 1, ?,
                           0.85, 0, 0.85, ?, 0)
                 """,
-                (memory_id, now)
+                (memory_id, client.agent_id, client.agent_id, now)
             )
             conn.commit()
 

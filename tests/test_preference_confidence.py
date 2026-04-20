@@ -24,6 +24,17 @@ def reset_server_owner():
     # Clean owner_keys before test to avoid UNIQUE constraint failures
     with get_db() as conn:
         conn.execute("DELETE FROM owner_keys")
+        # Seed a test agent for FK constraints (required after PRAGMA foreign_keys=ON)
+        conn.execute("""
+            INSERT OR IGNORE INTO agents (
+                id, name, role, capabilities, home_instance, passport_hash,
+                token_hash, trust_score, trust_tier, registered_at, last_seen
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "agent-test", "Test Agent", "tester", "[]",
+            "http://test.local", "test", "test",
+            50.0, "Member", datetime.utcnow().isoformat(), datetime.utcnow().isoformat()
+        ))
         conn.commit()
     yield
     admission_module._SERVER_OWNER = None

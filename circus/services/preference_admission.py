@@ -102,9 +102,83 @@ def admit_preference(
         - On skip: logs INFO with structured reason code
     """
     gates = []
-    threshold = settings.preference_activation_threshold
 
-    # Gate 1: Server owner configured
+    # Gate 0: Field allowlist validation (W8)
+    from circus.services.preference_constants import PREFERENCE_REGISTRY
+
+    field_meta = PREFERENCE_REGISTRY.get(preference_field)
+
+    if not field_meta:
+        gates.append({
+            "gate": "field_allowlisted",
+            "passed": False,
+            "field": preference_field
+        })
+        logger.info(
+            "preference_skipped",
+            extra={
+                "reason": "field_not_allowlisted",
+                "memory_id": memory_id,
+                "field": preference_field,
+            },
+        )
+        return PreferenceDecision(
+            admitted=False,
+            gates=gates,
+            reason="field_not_allowlisted",
+            field=preference_field,
+            value=preference_value
+        )
+
+    # Gate 1a: Value validation (W8)
+    if field_meta.valid_values is not None and preference_value not in field_meta.valid_values:
+        gates.append({
+            "gate": "field_allowlisted",
+            "passed": True,
+            "field": preference_field
+        })
+        gates.append({
+            "gate": "value_valid",
+            "passed": False,
+            "value": preference_value,
+            "valid_values": field_meta.valid_values
+        })
+        logger.info(
+            "preference_skipped",
+            extra={
+                "reason": "value_not_valid",
+                "memory_id": memory_id,
+                "field": preference_field,
+                "value": preference_value,
+                "valid_values": field_meta.valid_values,
+            },
+        )
+        return PreferenceDecision(
+            admitted=False,
+            gates=gates,
+            reason="value_not_valid",
+            field=preference_field,
+            value=preference_value
+        )
+
+    # Field and value valid
+    gates.append({
+        "gate": "field_allowlisted",
+        "passed": True,
+        "field": preference_field
+    })
+    if field_meta.valid_values is not None:
+        gates.append({
+            "gate": "value_valid",
+            "passed": True,
+            "value": preference_value,
+            "valid_values": field_meta.valid_values
+        })
+
+    # Use field-specific threshold (W8)
+    threshold = field_meta.activation_threshold
+
+    # Gate 2: Server owner configured
     server_owner = _get_server_owner()
     gates.append({
         "gate": "server_owner_configured",
@@ -130,7 +204,7 @@ def admit_preference(
             value=preference_value
         )
 
-    # Gate 2: Same-owner check
+    # Gate 3: Same-owner check
     owner_match = owner_id == server_owner
     gates.append({
         "gate": "same_owner_match",
@@ -151,6 +225,7 @@ def admit_preference(
         )
         # Mark remaining gates as not evaluated
         gates.append({"gate": "owner_signature_valid", "passed": None})
+        gates.append({"gate": "conflict_resolution", "passed": None})
         gates.append({"gate": "confidence_threshold", "passed": None})
         return PreferenceDecision(
             admitted=False,
@@ -160,7 +235,7 @@ def admit_preference(
             value=preference_value
         )
 
-    # Gate 3 (W5): Owner signature verification
+    # Gate 4 (W5): Owner signature verification
     # Defense in depth: check if owner_binding exists (should be validated at publish, but federation path might bypass)
     if not owner_binding:
         gates.append({"gate": "owner_signature_valid", "passed": False})
@@ -174,6 +249,7 @@ def admit_preference(
                 "effective_confidence": effective_confidence,
             },
         )
+        gates.append({"gate": "conflict_resolution", "passed": None})
         gates.append({"gate": "confidence_threshold", "passed": None})
         return PreferenceDecision(
             admitted=False,
@@ -217,7 +293,7 @@ def admit_preference(
             value=preference_value
         )
 
-    # Gate 3.5 (W7): Conflict resolution
+    # Gate 5 (W7): Conflict resolution
     conflict = detect_and_resolve_conflict(
         conn,
         owner_id,
@@ -258,7 +334,7 @@ def admit_preference(
             value=preference_value
         )
 
-    # Gate 4: Confidence threshold check
+    # Gate 6: Confidence threshold check (W8: uses field-specific threshold)
     confidence_pass = effective_confidence >= threshold
     gates.append({
         "gate": "confidence_threshold",

@@ -530,6 +530,53 @@ class CircusCLI:
                 print(f"  Content: {row[2][:70]}...")
                 print()
 
+    def allowlist_list(self, args):
+        """List all allowlisted preference fields."""
+        from circus.services.preference_constants import PREFERENCE_REGISTRY
+
+        fields = sorted(PREFERENCE_REGISTRY.values(), key=lambda f: f.category)
+
+        print(f"\nAllowlisted Preference Fields ({len(fields)}):\n")
+
+        current_category = None
+        for field in fields:
+            if field.category != current_category:
+                current_category = field.category
+                print(f"\n[{current_category.upper()}]")
+
+            print(f"  {field.name}")
+            print(f"    {field.description}")
+            if field.valid_values:
+                print(f"    Values: {', '.join(field.valid_values)}")
+            else:
+                print(f"    Values: free text")
+            print(f"    Default: {field.default}")
+            print(f"    Threshold: {field.activation_threshold}")
+            print()
+
+    def allowlist_show(self, args):
+        """Show single preference field details."""
+        from circus.services.preference_constants import PREFERENCE_REGISTRY
+
+        field = PREFERENCE_REGISTRY.get(args.field)
+
+        if not field:
+            print(f"Error: Field '{args.field}' not in allowlist", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"\nField: {field.name}")
+        print(f"Description: {field.description}")
+        print(f"Category: {field.category}")
+        print(f"Default: {field.default}")
+        print(f"Activation Threshold: {field.activation_threshold}")
+
+        if field.valid_values:
+            print(f"\nValid Values:")
+            for val in field.valid_values:
+                print(f"  - {val}")
+        else:
+            print(f"\nValid Values: free text (no constraints)")
+
 
 def main():
     """Main CLI entry point."""
@@ -642,6 +689,17 @@ def main():
     pref_history_parser.add_argument("--field", help="Filter by field name")
     pref_history_parser.add_argument("--owner", help="Filter by owner ID")
 
+    # Allowlist command (Week 8)
+    allowlist_parser = subparsers.add_parser("allowlist", help="Preference allowlist commands")
+    allowlist_subparsers = allowlist_parser.add_subparsers(dest="allowlist_command", help="Allowlist subcommands")
+
+    # allowlist list
+    allowlist_list_parser = allowlist_subparsers.add_parser("list", help="List all allowlisted fields")
+
+    # allowlist show
+    allowlist_show_parser = allowlist_subparsers.add_parser("show", help="Show field details")
+    allowlist_show_parser.add_argument("field", help="Field name to show")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -684,6 +742,17 @@ def main():
             cli.preference_history(args)
         else:
             print("Unknown preference subcommand", file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "allowlist":
+        if not hasattr(args, 'allowlist_command') or not args.allowlist_command:
+            print("Usage: circus allowlist {list|show} [options]", file=sys.stderr)
+            sys.exit(1)
+        elif args.allowlist_command == "list":
+            cli.allowlist_list(args)
+        elif args.allowlist_command == "show":
+            cli.allowlist_show(args)
+        else:
+            print("Unknown allowlist subcommand", file=sys.stderr)
             sys.exit(1)
     elif args.command == "hull":
         from circus.services.hull_integrity import (

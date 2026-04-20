@@ -296,10 +296,11 @@ def test_decision_trace_on_skip_wrong_owner(client, reset_server_owner):
         assert gates[1]["gate"] == "same_owner_match"
         assert gates[1]["passed"] is False
 
-        # Gates 3, 4, and 5 not evaluated (W7 added gate 3)
+        # Gates 3 and 4 not evaluated (only 4 gates appended on same_owner_failed)
+        # W5 short-circuits after same_owner fails — appends owner_signature_valid=None
+        # and confidence_threshold=None, but no conflict_resolution stub. Total = 4.
         assert gates[2]["passed"] is None
         assert gates[3]["passed"] is None
-        assert gates[4]["passed"] is None
 
         # Check outcome
         assert trace["outcome"] == "same_owner_failed"
