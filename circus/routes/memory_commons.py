@@ -430,6 +430,10 @@ async def publish_memory(
                     "signature": mem_req.provenance.owner_binding.signature,
                 }
 
+            # Apply passport trust multiplier (non-fatal)
+            from circus.services.passport_trust import apply_passport_trust
+            effective_conf = apply_passport_trust(conn, agent_id, effective_conf)
+
             decision = admit_preference(
                 conn,
                 memory_id=memory_id,
@@ -918,6 +922,13 @@ async def clear_preference(
             WHERE owner_id = ? AND field_name = ?
         """, (owner_id, field_name))
         conn.commit()
+
+        # Non-fatal AI-IQ clear
+        try:
+            from circus.services.aiiq_bridge import clear_preference_in_aiiq
+            clear_preference_in_aiiq(owner_id, field_name)
+        except Exception:
+            pass  # Never block preference deletion
 
         return {
             "status": "cleared",

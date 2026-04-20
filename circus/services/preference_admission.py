@@ -379,6 +379,18 @@ def admit_preference(
         }
     )
 
+    # Non-fatal AI-IQ sync
+    try:
+        from circus.services.aiiq_bridge import sync_preference_to_aiiq
+        sync_preference_to_aiiq(
+            owner_id=owner_id,
+            field=preference_field,
+            value=preference_value,
+            confidence=float(effective_confidence),
+        )
+    except Exception:
+        pass  # Never block preference admission
+
     return PreferenceDecision(
         admitted=True,
         gates=gates,
