@@ -688,6 +688,102 @@ class CircusCLI:
             print(f"  Reason: {reason}")
             print(f"  Event ID: {event_id}")
 
+    def federation_peers(self, args):
+        """List federation peers with health status."""
+        response = self.client.get(f"{self.base_url}/api/v1/federation/peers")
+
+        if response.status_code == 200:
+            result = response.json()
+            peers = result.get("peers", [])
+
+            if not peers:
+                print("No federation peers registered")
+                return
+
+            print(f"\nFederation Peers ({result['count']}):\n")
+            print(f"{'URL':<40} {'Status':<12} {'Failures':<10} {'Last Seen':<20}")
+            print("-" * 85)
+
+            for peer in peers:
+                url = peer["url"][:37] + "..." if len(peer["url"]) > 40 else peer["url"]
+                status = "HEALTHY" if peer["is_healthy"] else "UNHEALTHY"
+                failures = peer["consecutive_failures"]
+                last_seen = peer["last_seen_at"][:19] if peer["last_seen_at"] else "Never"
+
+                print(f"{url:<40} {status:<12} {failures:<10} {last_seen:<20}")
+        else:
+            print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+    def federation_outbox(self, args):
+        """List federation outbox entries."""
+        params = {}
+        if args.status:
+            params["status"] = args.status
+
+        response = self.client.get(f"{self.base_url}/api/v1/federation/outbox", params=params)
+
+        if response.status_code == 200:
+            result = response.json()
+            entries = result.get("entries", [])
+
+            if not entries:
+                print("No outbox entries found")
+                return
+
+            print(f"\nFederation Outbox ({result['count']}):\n")
+            print(f"{'ID':<20} {'Peer':<30} {'Status':<12} {'Attempts':<10} {'Created':<20}")
+            print("-" * 95)
+
+            for entry in entries:
+                entry_id = entry["id"][:17] + "..."
+                peer = entry["peer_url"][:27] + "..." if len(entry["peer_url"]) > 30 else entry["peer_url"]
+                status = entry["status"].upper()
+                attempts = entry["attempt_count"]
+                created = entry["created_at"][:19]
+
+                print(f"{entry_id:<20} {peer:<30} {status:<12} {attempts:<10} {created:<20}")
+
+                if entry["error"]:
+                    print(f"  Error: {entry['error'][:80]}")
+        else:
+            print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+    def federation_metrics(self, args):
+        """Show federation delivery metrics."""
+        response = self.client.get(f"{self.base_url}/api/v1/federation/metrics")
+
+        if response.status_code == 200:
+            metrics = response.json()
+
+            print("\nFederation Outbox Metrics:\n")
+            print(f"  Pending:    {metrics['pending']:>6}")
+            print(f"  Delivered:  {metrics['delivered']:>6}")
+            print(f"  Failed:     {metrics['failed']:>6}")
+            print(f"  Abandoned:  {metrics['abandoned']:>6}")
+            print(f"  {'─' * 17}")
+            print(f"  Total:      {metrics['total']:>6}")
+        else:
+            print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+    def federation_add_peer(self, args):
+        """Add a federation peer."""
+        data = {"url": args.url}
+        if args.name:
+            data["name"] = args.name
+
+        response = self.client.post(f"{self.base_url}/api/v1/federation/peers", json=data)
+
+        if response.status_code == 200:
+            result = response.json()
+            print(f"✓ Federation peer added: {result['url']}")
+            print(f"  Name: {result['name']}")
+        else:
+            print(f"Error: {response.status_code} - {response.text}", file=sys.stderr)
+            sys.exit(1)
+
 
 def main():
     """Main CLI entry point."""
@@ -817,6 +913,25 @@ def main():
     keys_revoke_parser.add_argument("--owner", required=True, help="Owner ID")
     keys_revoke_parser.add_argument("--reason", help="Revocation reason")
 
+    # Federation command (W10)
+    federation_parser = subparsers.add_parser("federation", help="Federation durability commands")
+    federation_subparsers = federation_parser.add_subparsers(dest="federation_command", help="Federation subcommands")
+
+    # federation peers
+    fed_peers_parser = federation_subparsers.add_parser("peers", help="List federation peers with health status")
+
+    # federation outbox
+    fed_outbox_parser = federation_subparsers.add_parser("outbox", help="List outbox entries")
+    fed_outbox_parser.add_argument("--status", choices=["pending", "delivered", "failed", "abandoned"], help="Filter by status")
+
+    # federation metrics
+    fed_metrics_parser = federation_subparsers.add_parser("metrics", help="Show delivery stats")
+
+    # federation add-peer
+    fed_add_peer_parser = federation_subparsers.add_parser("add-peer", help="Register a federation peer")
+    fed_add_peer_parser.add_argument("url", help="Peer base URL (e.g., http://peer:6200)")
+    fed_add_peer_parser.add_argument("--name", help="Optional human name")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -872,6 +987,21 @@ def main():
             cli.keys_revoke(args)
         else:
             print("Unknown keys subcommand", file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "federation":
+        if not hasattr(args, 'federation_command') or not args.federation_command:
+            print("Usage: circus federation {peers|outbox|metrics|add-peer} [options]", file=sys.stderr)
+            sys.exit(1)
+        elif args.federation_command == "peers":
+            cli.federation_peers(args)
+        elif args.federation_command == "outbox":
+            cli.federation_outbox(args)
+        elif args.federation_command == "metrics":
+            cli.federation_metrics(args)
+        elif args.federation_command == "add-peer":
+            cli.federation_add_peer(args)
+        else:
+            print("Unknown federation subcommand", file=sys.stderr)
             sys.exit(1)
     elif args.command == "hull":
         from circus.services.hull_integrity import (

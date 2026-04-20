@@ -377,6 +377,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v9_migration(db_path)
     # Run v10 migration for Key lifecycle
     run_v10_migration(db_path)
+    # Run v11 migration for Federation outbox
+    run_v11_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -742,6 +744,63 @@ def run_v10_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v10 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v11_migration(db_path: Optional[Path] = None) -> None:
+    """Run v11 migration: Federation outbox + peer health (W10)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v11_federation_outbox.sql"
+
+    if not migration_file.exists():
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if migration already applied (federation_outbox table exists)
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='federation_outbox'")
+        outbox_exists = cursor.fetchone() is not None
+
+        if not outbox_exists:
+            # Run migration SQL (creates table + indexes)
+            with open(migration_file, 'r') as f:
+                migration_sql = f.read()
+            cursor.executescript(migration_sql)
+
+            # Add health tracking columns to federation_peers
+            cursor.execute("PRAGMA table_info(federation_peers)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+
+            if 'last_seen_at' not in existing_columns:
+                cursor.execute("ALTER TABLE federation_peers ADD COLUMN last_seen_at TEXT")
+            if 'last_failed_at' not in existing_columns:
+                cursor.execute("ALTER TABLE federation_peers ADD COLUMN last_failed_at TEXT")
+            if 'consecutive_failures' not in existing_columns:
+                cursor.execute("ALTER TABLE federation_peers ADD COLUMN consecutive_failures INTEGER DEFAULT 0")
+            if 'is_healthy' not in existing_columns:
+                cursor.execute("ALTER TABLE federation_peers ADD COLUMN is_healthy INTEGER DEFAULT 1")
+            if 'registered_at' not in existing_columns:
+                cursor.execute("ALTER TABLE federation_peers ADD COLUMN registered_at TEXT")
+
+            # Fix public_key constraint: SQLite doesn't support DROP NOT NULL,
+            # so we'll set a dummy key for existing rows without one (should be none)
+            # New peers added via outbox don't need public_key (they're just URLs)
+
+            conn.commit()
+            logger.info("v11 migration: federation_outbox table created, peer health columns added")
+        else:
+            logger.debug("v11 migration: federation_outbox already exists, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v11 migration failed: %s", e)
         raise
     finally:
         conn.close()

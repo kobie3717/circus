@@ -85,15 +85,24 @@ async def lifespan(app: FastAPI):
     init_database()
     seed_default_rooms()
 
-    # Start background task
-    task = asyncio.create_task(trust_decay_task())
+    # Start background tasks
+    trust_task = asyncio.create_task(trust_decay_task())
+
+    # Start federation worker (W10)
+    from circus.services.federation_worker import run_federation_worker
+    federation_task = asyncio.create_task(run_federation_worker())
 
     yield
 
     # Shutdown
-    task.cancel()
+    trust_task.cancel()
+    federation_task.cancel()
     try:
-        await task
+        await trust_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await federation_task
     except asyncio.CancelledError:
         pass
 

@@ -496,6 +496,44 @@ async def publish_memory(
         if decision_trace:
             response_data["decision_trace"] = decision_trace
 
+        # W10: Enqueue for federation (if CIRCUS_PEERS configured)
+        from circus.services.federation_worker import enqueue_for_federation
+
+        # Build federation payload (same shape as publish request)
+        federation_payload = {
+            "content": mem_req.content,
+            "category": mem_req.category,
+            "domain": normalized_domain,
+            "tags": mem_req.tags or [],
+            "confidence": mem_req.confidence,
+            "privacy_tier": mem_req.privacy_tier,
+        }
+
+        # Include provenance if present
+        if mem_req.provenance:
+            federation_payload["provenance"] = {
+                "derived_from": mem_req.provenance.derived_from,
+                "citations": mem_req.provenance.citations,
+                "reasoning": mem_req.provenance.reasoning,
+                "owner_id": mem_req.provenance.owner_id,
+            }
+            if mem_req.provenance.owner_binding:
+                federation_payload["provenance"]["owner_binding"] = {
+                    "agent_id": mem_req.provenance.owner_binding.agent_id,
+                    "memory_id": mem_req.provenance.owner_binding.memory_id,
+                    "timestamp": mem_req.provenance.owner_binding.timestamp,
+                    "signature": mem_req.provenance.owner_binding.signature,
+                }
+
+        # Include preference if present
+        if mem_req.preference:
+            federation_payload["preference"] = {
+                "field": mem_req.preference.field,
+                "value": mem_req.preference.value,
+            }
+
+        enqueue_for_federation(memory_id, federation_payload)
+
         return PublishResponseWithConflict(**response_data)
 
 

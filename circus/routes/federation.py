@@ -454,3 +454,152 @@ async def push_federation_bundle(
         resp["detail"] = result.detail
 
     return resp
+
+
+# W10: Federation outbox endpoints
+
+@router.get("/api/v1/federation/peers")
+async def get_federation_peers(agent_id: str = Depends(verify_token)):
+    """List all federation peers with health status (ring token auth)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT url, name, last_seen_at, last_failed_at,
+                   consecutive_failures, is_healthy, registered_at
+            FROM federation_peers
+            ORDER BY name
+        """)
+
+        peers = []
+        for row in cursor.fetchall():
+            peers.append({
+                "url": row["url"],
+                "name": row["name"] or row["url"],
+                "last_seen_at": row["last_seen_at"],
+                "last_failed_at": row["last_failed_at"],
+                "consecutive_failures": row["consecutive_failures"],
+                "is_healthy": bool(row["is_healthy"]),
+                "registered_at": row["registered_at"]
+            })
+
+        return {"peers": peers, "count": len(peers)}
+
+
+@router.get("/api/v1/federation/outbox")
+async def get_federation_outbox(
+    status: Optional[str] = Query(None, pattern="^(pending|delivered|failed|abandoned)$"),
+    agent_id: str = Depends(verify_token)
+):
+    """List outbox entries (ring token auth)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        if status:
+            cursor.execute("""
+                SELECT id, peer_url, memory_id, status, attempt_count,
+                       last_attempted_at, delivered_at, error, created_at, next_retry_at
+                FROM federation_outbox
+                WHERE status = ?
+                ORDER BY created_at DESC
+                LIMIT 100
+            """, (status,))
+        else:
+            cursor.execute("""
+                SELECT id, peer_url, memory_id, status, attempt_count,
+                       last_attempted_at, delivered_at, error, created_at, next_retry_at
+                FROM federation_outbox
+                ORDER BY created_at DESC
+                LIMIT 100
+            """)
+
+        entries = []
+        for row in cursor.fetchall():
+            entries.append({
+                "id": row["id"],
+                "peer_url": row["peer_url"],
+                "memory_id": row["memory_id"],
+                "status": row["status"],
+                "attempt_count": row["attempt_count"],
+                "last_attempted_at": row["last_attempted_at"],
+                "delivered_at": row["delivered_at"],
+                "error": row["error"],
+                "created_at": row["created_at"],
+                "next_retry_at": row["next_retry_at"]
+            })
+
+        return {"entries": entries, "count": len(entries)}
+
+
+@router.get("/api/v1/federation/metrics")
+async def get_federation_metrics():
+    """Get federation outbox metrics (public, no auth)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Count by status
+        cursor.execute("""
+            SELECT status, COUNT(*) as count
+            FROM federation_outbox
+            GROUP BY status
+        """)
+
+        counts = {row["status"]: row["count"] for row in cursor.fetchall()}
+
+        return {
+            "pending": counts.get("pending", 0),
+            "delivered": counts.get("delivered", 0),
+            "failed": counts.get("failed", 0),
+            "abandoned": counts.get("abandoned", 0),
+            "total": sum(counts.values())
+        }
+
+
+@router.post("/api/v1/federation/peers")
+async def add_federation_peer(
+    url: str,
+    name: Optional[str] = None,
+    agent_id: str = Depends(verify_token)
+):
+    """Register a federation peer (ring token auth)."""
+    now = datetime.utcnow().isoformat()
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Check if peer already exists
+        cursor.execute("SELECT url FROM federation_peers WHERE url = ?", (url,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="Peer already registered")
+
+        # Generate peer ID
+        peer_id = f"peer-{secrets.token_hex(8)}"
+
+        # Insert peer (public_key is NOT NULL, use dummy for outbox-only peers)
+        dummy_key = b'\x00' * 32
+        cursor.execute("""
+            INSERT INTO federation_peers (
+                id, url, name, public_key, created_at, registered_at, is_healthy, consecutive_failures
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 0)
+        """, (peer_id, url, name or url, dummy_key, now, now))
+
+        conn.commit()
+
+    return {"status": "registered", "url": url, "name": name or url}
+
+
+@router.delete("/api/v1/federation/peers/{url:path}")
+async def remove_federation_peer(
+    url: str,
+    agent_id: str = Depends(verify_token)
+):
+    """Remove a federation peer (ring token auth)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("DELETE FROM federation_peers WHERE url = ?", (url,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Peer not found")
+
+        conn.commit()
+
+    return {"status": "removed", "url": url}
