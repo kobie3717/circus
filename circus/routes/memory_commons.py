@@ -974,3 +974,112 @@ async def get_conflicts(
             "conflicts": conflicts,
             "count": len(conflicts)
         }
+
+
+# Cross-Agent Shared Learning API (W11)
+
+
+@router.get("/search")
+async def search_shared_knowledge(
+    q: str,
+    limit: int = 3,
+    owner_id: Optional[str] = None
+):
+    """
+    Search shared memories (no auth required - read-only, public knowledge).
+
+    Query shared_memories table using LIKE on content (FTS if available).
+    Score: confidence × (1 - hop_count × 0.1) — capped at 0.0
+    Returns top `limit` results (default 3, max 10).
+
+    Optional owner_id filter for owner-specific knowledge.
+    """
+    if not settings.memory_commons_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Memory Commons is disabled"
+        )
+
+    # Clamp limit
+    limit = max(1, min(limit, 10))
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Check if FTS table exists (fts_shared_memories)
+        cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='fts_shared_memories'
+        """)
+        has_fts = cursor.fetchone() is not None
+
+        # Build query
+        if has_fts:
+            # FTS search
+            if owner_id:
+                cursor.execute("""
+                    SELECT sm.id, sm.content, sm.category, sm.domain, sm.confidence,
+                           sm.hop_count, sm.from_agent_id, sm.shared_at
+                    FROM fts_shared_memories fts
+                    JOIN shared_memories sm ON fts.rowid = sm.rowid
+                    WHERE fts.content MATCH ? AND sm.provenance LIKE ?
+                    ORDER BY rank
+                    LIMIT ?
+                """, (q, f'%"owner_id": "{owner_id}"%', limit))
+            else:
+                cursor.execute("""
+                    SELECT sm.id, sm.content, sm.category, sm.domain, sm.confidence,
+                           sm.hop_count, sm.from_agent_id, sm.shared_at
+                    FROM fts_shared_memories fts
+                    JOIN shared_memories sm ON fts.rowid = sm.rowid
+                    WHERE fts.content MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                """, (q, limit))
+        else:
+            # Fallback: LIKE search
+            if owner_id:
+                cursor.execute("""
+                    SELECT id, content, category, domain, confidence,
+                           hop_count, from_agent_id, shared_at
+                    FROM shared_memories
+                    WHERE content LIKE ? AND provenance LIKE ?
+                    ORDER BY shared_at DESC
+                    LIMIT ?
+                """, (f'%{q}%', f'%"owner_id": "{owner_id}"%', limit))
+            else:
+                cursor.execute("""
+                    SELECT id, content, category, domain, confidence,
+                           hop_count, from_agent_id, shared_at
+                    FROM shared_memories
+                    WHERE content LIKE ?
+                    ORDER BY shared_at DESC
+                    LIMIT ?
+                """, (f'%{q}%', limit))
+
+        results = []
+        for row in cursor.fetchall():
+            memory_id, content, category, domain, confidence, hop_count, from_agent_id, shared_at = row
+
+            # Calculate score: confidence × (1 - hop_count × 0.1) — capped at 0.0
+            score = max(0.0, confidence * (1.0 - hop_count * 0.1))
+
+            # Extract clean source_agent name (strip timestamp suffix if present)
+            source_agent = from_agent_id.split('-')[0] if from_agent_id else 'unknown'
+
+            results.append({
+                "memory_id": memory_id,
+                "content": content,
+                "category": category,
+                "domain": domain,
+                "confidence": confidence,
+                "score": round(score, 2),
+                "source_agent": source_agent,
+                "shared_at": shared_at
+            })
+
+        return {
+            "results": results,
+            "query": q,
+            "count": len(results)
+        }
