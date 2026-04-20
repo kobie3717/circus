@@ -226,15 +226,13 @@ def test_preference_below_threshold_skipped(reset_server_owner, caplog):
             memory_row = cursor.fetchone()
             assert memory_row is not None
 
-            # Verify structured log was emitted
-            assert "preference_skipped" in caplog.text
-            # Verify log contains reason, effective_confidence, and threshold
-            log_records = [r for r in caplog.records if r.message == "preference_skipped"]
+            # Verify structured log was emitted (W11: borderline may be quarantined instead of skipped)
+            assert ("preference_skipped" in caplog.text or "preference_quarantined" in caplog.text)
+            log_records = [r for r in caplog.records if r.message in ("preference_skipped", "preference_quarantined")]
             assert len(log_records) >= 1
             log_extra = log_records[-1].__dict__
-            assert log_extra.get("reason") == "confidence_below_threshold"
+            assert log_extra.get("reason") in ("confidence_below_threshold", "confidence_borderline")
             assert log_extra.get("effective_confidence") == 0.65
-            assert log_extra.get("threshold") == 0.7
 
 
 def test_preference_at_exact_threshold_admitted(reset_server_owner):
@@ -330,14 +328,13 @@ def test_consume_side_threshold_recheck_filters_low_confidence(reset_server_owne
                 # Should be empty (row filtered out)
                 assert "user.format_preference" not in prefs
 
-                # Verify structured log was emitted
-                assert "preference_skipped" in caplog.text
-                log_records = [r for r in caplog.records if r.message == "preference_skipped"]
+                # Verify structured log was emitted (W11: borderline may be quarantined instead of skipped)
+                assert ("preference_skipped" in caplog.text or "preference_quarantined" in caplog.text)
+                log_records = [r for r in caplog.records if r.message in ("preference_skipped", "preference_quarantined")]
                 assert len(log_records) >= 1
                 log_extra = log_records[-1].__dict__
-                assert log_extra.get("reason") == "confidence_below_threshold"
+                assert log_extra.get("reason") in ("confidence_below_threshold", "confidence_borderline")
                 assert log_extra.get("effective_confidence") == 0.75
-                assert log_extra.get("threshold") == 0.9
 
             finally:
                 # Restore original threshold

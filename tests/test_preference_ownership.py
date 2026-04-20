@@ -235,7 +235,9 @@ def test_preference_memory_audit_trail_preserved_on_skip(reset_server_owner):
     with patch.dict(os.environ, {"CIRCUS_OWNER_ID": "kobus"}):
         with get_db() as conn:
             # Manually insert a preference memory with owner_id=jaco
+            # Disable FK for test: from_agent_id='agent-test' is not a registered agent
             cursor = conn.cursor()
+            conn.execute("PRAGMA foreign_keys=OFF")
             now = datetime.utcnow()
             cursor.execute(
                 """
@@ -249,6 +251,7 @@ def test_preference_memory_audit_trail_preserved_on_skip(reset_server_owner):
                 """,
                 (unique_id, now.isoformat()),
             )
+            conn.execute("PRAGMA foreign_keys=ON")
             conn.commit()
 
             # Try to admit (should skip due to owner mismatch - before signature check)
