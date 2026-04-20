@@ -81,7 +81,13 @@ async def trust_decay_task():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
-    # Startup
+    # Startup: validate required configuration
+    if not settings.secret_key or settings.secret_key == "":
+        raise RuntimeError(
+            "CIRCUS_SECRET_KEY environment variable must be set. "
+            "Generate with: openssl rand -hex 32"
+        )
+
     init_database()
     seed_default_rooms()
 

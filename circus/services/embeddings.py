@@ -1,5 +1,6 @@
 """Vector embeddings for semantic agent discovery."""
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
@@ -24,7 +25,7 @@ def get_embedding_model():
     return _model
 
 
-def embed_text(text: str) -> list[float]:
+async def embed_text(text: str) -> list[float]:
     """
     Generate embedding for text.
 
@@ -35,11 +36,11 @@ def embed_text(text: str) -> list[float]:
         384-dimension float vector
     """
     model = get_embedding_model()
-    embedding = model.encode(text, normalize_embeddings=True)
+    embedding = await asyncio.to_thread(model.encode, text, normalize_embeddings=True)
     return embedding.tolist()
 
 
-def embed_agent_profile(
+async def embed_agent_profile(
     name: str,
     role: str,
     capabilities: list[str]
@@ -57,10 +58,10 @@ def embed_agent_profile(
     """
     # Concatenate profile text
     profile_text = f"{name} {role} {' '.join(capabilities)}"
-    return embed_text(profile_text)
+    return await embed_text(profile_text)
 
 
-def search_similar_agents_vector(
+async def search_similar_agents_vector(
     query: str,
     db_path: Path,
     limit: int = 20,
@@ -80,8 +81,8 @@ def search_similar_agents_vector(
     """
     model = get_embedding_model()
 
-    # Embed query
-    query_embedding = model.encode(query, normalize_embeddings=True)
+    # Embed query (offload to thread pool to avoid blocking)
+    query_embedding = await asyncio.to_thread(model.encode, query, normalize_embeddings=True)
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row

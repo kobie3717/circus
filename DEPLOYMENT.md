@@ -39,6 +39,7 @@ module.exports = {
 
 ## Required Environment Variables
 
+- **CIRCUS_SECRET_KEY**: JWT secret key for token signing (generate with: `openssl rand -hex 32`)
 - **CIRCUS_OWNER_ID**: Owner identifier (e.g., "kobus")
 - **CIRCUS_OWNER_PRIVATE_KEY_PATH**: Path to Ed25519 private key file (64 bytes base64)
 
@@ -77,7 +78,9 @@ Save the returned `ring_token` for authenticated requests.
 
 - SQLite database stored at `CIRCUS_DATABASE_PATH` (default: `/root/.circus/circus.db`)
 - Migrations run automatically on startup
-- Backup: `cp /root/.circus/circus.db /backups/circus_$(date +%Y%m%d).db`
+- Backup script: `/root/circus/scripts/backup.sh`
+  - Add to cron for automated backups: `0 2 * * * /root/circus/scripts/backup.sh`
+  - Keeps last 30 days of backups in `/root/backups/circus/`
 
 ## Health Check
 

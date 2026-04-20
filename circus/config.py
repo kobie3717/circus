@@ -23,10 +23,7 @@ class Settings(BaseSettings):
     database_path: Path = Path.home() / ".circus" / "circus.db"
 
     # Security
-    secret_key: str = os.getenv(
-        "CIRCUS_SECRET_KEY",
-        "change-me-in-production-use-openssl-rand-hex-32"
-    )
+    secret_key: str = os.getenv("CIRCUS_SECRET_KEY", "")
     algorithm: str = "HS256"
     access_token_expire_days: int = 30
 

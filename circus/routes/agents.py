@@ -366,6 +366,27 @@ async def discover(
 
         rows = cursor.fetchall()
 
+        # Batch-fetch competencies to avoid N+1 query
+        agent_ids = [row["id"] for row in rows]
+        competencies_by_agent = {}
+        if agent_ids:
+            placeholders = ",".join("?" * len(agent_ids))
+            competence_rows = cursor.execute(
+                f"SELECT agent_id, domain, score, observations FROM agent_competence WHERE agent_id IN ({placeholders}) ORDER BY score DESC",
+                agent_ids
+            ).fetchall()
+            for c in competence_rows:
+                if c["agent_id"] not in competencies_by_agent:
+                    competencies_by_agent[c["agent_id"]] = []
+                if len(competencies_by_agent[c["agent_id"]]) < 5:  # Top 5 domains
+                    competencies_by_agent[c["agent_id"]].append(
+                        DomainCompetence(
+                            domain=c["domain"],
+                            score=c["score"],
+                            observations=c["observations"]
+                        )
+                    )
+
     agent_responses = []
     for row in rows:
         # Encode public key if available
@@ -395,7 +416,7 @@ async def discover(
             last_seen=row["last_seen"],
             public_key=public_key_str,
             signed_card=signed_card_val,
-            competence=get_agent_competence_list(row["id"])
+            competence=competencies_by_agent.get(row["id"])
         ))
 
     return DiscoverResponse(
@@ -700,7 +721,7 @@ async def discover_semantic(
         from circus.services.embeddings import search_similar_agents_vector
 
         # Get similar agents by embedding
-        similar_agents = search_similar_agents_vector(
+        similar_agents = await search_similar_agents_vector(
             q,
             settings.database_path,
             limit=limit * 2,  # Get more to filter by trust
@@ -711,45 +732,76 @@ async def discover_semantic(
         with get_db() as conn:
             cursor = conn.cursor()
 
+            # Fetch agent data in batch
+            agent_id_list = [agent_id for agent_id, _ in similar_agents]
+            if not agent_id_list:
+                return DiscoverResponse(agents=[], count=0)
+
+            placeholders = ",".join("?" * len(agent_id_list))
+            agent_rows = cursor.execute(f"""
+                SELECT a.*, p.prediction_accuracy
+                FROM agents a
+                LEFT JOIN passports p ON a.id = p.agent_id
+                WHERE a.id IN ({placeholders}) AND a.trust_score >= ? AND a.is_active = 1
+            """, (*agent_id_list, min_trust)).fetchall()
+
+            # Create lookup for similarity scores
+            similarity_by_id = {agent_id: similarity for agent_id, similarity in similar_agents}
+
+            # Batch-fetch competencies to avoid N+1 query
+            rows_agent_ids = [row["id"] for row in agent_rows]
+            competencies_by_agent = {}
+            if rows_agent_ids:
+                comp_placeholders = ",".join("?" * len(rows_agent_ids))
+                competence_rows = cursor.execute(
+                    f"SELECT agent_id, domain, score, observations FROM agent_competence WHERE agent_id IN ({comp_placeholders}) ORDER BY score DESC",
+                    rows_agent_ids
+                ).fetchall()
+                for c in competence_rows:
+                    if c["agent_id"] not in competencies_by_agent:
+                        competencies_by_agent[c["agent_id"]] = []
+                    if len(competencies_by_agent[c["agent_id"]]) < 5:  # Top 5 domains
+                        competencies_by_agent[c["agent_id"]].append(
+                            DomainCompetence(
+                                domain=c["domain"],
+                                score=c["score"],
+                                observations=c["observations"]
+                            )
+                        )
+
             agent_responses = []
-            for agent_id, similarity in similar_agents:
-                cursor.execute("""
-                    SELECT a.*, p.prediction_accuracy
-                    FROM agents a
-                    LEFT JOIN passports p ON a.id = p.agent_id
-                    WHERE a.id = ? AND a.trust_score >= ? AND a.is_active = 1
-                """, (agent_id, min_trust))
+            for row in agent_rows:
+                if len(agent_responses) >= limit:
+                    break
 
-                row = cursor.fetchone()
-                if row and len(agent_responses) < limit:
-                    public_key_str = None
-                    try:
-                        if row["public_key"]:
-                            public_key_str = encode_public_key(row["public_key"])
-                    except (KeyError, IndexError):
-                        pass
+                public_key_str = None
+                try:
+                    if row["public_key"]:
+                        public_key_str = encode_public_key(row["public_key"])
+                except (KeyError, IndexError):
+                    pass
 
-                    signed_card_val = None
-                    try:
-                        signed_card_val = row["signed_card"]
-                    except (KeyError, IndexError):
-                        pass
+                signed_card_val = None
+                try:
+                    signed_card_val = row["signed_card"]
+                except (KeyError, IndexError):
+                    pass
 
-                    agent_responses.append(AgentResponse(
-                        agent_id=row["id"],
-                        name=row["name"],
-                        role=row["role"],
-                        capabilities=json.loads(row["capabilities"]),
-                        home_instance=row["home_instance"],
-                        trust_score=row["trust_score"],
-                        trust_tier=row["trust_tier"],
-                        prediction_accuracy=row["prediction_accuracy"],
-                        registered_at=row["registered_at"],
-                        last_seen=row["last_seen"],
-                        public_key=public_key_str,
-                        signed_card=signed_card_val,
-                        competence=get_agent_competence_list(row["id"])
-                    ))
+                agent_responses.append(AgentResponse(
+                    agent_id=row["id"],
+                    name=row["name"],
+                    role=row["role"],
+                    capabilities=json.loads(row["capabilities"]),
+                    home_instance=row["home_instance"],
+                    trust_score=row["trust_score"],
+                    trust_tier=row["trust_tier"],
+                    prediction_accuracy=row["prediction_accuracy"],
+                    registered_at=row["registered_at"],
+                    last_seen=row["last_seen"],
+                    public_key=public_key_str,
+                    signed_card=signed_card_val,
+                    competence=competencies_by_agent.get(row["id"])
+                ))
 
         return DiscoverResponse(
             agents=agent_responses,

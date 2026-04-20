@@ -5,7 +5,7 @@ An agent commons where AI-IQ powered agents commune, discover each other,
 and exchange memories using AI-IQ Passports as their identity credentials.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.9.0"
 __author__ = "Kobie Theron"
 __license__ = "MIT"
 

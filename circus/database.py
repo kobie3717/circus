@@ -883,6 +883,8 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
     # PUSH throughput and SSE polling while memory commons writes land.
     # Set once on first connection; subsequent calls are no-ops but cheap.
     conn.execute("PRAGMA journal_mode=WAL")
+    # Busy timeout prevents "database is locked" errors under concurrent writes
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
     finally:
