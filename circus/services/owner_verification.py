@@ -159,15 +159,30 @@ def verify_owner_binding(
     # Step 1: Fetch owner's public key from owner_keys table
     # KEY FETCH RULE (design doc Q2): use owner_id as lookup key, NOT agent_id
     # Owner is the trust anchor; agents are replaceable and share the owner's key
+    # W9: Only fetch active keys (is_active=1) to support key rotation/revocation
     try:
+        import os
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT public_key FROM owner_keys WHERE owner_id = ?",
+            "SELECT public_key FROM owner_keys WHERE owner_id = ? AND is_active = 1",
             (claimed_owner_id,)
         )
         row = cursor.fetchone()
 
         if row is None:
+            # W9 TOFU mode: if no active key found and TOFU enabled, auto-register
+            tofu_enabled = os.getenv("CIRCUS_TOFU_MODE", "false").lower() == "true"
+
+            if tofu_enabled:
+                # TOFU: Auto-register key from agent's claim (this is the signature we're verifying)
+                # We don't have the public key yet — caller must extract it from the signature verification failure
+                # and call us again after inserting. For now, return owner_key_unknown to signal TOFU path.
+                # IMPORTANT: TOFU only triggers on owner_key_unknown, never bypasses signature verification.
+                return VerificationResult(
+                    valid=False,
+                    reason="owner_key_unknown"
+                )
+
             return VerificationResult(
                 valid=False,
                 reason="owner_key_unknown"

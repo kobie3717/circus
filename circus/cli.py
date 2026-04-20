@@ -530,6 +530,164 @@ class CircusCLI:
                 print(f"  Content: {row[2][:70]}...")
                 print()
 
+    def keys_list(self, args):
+        """List owner keys (active + history)."""
+        from circus.database import get_db
+
+        owner_filter = args.owner if args.owner else None
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            if owner_filter:
+                cursor.execute("""
+                    SELECT owner_id, public_key, created_at, is_active, rotated_at, revoked_at, revoked_reason
+                    FROM owner_keys
+                    WHERE owner_id = ?
+                    ORDER BY created_at DESC
+                """, (owner_filter,))
+            else:
+                cursor.execute("""
+                    SELECT owner_id, public_key, created_at, is_active, rotated_at, revoked_at, revoked_reason
+                    FROM owner_keys
+                    ORDER BY owner_id, created_at DESC
+                """)
+
+            rows = cursor.fetchall()
+
+            if not rows:
+                print("No keys found")
+                return
+
+            # Pretty print
+            print(f"\nOwner Keys ({len(rows)}):\n")
+            print(f"{'Owner':<15} {'Public Key':<20} {'Created':<20} {'Status':<12} {'Updated':<20}")
+            print("-" * 90)
+
+            for row in rows:
+                owner_id = row[0]
+                public_key = row[1][:17] + "..."
+                created = row[2][:19]
+                is_active = row[3]
+                rotated_at = row[4]
+                revoked_at = row[5]
+                revoked_reason = row[6]
+
+                if is_active:
+                    status = "ACTIVE"
+                    updated = ""
+                elif revoked_at:
+                    status = f"REVOKED ({revoked_reason or 'unknown'})"
+                    updated = revoked_at[:19]
+                elif rotated_at:
+                    status = "ROTATED"
+                    updated = rotated_at[:19]
+                else:
+                    status = "INACTIVE"
+                    updated = ""
+
+                print(f"{owner_id:<15} {public_key:<20} {created:<20} {status:<12} {updated:<20}")
+
+    def keys_events(self, args):
+        """Show key events audit log."""
+        from circus.database import get_db
+
+        owner_filter = args.owner if args.owner else None
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            if owner_filter:
+                cursor.execute("""
+                    SELECT id, owner_id, event_type, public_key_b64, previous_key_b64, reason, happened_at, actor
+                    FROM key_events
+                    WHERE owner_id = ?
+                    ORDER BY happened_at DESC
+                    LIMIT 50
+                """, (owner_filter,))
+            else:
+                cursor.execute("""
+                    SELECT id, owner_id, event_type, public_key_b64, previous_key_b64, reason, happened_at, actor
+                    FROM key_events
+                    ORDER BY happened_at DESC
+                    LIMIT 50
+                """)
+
+            rows = cursor.fetchall()
+
+            if not rows:
+                print("No key events found")
+                return
+
+            # Pretty print
+            print(f"\nKey Events ({len(rows)}):\n")
+            print(f"{'Event ID':<20} {'Owner':<15} {'Type':<15} {'Happened':<20} {'Actor':<20}")
+            print("-" * 95)
+
+            for row in rows:
+                event_id = row[0][:17] + "..."
+                owner_id = row[1]
+                event_type = row[2]
+                happened = row[6][:19]
+                actor = row[7] if row[7] else "N/A"
+                actor_short = actor[:17] + "..." if len(actor) > 20 else actor
+
+                print(f"{event_id:<20} {owner_id:<15} {event_type:<15} {happened:<20} {actor_short:<20}")
+
+                # Show reason if present
+                if row[5]:
+                    print(f"  Reason: {row[5]}")
+
+    def keys_revoke(self, args):
+        """Revoke owner key (operator command)."""
+        from circus.database import get_db
+
+        owner = args.owner
+        reason = args.reason if args.reason else "operator-revoke"
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            now = datetime.utcnow().isoformat()
+
+            # Fetch current active key
+            cursor.execute("""
+                SELECT public_key FROM owner_keys
+                WHERE owner_id = ? AND is_active = 1
+            """, (owner,))
+            row = cursor.fetchone()
+
+            if not row:
+                print(f"Error: No active key found for owner '{owner}'")
+                sys.exit(1)
+
+            public_key_b64 = row[0]
+
+            # Mark key as revoked
+            cursor.execute("""
+                UPDATE owner_keys
+                SET is_active = 0,
+                    revoked_at = ?,
+                    revoked_reason = ?
+                WHERE owner_id = ? AND public_key = ? AND is_active = 1
+            """, (now, reason, owner, public_key_b64))
+
+            # Log key_events entry
+            import secrets
+            event_id = f"kevent-{secrets.token_hex(8)}"
+            cursor.execute("""
+                INSERT INTO key_events (
+                    id, owner_id, event_type, public_key_b64,
+                    reason, happened_at, actor
+                ) VALUES (?, ?, 'revoked', ?, ?, ?, 'operator')
+            """, (event_id, owner, public_key_b64, reason, now))
+
+            conn.commit()
+
+            print(f"✓ Key revoked for owner '{owner}'")
+            print(f"  Public key: {public_key_b64[:32]}...")
+            print(f"  Reason: {reason}")
+            print(f"  Event ID: {event_id}")
+
 
 def main():
     """Main CLI entry point."""
@@ -642,6 +800,23 @@ def main():
     pref_history_parser.add_argument("--field", help="Filter by field name")
     pref_history_parser.add_argument("--owner", help="Filter by owner ID")
 
+    # Keys command (Week 9)
+    keys_parser = subparsers.add_parser("keys", help="Owner key lifecycle commands")
+    keys_subparsers = keys_parser.add_subparsers(dest="keys_command", help="Keys subcommands")
+
+    # keys list
+    keys_list_parser = keys_subparsers.add_parser("list", help="List owner keys")
+    keys_list_parser.add_argument("--owner", help="Filter by owner ID")
+
+    # keys events
+    keys_events_parser = keys_subparsers.add_parser("events", help="Show key events audit log")
+    keys_events_parser.add_argument("--owner", help="Filter by owner ID")
+
+    # keys revoke
+    keys_revoke_parser = keys_subparsers.add_parser("revoke", help="Revoke owner key")
+    keys_revoke_parser.add_argument("--owner", required=True, help="Owner ID")
+    keys_revoke_parser.add_argument("--reason", help="Revocation reason")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -684,6 +859,19 @@ def main():
             cli.preference_history(args)
         else:
             print("Unknown preference subcommand", file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "keys":
+        if not hasattr(args, 'keys_command') or not args.keys_command:
+            print("Usage: circus keys {list|events|revoke} [options]", file=sys.stderr)
+            sys.exit(1)
+        elif args.keys_command == "list":
+            cli.keys_list(args)
+        elif args.keys_command == "events":
+            cli.keys_events(args)
+        elif args.keys_command == "revoke":
+            cli.keys_revoke(args)
+        else:
+            print("Unknown keys subcommand", file=sys.stderr)
             sys.exit(1)
     elif args.command == "hull":
         from circus.services.hull_integrity import (

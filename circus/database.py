@@ -375,6 +375,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v8_migration(db_path)
     # Run v9 migration for Conflict count
     run_v9_migration(db_path)
+    # Run v10 migration for Key lifecycle
+    run_v10_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -703,6 +705,43 @@ def run_v9_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v9 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v10_migration(db_path: Optional[Path] = None) -> None:
+    """Run v10 migration: Key lifecycle (W9) — rotation, revocation, TOFU, discovery."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v10_key_lifecycle.sql"
+
+    if not migration_file.exists():
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if migration already applied (is_active column exists)
+        cursor.execute("PRAGMA table_info(owner_keys)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        if 'is_active' not in existing_columns:
+            # Run migration SQL
+            with open(migration_file, 'r') as f:
+                migration_sql = f.read()
+            cursor.executescript(migration_sql)
+            conn.commit()
+            logger.info("v10 migration: key lifecycle schema applied (owner_keys + key_events)")
+        else:
+            logger.debug("v10 migration: key lifecycle columns already exist, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v10 migration failed: %s", e)
         raise
     finally:
         conn.close()
