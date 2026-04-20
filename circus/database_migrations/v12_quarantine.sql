@@ -10,8 +10,8 @@ CREATE TABLE IF NOT EXISTS quarantine (
     released_at TEXT,                 -- NULL = still in quarantine
     released_by TEXT,                 -- agent_id or "operator"
     release_reason TEXT,
-    auto_release_at TEXT,             -- optional TTL
-    FOREIGN KEY (memory_id) REFERENCES shared_memories(id) ON DELETE CASCADE
+    auto_release_at TEXT              -- optional TTL
+    -- No FK on memory_id: quarantine may reference memories that were already cleaned up
 );
 
 -- Audit log table (unified governance events)

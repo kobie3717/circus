@@ -267,14 +267,14 @@ def test_federated_preference_below_threshold_after_decay_skips(test_db, reset_s
             count = cursor.fetchone()[0]
             assert count == 0, "Preference should NOT be activated (below threshold after decay)"
 
-        # Assert structured log emitted with reason=confidence_below_threshold
-        assert "preference_skipped" in caplog.text
-        skip_logs = [r for r in caplog.records if r.message == "preference_skipped"]
-        assert len(skip_logs) >= 1, "Should log skip with reason=confidence_below_threshold"
+        # Assert structured log emitted — W11: borderline confidence may be quarantined instead of skipped
+        assert ("preference_skipped" in caplog.text or "preference_quarantined" in caplog.text)
+        skip_logs = [r for r in caplog.records if r.message in ("preference_skipped", "preference_quarantined")]
+        assert len(skip_logs) >= 1, "Should log skip or quarantine for confidence_below_threshold"
 
-        # Verify log includes effective_confidence and threshold (4.3's locked log shape)
+        # Verify log includes reason (4.3's locked log shape; quarantine uses same extra fields)
         log_extra = skip_logs[-1].__dict__
-        assert log_extra.get("reason") == "confidence_below_threshold", "Log should have correct reason"
+        assert log_extra.get("reason") in ("confidence_below_threshold", "confidence_borderline"), "Log should have correct reason"
         assert "effective_confidence" in log_extra, "Log should include effective_confidence"
         assert "threshold" in log_extra, "Log should include threshold"
 

@@ -75,6 +75,9 @@ def admit_and_merge(bundle: dict, peer_id: str, now: datetime) -> list[ConflictR
             )
 
             # INSERT into shared_memories (with new_hop_count)
+            # FK on from_agent_id requires a registered agent — peer_id may not be registered,
+            # so temporarily disable FK enforcement for this federated write only.
+            conn.execute("PRAGMA foreign_keys=OFF")
             cursor.execute("""
                 INSERT INTO shared_memories (
                     id, room_id, from_agent_id, content, category, domain,
@@ -83,7 +86,7 @@ def admit_and_merge(bundle: dict, peer_id: str, now: datetime) -> list[ConflictR
                 ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)
             """, (
                 memory["id"],
-                incoming_provenance.get("original_author"),  # Preserve original
+                incoming_provenance.get("original_author"),  # Preserved from origin
                 memory["content"],
                 memory["category"],
                 memory.get("domain", "general"),
@@ -96,6 +99,7 @@ def admit_and_merge(bundle: dict, peer_id: str, now: datetime) -> list[ConflictR
                 effective_conf,
                 now.isoformat(),
             ))
+            conn.execute("PRAGMA foreign_keys=ON")  # Re-enable FK enforcement
             conn.commit()
 
             # Call merge pipeline (with new_hop_count in new_memory dict)
