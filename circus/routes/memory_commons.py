@@ -886,3 +886,42 @@ async def clear_preference(
             "owner_id": owner_id,
             "field_name": field_name
         }
+
+
+@router.get("/preferences/{owner_id}/conflicts")
+async def get_conflicts(
+    owner_id: str,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Get contested preferences for an owner (W7).
+
+    Returns preferences that have been contested (conflict_count > 0),
+    showing which preferences have had competing values published.
+
+    Requires ring token auth.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT field_name, value, effective_confidence, conflict_count, updated_at
+            FROM active_preferences
+            WHERE owner_id = ? AND conflict_count > 0
+            ORDER BY conflict_count DESC, updated_at DESC
+        """, (owner_id,))
+
+        conflicts = []
+        for row in cursor.fetchall():
+            conflicts.append({
+                "field": row[0],
+                "value": row[1],
+                "confidence": row[2],
+                "conflict_count": row[3],
+                "updated_at": row[4]
+            })
+
+        return {
+            "owner_id": owner_id,
+            "conflicts": conflicts,
+            "count": len(conflicts)
+        }

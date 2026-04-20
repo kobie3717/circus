@@ -198,7 +198,7 @@ def test_decision_trace_on_admit(client, reset_server_owner):
         # Check gates
         assert "gates" in trace
         gates = trace["gates"]
-        assert len(gates) == 4
+        assert len(gates) == 5  # W7: Added conflict_resolution gate
 
         # All gates should pass
         assert gates[0]["gate"] == "server_owner_configured"
@@ -211,9 +211,13 @@ def test_decision_trace_on_admit(client, reset_server_owner):
         assert gates[2]["gate"] == "owner_signature_valid"
         assert gates[2]["passed"] is True
 
-        assert gates[3]["gate"] == "confidence_threshold"
+        # W7: New conflict_resolution gate
+        assert gates[3]["gate"] == "conflict_resolution"
         assert gates[3]["passed"] is True
-        assert gates[3]["value"] >= 0.7  # Default threshold
+
+        assert gates[4]["gate"] == "confidence_threshold"
+        assert gates[4]["passed"] is True
+        assert gates[4]["value"] >= 0.7  # Default threshold
 
         # Check outcome
         assert trace["outcome"] == "activated"
@@ -282,6 +286,7 @@ def test_decision_trace_on_skip_wrong_owner(client, reset_server_owner):
         trace = data["decision_trace"]
 
         gates = trace["gates"]
+        # Gate 2 fails (wrong owner) — conflict_resolution (gate 3.5) never runs, so 4 gates total
         assert len(gates) == 4
 
         # Gate 1 passes
@@ -291,9 +296,10 @@ def test_decision_trace_on_skip_wrong_owner(client, reset_server_owner):
         assert gates[1]["gate"] == "same_owner_match"
         assert gates[1]["passed"] is False
 
-        # Gates 3 and 4 not evaluated
+        # Gates 3, 4, and 5 not evaluated (W7 added gate 3)
         assert gates[2]["passed"] is None
         assert gates[3]["passed"] is None
+        assert gates[4]["passed"] is None
 
         # Check outcome
         assert trace["outcome"] == "same_owner_failed"
@@ -362,7 +368,7 @@ def test_decision_trace_on_skip_bad_signature(client, reset_server_owner):
         trace = data["decision_trace"]
 
         gates = trace["gates"]
-        assert len(gates) == 4
+        assert len(gates) == 5  # W7: Added conflict_resolution gate
 
         # Gates 1 and 2 pass
         assert gates[0]["passed"] is True
@@ -372,8 +378,9 @@ def test_decision_trace_on_skip_bad_signature(client, reset_server_owner):
         assert gates[2]["gate"] == "owner_signature_valid"
         assert gates[2]["passed"] is False
 
-        # Gate 4 not evaluated
+        # Gates 4 and 5 not evaluated (W7 added gate 4)
         assert gates[3]["passed"] is None
+        assert gates[4]["passed"] is None
 
         # Check outcome is signature-related
         assert "signature" in trace["outcome"].lower() or "invalid" in trace["outcome"].lower()

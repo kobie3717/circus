@@ -22,6 +22,7 @@ from typing import Optional
 
 from circus.config import settings
 from circus.services.owner_verification import verify_owner_binding
+from circus.services.conflict_detection import detect_and_resolve_conflict
 
 logger = logging.getLogger(__name__)
 
@@ -206,11 +207,53 @@ def admit_preference(
                 "effective_confidence": effective_confidence,
             },
         )
+        gates.append({"gate": "conflict_resolution", "passed": None})
         gates.append({"gate": "confidence_threshold", "passed": None})
         return PreferenceDecision(
             admitted=False,
             gates=gates,
             reason=result.reason,
+            field=preference_field,
+            value=preference_value
+        )
+
+    # Gate 3.5 (W7): Conflict resolution
+    conflict = detect_and_resolve_conflict(
+        conn,
+        owner_id,
+        preference_field,
+        preference_value,
+        effective_confidence
+    )
+
+    gates.append({
+        "gate": "conflict_resolution",
+        "passed": conflict.resolution == "new_wins",
+        "resolution": conflict.resolution,
+        "existing_confidence": conflict.existing_confidence,
+        "new_confidence": effective_confidence,
+        "reason": conflict.reason
+    })
+
+    if conflict.resolution == "existing_wins":
+        logger.info(
+            "preference_skipped",
+            extra={
+                "reason": "conflict_existing_wins",
+                "memory_id": memory_id,
+                "owner_id": owner_id,
+                "field": preference_field,
+                "effective_confidence": effective_confidence,
+                "existing_confidence": conflict.existing_confidence,
+                "existing_value": conflict.existing_value,
+                "new_value": preference_value,
+            },
+        )
+        gates.append({"gate": "confidence_threshold", "passed": None})
+        return PreferenceDecision(
+            admitted=False,
+            gates=gates,
+            reason="conflict_existing_wins",
             field=preference_field,
             value=preference_value
         )
@@ -246,19 +289,38 @@ def admit_preference(
 
     # All gates passed — upsert to active_preferences
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO active_preferences (owner_id, field_name, value, source_memory_id, effective_confidence, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(owner_id, field_name)
-        DO UPDATE SET
-            value = excluded.value,
-            source_memory_id = excluded.source_memory_id,
-            effective_confidence = excluded.effective_confidence,
-            updated_at = excluded.updated_at
-        """,
-        (owner_id, preference_field, preference_value, memory_id, effective_confidence, now.isoformat()),
-    )
+
+    # W7: Increment conflict_count if this was a contested update (has_conflict + new_wins)
+    if conflict.has_conflict:
+        cursor.execute(
+            """
+            INSERT INTO active_preferences (owner_id, field_name, value, source_memory_id, effective_confidence, updated_at, conflict_count)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(owner_id, field_name)
+            DO UPDATE SET
+                value = excluded.value,
+                source_memory_id = excluded.source_memory_id,
+                effective_confidence = excluded.effective_confidence,
+                updated_at = excluded.updated_at,
+                conflict_count = conflict_count + 1
+            """,
+            (owner_id, preference_field, preference_value, memory_id, effective_confidence, now.isoformat()),
+        )
+    else:
+        # No conflict (first publish or idempotent update)
+        cursor.execute(
+            """
+            INSERT INTO active_preferences (owner_id, field_name, value, source_memory_id, effective_confidence, updated_at, conflict_count)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(owner_id, field_name)
+            DO UPDATE SET
+                value = excluded.value,
+                source_memory_id = excluded.source_memory_id,
+                effective_confidence = excluded.effective_confidence,
+                updated_at = excluded.updated_at
+            """,
+            (owner_id, preference_field, preference_value, memory_id, effective_confidence, now.isoformat()),
+        )
 
     return PreferenceDecision(
         admitted=True,

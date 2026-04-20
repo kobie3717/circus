@@ -373,6 +373,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v7_migration(db_path)
     # Run v8 migration for Owner keys
     run_v8_migration(db_path)
+    # Run v9 migration for Conflict count
+    run_v9_migration(db_path)
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
@@ -675,6 +677,37 @@ def run_v8_migration(db_path: Optional[Path] = None) -> None:
         conn.close()
 
 
+def run_v9_migration(db_path: Optional[Path] = None) -> None:
+    """Run v9 migration: Add conflict_count column to active_preferences (W7)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if conflict_count column already exists
+        cursor.execute("PRAGMA table_info(active_preferences)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        if 'conflict_count' not in columns:
+            # Add column (default 0)
+            cursor.execute("ALTER TABLE active_preferences ADD COLUMN conflict_count INTEGER DEFAULT 0")
+            conn.commit()
+            logger.info("v9 migration: added conflict_count column to active_preferences")
+        else:
+            logger.debug("v9 migration: conflict_count column already exists, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v9 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
 @contextmanager
 def get_db() -> Generator[sqlite3.Connection, None, None]:
     """Get database connection context manager.
@@ -704,6 +737,14 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
     """
     conn = sqlite3.connect(str(settings.database_path))
     conn.row_factory = sqlite3.Row
+    # Enforce referential integrity — 20+ FK constraints are defined in schema
+    # but SQLite ships with foreign_keys=OFF by default. Without this, deleting
+    # an agent leaves orphaned passports/trust_events/vouches/etc.
+    conn.execute("PRAGMA foreign_keys=ON")
+    # WAL mode allows concurrent reads during writes — required for federation
+    # PUSH throughput and SSE polling while memory commons writes land.
+    # Set once on first connection; subsequent calls are no-ops but cheap.
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         yield conn
     finally:
