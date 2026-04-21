@@ -1016,6 +1016,13 @@ async def search_shared_knowledge(
     # Clamp limit
     limit = max(1, min(limit, 10))
 
+    # Sanitize query for FTS5: multi-word queries become OR'd terms
+    # "whatsauction deploy" → "whatsauction OR deploy" so any term can match
+    import re as _re
+    words = _re.findall(r'\b\w{3,}\b', q.lower())
+    # Strip FTS5 special chars from original, then build OR query
+    fts_query = ' OR '.join(f'"{w}"' for w in words[:10]) if words else q
+
     with get_db() as conn:
         cursor = conn.cursor()
 
@@ -1039,7 +1046,7 @@ async def search_shared_knowledge(
                       AND (sm.status IS NULL OR sm.status = 'active')
                     ORDER BY rank
                     LIMIT ?
-                """, (q, f'%"owner_id": "{owner_id}"%', limit))
+                """, (fts_query, f'%"owner_id": "{owner_id}"%', limit))
             else:
                 cursor.execute("""
                     SELECT sm.id, sm.content, sm.category, sm.domain, sm.confidence,
@@ -1050,29 +1057,34 @@ async def search_shared_knowledge(
                       AND (sm.status IS NULL OR sm.status = 'active')
                     ORDER BY rank
                     LIMIT ?
-                """, (q, limit))
+                """, (fts_query, limit))
         else:
-            # Fallback: LIKE search
+            # Fallback: LIKE search — split multi-word queries into individual OR conditions
+            # "whatsauction deploy" → content LIKE '%whatsauction%' OR content LIKE '%deploy%'
+            like_words = words if words else [q]
+            like_clauses = ' OR '.join(['content LIKE ?' for _ in like_words])
+            like_params = [f'%{w}%' for w in like_words]
+
             if owner_id:
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT id, content, category, domain, confidence,
                            hop_count, from_agent_id, shared_at
                     FROM shared_memories
-                    WHERE content LIKE ? AND provenance LIKE ?
+                    WHERE ({like_clauses}) AND provenance LIKE ?
                       AND (status IS NULL OR status = 'active')
                     ORDER BY shared_at DESC
                     LIMIT ?
-                """, (f'%{q}%', f'%"owner_id": "{owner_id}"%', limit))
+                """, (*like_params, f'%"owner_id": "{owner_id}"%', limit))
             else:
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT id, content, category, domain, confidence,
                            hop_count, from_agent_id, shared_at
                     FROM shared_memories
-                    WHERE content LIKE ?
+                    WHERE ({like_clauses})
                       AND (status IS NULL OR status = 'active')
                     ORDER BY shared_at DESC
                     LIMIT ?
-                """, (f'%{q}%', limit))
+                """, (*like_params, limit))
 
         results = []
         for row in cursor.fetchall():
