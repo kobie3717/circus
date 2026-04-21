@@ -94,7 +94,7 @@ class ConflictResolution(BaseModel):
     authority_score_b: float
 
 
-def detect_conflict(
+async def detect_conflict(
     new_memory: dict,
     existing_memories: list[dict],
 ) -> Optional[ConflictInfo]:
@@ -114,13 +114,13 @@ def detect_conflict(
         return None
 
     # Embed new memory content
-    new_embedding = embed_text(new_memory["content"])
+    new_embedding = await embed_text(new_memory["content"])
     new_content_lower = new_memory["content"].lower()
     new_has_negation = _has_negation(new_content_lower)
 
     for existing in existing_memories:
         # Check semantic similarity first
-        existing_embedding = embed_text(existing["content"])
+        existing_embedding = await embed_text(existing["content"])
         similarity = _cosine_similarity(new_embedding, existing_embedding)
 
         if similarity < SIMILARITY_THRESHOLD:
@@ -174,7 +174,7 @@ def detect_conflict(
     return None
 
 
-def apply_belief_merge_pipeline(
+async def apply_belief_merge_pipeline(
     conn: sqlite3.Connection,
     new_memory: dict,  # Keys: id, from_agent_id, content, category, domain, confidence, shared_at
     agent_id: str,
@@ -223,7 +223,7 @@ def apply_belief_merge_pipeline(
             for row in cursor.fetchall()
         ]
 
-        conflict_info = detect_conflict(new_memory, existing_memories)
+        conflict_info = await detect_conflict(new_memory, existing_memories)
 
         if conflict_info:
             # Fetch full memory data for resolution

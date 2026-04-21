@@ -398,7 +398,7 @@ async def publish_memory(
         conn.commit()
 
         # Week 2: Conflict detection
-        conflict_result = apply_belief_merge_pipeline(
+        conflict_result = await apply_belief_merge_pipeline(
             conn,
             new_memory={
                 "id": memory_id,

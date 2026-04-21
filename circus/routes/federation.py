@@ -424,7 +424,7 @@ async def push_federation_bundle(
     conflicts = []
     if result.decision == "admitted":
         try:
-            conflicts = admit_and_merge(bundle, peer_id=bundle_peer_id, now=now)
+            conflicts = await admit_and_merge(bundle, peer_id=bundle_peer_id, now=now)
         except Exception as exc:
             logger.error("admit_and_merge raised: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")

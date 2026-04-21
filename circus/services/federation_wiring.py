@@ -24,7 +24,7 @@ from circus.services.provenance import decay_confidence
 logger = logging.getLogger(__name__)
 
 
-def admit_and_merge(bundle: dict, peer_id: str, now: datetime) -> list[ConflictResolution]:
+async def admit_and_merge(bundle: dict, peer_id: str, now: datetime) -> list[ConflictResolution]:
     """Process admitted federated bundle — write to shared_memories + call merge pipeline.
 
     PRE: Bundle has passed all admission verifications (signature, passport, trust, hop_count).
@@ -103,7 +103,7 @@ def admit_and_merge(bundle: dict, peer_id: str, now: datetime) -> list[ConflictR
             conn.commit()
 
             # Call merge pipeline (with new_hop_count in new_memory dict)
-            conflict = apply_belief_merge_pipeline(
+            conflict = await apply_belief_merge_pipeline(
                 conn,
                 new_memory={
                     "id": memory["id"],

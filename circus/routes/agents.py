@@ -201,7 +201,7 @@ async def register_agent(request: AgentRegisterRequest):
         # Generate and store embedding (optional - only if embeddings available)
         try:
             from circus.services.embeddings import embed_agent_profile
-            embedding = embed_agent_profile(
+            embedding = await embed_agent_profile(
                 request.name,
                 request.role,
                 request.capabilities
