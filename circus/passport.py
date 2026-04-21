@@ -33,8 +33,19 @@ def generate_passport(
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
+    # Detect schema: check if using 'status' column or 'active' column
+    cursor.execute("PRAGMA table_info(memories)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if 'status' in columns:
+        active_clause = "status = 'active'"
+    elif 'active' in columns:
+        active_clause = "active = 1"
+    else:
+        # Fallback: count all memories
+        active_clause = "1=1"
+
     # Extract basic memory stats
-    cursor.execute("SELECT COUNT(*) as count FROM memories WHERE status = 'active'")
+    cursor.execute(f"SELECT COUNT(*) as count FROM memories WHERE {active_clause}")
     memory_count = cursor.fetchone()['count']
 
     # Extract entities (if graph tables exist)
@@ -66,22 +77,32 @@ def generate_passport(
         # Graph tables don't exist
         pass
 
-    # Extract beliefs
+    # Extract beliefs (check if table exists first)
     belief_count = 0
     top_beliefs = []
     contradictions = 0
     avg_confidence = 0.5
 
     try:
-        cursor.execute("""
-            SELECT COUNT(*) FROM beliefs WHERE status = 'active'
+        # Detect belief schema
+        cursor.execute("PRAGMA table_info(beliefs)")
+        belief_columns = {row[1] for row in cursor.fetchall()}
+        if 'status' in belief_columns:
+            belief_active_clause = "status = 'active'"
+        elif 'active' in belief_columns:
+            belief_active_clause = "active = 1"
+        else:
+            belief_active_clause = "1=1"
+
+        cursor.execute(f"""
+            SELECT COUNT(*) FROM beliefs WHERE {belief_active_clause}
         """)
         belief_count = cursor.fetchone()[0]
 
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT statement, confidence
             FROM beliefs
-            WHERE status = 'active'
+            WHERE {belief_active_clause}
             ORDER BY confidence DESC
             LIMIT 5
         """)
@@ -91,9 +112,9 @@ def generate_passport(
         ]
 
         # Count contradictions
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT COUNT(*) FROM beliefs
-            WHERE status = 'active'
+            WHERE {belief_active_clause}
             AND id IN (
                 SELECT belief_id FROM belief_contradictions
             )
@@ -101,8 +122,8 @@ def generate_passport(
         contradictions = cursor.fetchone()[0]
 
         # Average confidence
-        cursor.execute("""
-            SELECT AVG(confidence) FROM beliefs WHERE status = 'active'
+        cursor.execute(f"""
+            SELECT AVG(confidence) FROM beliefs WHERE {belief_active_clause}
         """)
         avg_confidence = cursor.fetchone()[0] or 0.5
 
@@ -139,13 +160,13 @@ def generate_passport(
         pass
 
     # Extract memory quality metrics
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT
             AVG(priority) as avg_priority,
             AVG(access_count) as avg_access,
             COUNT(*) as total
         FROM memories
-        WHERE status = 'active'
+        WHERE {active_clause}
     """)
     row = cursor.fetchone()
     avg_priority = row['avg_priority'] or 5.0
@@ -154,20 +175,20 @@ def generate_passport(
     # Calculate proof count (citations) - check if column exists first
     avg_citations = 0.0
     try:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT AVG(json_array_length(citations)) as avg_citations
             FROM memories
-            WHERE status = 'active' AND citations IS NOT NULL
+            WHERE {active_clause} AND citations IS NOT NULL
         """)
         row = cursor.fetchone()
         avg_citations = row['avg_citations'] or 0.0
     except sqlite3.OperationalError:
         # citations column doesn't exist, check for citationsJson
         try:
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT COUNT(*) as count
                 FROM memories
-                WHERE status = 'active' AND citationsJson IS NOT NULL AND citationsJson != '[]'
+                WHERE {active_clause} AND citationsJson IS NOT NULL AND citationsJson != '[]'
             """)
             row = cursor.fetchone()
             # Estimate average based on presence
