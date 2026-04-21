@@ -14,8 +14,8 @@ def seed_owner_key_from_env(conn: sqlite3.Connection) -> None:
     import os
     import base64
 
-    owner_id = os.environ.get('CIRCUS_OWNER_ID', '')
-    key_path = os.environ.get('CIRCUS_OWNER_PRIVATE_KEY_PATH', '')
+    owner_id = settings.owner_id
+    key_path = settings.owner_private_key_path
 
     if not owner_id or not key_path:
         return

@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     # Minimum effective_confidence for preference activation. Configurable per deployment.
     preference_activation_threshold: float = 0.7
 
+    # Owner credentials for auto-seeding owner_keys table
+    owner_id: Optional[str] = None
+    owner_private_key_path: Optional[str] = None
+
     # CORS
     cors_origins: list[str] = [
         "http://localhost:3000",
