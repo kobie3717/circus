@@ -327,6 +327,7 @@ class ProvenanceInfo(BaseModel):
     reasoning: Optional[str] = Field(default=None)
     owner_id: Optional[str] = Field(default=None)  # Week 4: owner identifier for preference memories
     owner_binding: Optional[OwnerBinding] = Field(default=None)  # Week 5: cryptographic owner proof
+    supersedes_memory_id: Optional[str] = Field(default=None)  # For corrections: ID of stale memory being replaced
 
 
 class PreferenceField(BaseModel):

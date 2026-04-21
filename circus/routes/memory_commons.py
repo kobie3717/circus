@@ -397,6 +397,19 @@ async def publish_memory(
         ))
         conn.commit()
 
+        # Corrections: mark superseded memory as inactive
+        if (mem_req.category == 'correction'
+                and mem_req.provenance
+                and mem_req.provenance.supersedes_memory_id):
+            try:
+                cursor.execute(
+                    "UPDATE shared_memories SET status = 'superseded' WHERE id = ?",
+                    (mem_req.provenance.supersedes_memory_id,)
+                )
+                conn.commit()
+            except Exception:
+                pass  # Non-fatal — correction still stored even if superseding fails
+
         # Week 2: Conflict detection
         conflict_result = await apply_belief_merge_pipeline(
             conn,
@@ -1023,6 +1036,7 @@ async def search_shared_knowledge(
                     FROM fts_shared_memories fts
                     JOIN shared_memories sm ON fts.rowid = sm.rowid
                     WHERE fts.content MATCH ? AND sm.provenance LIKE ?
+                      AND (sm.status IS NULL OR sm.status = 'active')
                     ORDER BY rank
                     LIMIT ?
                 """, (q, f'%"owner_id": "{owner_id}"%', limit))
@@ -1033,6 +1047,7 @@ async def search_shared_knowledge(
                     FROM fts_shared_memories fts
                     JOIN shared_memories sm ON fts.rowid = sm.rowid
                     WHERE fts.content MATCH ?
+                      AND (sm.status IS NULL OR sm.status = 'active')
                     ORDER BY rank
                     LIMIT ?
                 """, (q, limit))
@@ -1044,6 +1059,7 @@ async def search_shared_knowledge(
                            hop_count, from_agent_id, shared_at
                     FROM shared_memories
                     WHERE content LIKE ? AND provenance LIKE ?
+                      AND (status IS NULL OR status = 'active')
                     ORDER BY shared_at DESC
                     LIMIT ?
                 """, (f'%{q}%', f'%"owner_id": "{owner_id}"%', limit))
@@ -1053,6 +1069,7 @@ async def search_shared_knowledge(
                            hop_count, from_agent_id, shared_at
                     FROM shared_memories
                     WHERE content LIKE ?
+                      AND (status IS NULL OR status = 'active')
                     ORDER BY shared_at DESC
                     LIMIT ?
                 """, (f'%{q}%', limit))

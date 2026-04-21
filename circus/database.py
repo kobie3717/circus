@@ -459,7 +459,8 @@ def run_v2_migration(db_path: Optional[Path] = None) -> None:
         'confidence': "ALTER TABLE shared_memories ADD COLUMN confidence REAL DEFAULT 1.0",
         'age_days': "ALTER TABLE shared_memories ADD COLUMN age_days INTEGER DEFAULT 0",
         'derived_from': "ALTER TABLE shared_memories ADD COLUMN derived_from TEXT",
-        'effective_confidence': "ALTER TABLE shared_memories ADD COLUMN effective_confidence REAL"
+        'effective_confidence': "ALTER TABLE shared_memories ADD COLUMN effective_confidence REAL",
+        'status': "ALTER TABLE shared_memories ADD COLUMN status TEXT DEFAULT 'active'"
     }
 
     for col_name, alter_sql in columns_to_add.items():
@@ -468,6 +469,7 @@ def run_v2_migration(db_path: Optional[Path] = None) -> None:
 
     # Create index on privacy_tier if it doesn't exist
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_privacy_tier ON shared_memories(privacy_tier)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_shared_memories_status ON shared_memories(status)")
 
     # Add columns to federation_peers if they don't exist
     cursor.execute("PRAGMA table_info(federation_peers)")
