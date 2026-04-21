@@ -10,7 +10,7 @@ from typing import AsyncIterator, Optional
 # server 8-byte and client 16-byte token lengths).
 _MEMORY_ID_PATTERN = re.compile(r'^shmem-[0-9a-f]{16,64}$')
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -1100,3 +1100,74 @@ async def search_shared_knowledge(
             "query": q,
             "count": len(results)
         }
+
+
+@router.post("/auto-resolve-conflicts")
+async def auto_resolve_conflicts(
+    limit: int = 100,
+):
+    """
+    Batch-resolve unresolved belief conflicts using recency as tiebreaker.
+    For refinement and update types: newer memory wins.
+    Safe to call repeatedly — idempotent.
+    """
+    resolved_count = 0
+    skipped_count = 0
+    errors = []
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT bc.id, bc.memory_id_a, bc.memory_id_b, bc.conflict_type,
+                   a.shared_at as shared_at_a, a.status as status_a,
+                   b.shared_at as shared_at_b, b.status as status_b
+            FROM belief_conflicts bc
+            JOIN shared_memories a ON bc.memory_id_a = a.id
+            JOIN shared_memories b ON bc.memory_id_b = b.id
+            WHERE bc.resolution IS NULL
+              AND bc.conflict_type IN ('refinement', 'update')
+            LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+
+        for row in rows:
+            conflict_id, mem_a_id, mem_b_id, conflict_type, shared_at_a, status_a, shared_at_b, status_b = row
+
+            # Skip if either memory already superseded — just clean up the conflict record
+            if status_a == 'superseded' or status_b == 'superseded':
+                cursor.execute("""
+                    UPDATE belief_conflicts
+                    SET resolution = 'auto_skipped', resolved_at = datetime('now'), resolved_by_agent_id = 'system'
+                    WHERE id = ?
+                """, (conflict_id,))
+                conn.commit()
+                skipped_count += 1
+                continue
+
+            # Newer memory wins
+            winner_id = mem_b_id if (shared_at_b or '') >= (shared_at_a or '') else mem_a_id
+            loser_id  = mem_a_id if winner_id == mem_b_id else mem_b_id
+
+            try:
+                cursor.execute(
+                    "UPDATE shared_memories SET status = 'superseded' WHERE id = ?",
+                    (loser_id,)
+                )
+                cursor.execute("""
+                    UPDATE belief_conflicts
+                    SET resolution = 'recency_wins', resolved_at = datetime('now'), resolved_by_agent_id = 'system'
+                    WHERE id = ?
+                """, (conflict_id,))
+                conn.commit()
+                resolved_count += 1
+            except Exception as e:
+                errors.append(str(e))
+                conn.rollback()
+
+    return {
+        "resolved": resolved_count,
+        "skipped": skipped_count,
+        "errors": errors,
+        "message": f"Auto-resolved {resolved_count} conflicts ({skipped_count} skipped as already superseded)"
+    }
