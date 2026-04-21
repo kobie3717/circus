@@ -9,6 +9,48 @@ from typing import Generator, Optional
 from circus.config import settings
 
 
+def seed_owner_key_from_env(conn: sqlite3.Connection) -> None:
+    """Auto-seed owner public key on startup if owner_keys table is empty for this owner."""
+    import os
+    import base64
+
+    owner_id = os.environ.get('CIRCUS_OWNER_ID', '')
+    key_path = os.environ.get('CIRCUS_OWNER_PRIVATE_KEY_PATH', '')
+
+    if not owner_id or not key_path:
+        return
+    if not os.path.exists(key_path):
+        return
+
+    # Check if already seeded
+    cursor = conn.cursor()
+    row = cursor.execute(
+        "SELECT COUNT(*) FROM owner_keys WHERE owner_id=?", (owner_id,)
+    ).fetchone()
+    if row[0] > 0:
+        return
+
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+
+        priv_bytes = base64.b64decode(open(key_path).read().strip())
+        pk = Ed25519PrivateKey.from_private_bytes(priv_bytes)
+        pub = pk.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+        pub_b64 = base64.b64encode(pub).decode()
+        cursor.execute(
+            "INSERT OR IGNORE INTO owner_keys (owner_id, public_key, created_at) VALUES (?,?,?)",
+            (owner_id, pub_b64, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        print(f"[DB] Auto-seeded owner_key for {owner_id}")
+    except Exception as e:
+        print(f"[DB] Could not auto-seed owner key: {e}")
+
+
 def init_database(db_path: Optional[Path] = None) -> None:
     """Initialize database schema."""
     db_path = db_path or settings.database_path
@@ -381,6 +423,11 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v11_migration(db_path)
     # Run v12 migration for Quarantine and governance audit
     run_v12_migration(db_path)
+
+    # Auto-seed owner key if configured
+    conn = sqlite3.connect(str(db_path))
+    seed_owner_key_from_env(conn)
+    conn.close()
 
 
 def run_v2_migration(db_path: Optional[Path] = None) -> None:
