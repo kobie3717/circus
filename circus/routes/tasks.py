@@ -1,6 +1,7 @@
 """A2A task lifecycle routes."""
 
 import json
+import jsonschema
 import secrets
 from datetime import datetime
 from typing import Optional
@@ -53,12 +54,13 @@ async def submit_task(
         cursor.execute("""
             INSERT INTO tasks (
                 id, from_agent_id, to_agent_id, task_type, payload,
-                state, created_at, updated_at, deadline
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                state, created_at, updated_at, deadline, output_schema
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             task_id, agent_id, request.to_agent_id,
             request.task_type, json.dumps(request.payload),
-            TaskState.SUBMITTED.value, now, now, request.deadline
+            TaskState.SUBMITTED.value, now, now, request.deadline,
+            json.dumps(request.output_schema) if request.output_schema else None
         ))
 
         # Log state transition
@@ -79,7 +81,8 @@ async def submit_task(
         state=TaskState.SUBMITTED,
         created_at=now,
         updated_at=now,
-        deadline=request.deadline
+        deadline=request.deadline,
+        output_schema=request.output_schema
     )
 
 
@@ -116,6 +119,21 @@ async def update_task_state(
                 status_code=400,
                 detail=f"Invalid transition: {current_state} -> {new_state}"
             )
+
+        # Validate output_schema if transitioning to COMPLETED with result
+        if new_state == TaskState.COMPLETED and request.result is not None:
+            if task["output_schema"]:
+                try:
+                    stored_schema = json.loads(task["output_schema"])
+                    jsonschema.validate(instance=request.result, schema=stored_schema)
+                except jsonschema.ValidationError as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"result does not match output_schema: {e.message}"
+                    )
+                except json.JSONDecodeError:
+                    # Schema stored but not valid JSON - log but allow completion
+                    pass
 
         # Update task
         now = datetime.utcnow().isoformat()
@@ -155,7 +173,8 @@ async def update_task_state(
         error=updated_task["error"],
         created_at=updated_task["created_at"],
         updated_at=updated_task["updated_at"],
-        deadline=updated_task["deadline"]
+        deadline=updated_task["deadline"],
+        output_schema=json.loads(updated_task["output_schema"]) if updated_task["output_schema"] else None
     )
 
 
@@ -197,7 +216,8 @@ async def get_inbox(
                 error=row["error"],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
-                deadline=row["deadline"]
+                deadline=row["deadline"],
+                output_schema=json.loads(row["output_schema"]) if row["output_schema"] else None
             ))
 
         return tasks
@@ -241,7 +261,8 @@ async def get_outbox(
                 error=row["error"],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
-                deadline=row["deadline"]
+                deadline=row["deadline"],
+                output_schema=json.loads(row["output_schema"]) if row["output_schema"] else None
             ))
 
         return tasks
@@ -276,7 +297,8 @@ async def get_task(
             error=task["error"],
             created_at=task["created_at"],
             updated_at=task["updated_at"],
-            deadline=task["deadline"]
+            deadline=task["deadline"],
+            output_schema=json.loads(task["output_schema"]) if task["output_schema"] else None
         )
 
 

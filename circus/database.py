@@ -423,6 +423,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v11_migration(db_path)
     # Run v12 migration for Quarantine and governance audit
     run_v12_migration(db_path)
+    # Run v13 migration for task output schemas
+    run_v13_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -890,6 +892,37 @@ def run_v12_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v12 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v13_migration(db_path: Optional[Path] = None) -> None:
+    """Run v13 migration: Add output_schema column for agentdo-style task schema validation."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if output_schema column already exists
+        cursor.execute("PRAGMA table_info(tasks)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        if 'output_schema' not in existing_columns:
+            # Add column (nullable, JSON string)
+            cursor.execute("ALTER TABLE tasks ADD COLUMN output_schema TEXT")
+            conn.commit()
+            logger.info("v13 migration: added output_schema column to tasks table")
+        else:
+            logger.debug("v13 migration: output_schema column already exists, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v13 migration failed: %s", e)
         raise
     finally:
         conn.close()

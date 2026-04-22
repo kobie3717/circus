@@ -1,0 +1,3 @@
+-- v13: add output_schema column to tasks table for agentdo-style schema validation
+-- SQLite doesn't support IF NOT EXISTS on ALTER COLUMN, so the Python runner uses PRAGMA table_info guard.
+-- This migration adds JSON Schema validation for task results at completion time.

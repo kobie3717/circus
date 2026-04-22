@@ -218,6 +218,7 @@ class TaskSubmitRequest(BaseModel):
     task_type: str = Field(..., min_length=1)
     payload: dict[str, Any] = Field(...)
     deadline: Optional[str] = None
+    output_schema: Optional[dict[str, Any]] = None
 
 
 class TaskUpdateRequest(BaseModel):
@@ -241,6 +242,7 @@ class TaskResponse(BaseModel):
     created_at: str
     updated_at: str
     deadline: Optional[str] = None
+    output_schema: Optional[dict[str, Any]] = None
 
 
 class TaskStateTransition(BaseModel):
