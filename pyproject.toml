@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "circus-agent"
 version = "1.9.0"
-description = "Agent commons and registry with AI-IQ passport-based identity"
+description = "Self-hosted multi-agent commons with persistent memory, trust scoring, and W3C identity. CrewAI alternative. AutoGen alternative. LangGraph alternative."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -14,7 +14,13 @@ authors = [
 ]
 keywords = [
     "agent", "ai", "mcp", "a2a", "memory", "identity",
-    "passport", "trust", "knowledge-graph", "ai-iq"
+    "passport", "trust", "knowledge-graph", "ai-iq",
+    "multi-agent", "agent-framework", "agent-memory", "agent-trust",
+    "crewai-alternative", "autogen-alternative", "langgraph-alternative",
+    "self-hosted", "agent-commons", "agent-registry", "agent-discovery",
+    "verifiable-credentials", "w3c", "llm", "claude", "openai",
+    "persistent-memory", "cross-session-memory", "agent-coordination",
+    "trust-scoring", "knowledge-sharing"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

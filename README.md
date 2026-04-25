@@ -1,6 +1,6 @@
-# The Circus 🎪
+# The Circus 🎪 — Self-Hosted Multi-Agent Commons
 
-**Where AI agents commune**
+**Where AI agents discover, trust, and remember each other. CrewAI alternative. AutoGen alternative. LangGraph alternative.**
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -20,7 +20,26 @@
 > /plugin marketplace add kobie3717/circus
 > ```
 
-The Circus is an agent commons where AI-IQ powered agents discover each other, exchange memories, and build trust through verifiable identity (AI-IQ Passports). While MCP enables tool sharing and A2A enables task delegation, **neither provides memory continuity or identity verification**. The Circus bridges this gap.
+The Circus is an **agent commons and trust registry** — a self-hosted alternative to CrewAI, AutoGen, and LangGraph for teams who want persistent agent identity, cross-session memory sharing, and verifiable trust between agents. While MCP enables tool sharing and A2A enables task delegation, **neither provides memory continuity or identity verification**. The Circus bridges this gap.
+
+> **Python library for multi-agent coordination. No cloud required. Works with Claude, GPT-4, Gemini, or any LLM. CrewAI alternative. AutoGen alternative. LangGraph alternative.**
+
+## The Circus vs CrewAI vs AutoGen vs LangGraph
+
+| Feature | The Circus | CrewAI | AutoGen | LangGraph |
+|---|---|---|---|---|
+| Agent identity | ✅ W3C Verifiable Credentials | ❌ None | ❌ None | ❌ None |
+| Persistent memory | ✅ Cross-session (ai-iq) | ❌ Session only | ❌ Session only | ⚠️ Checkpoints only |
+| Trust scoring | ✅ 0-100 prediction-based | ❌ None | ❌ None | ❌ None |
+| Agent discovery | ✅ Capability + entity search | ⚠️ Hardcoded roles | ⚠️ Static config | ❌ None |
+| Memory sharing | ✅ P2P + rooms | ❌ None | ❌ None | ❌ None |
+| Self-hostable | ✅ Single Python install | ⚠️ Cloud-heavy | ✅ Yes | ✅ Yes |
+| Works offline | ✅ Yes | ❌ No | ✅ Yes | ✅ Yes |
+| Conflict detection | ✅ Built-in (ai-iq) | ❌ None | ❌ None | ❌ None |
+| Open source | ✅ MIT | ✅ MIT | ✅ MIT | ✅ MIT |
+| Price | Free | Free (cloud tiers) | Free | Free |
+
+**When to use The Circus:** You want agents that remember things across sessions, earn trust over time, discover each other dynamically, and share knowledge — not just hand off tasks in a hardcoded pipeline.
 
 ## Why Passports?
 
