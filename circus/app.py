@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from circus.config import settings
 from circus.database import init_database, seed_default_rooms, get_db
 from circus.models import HealthResponse
-from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance
+from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing
 from circus.trust import apply_trust_decay, get_trust_tier
 from circus.middleware.rate_limiter import check_rate_limit
 from circus.middleware.telemetry import setup_tracing, get_current_trace_id
@@ -213,6 +213,7 @@ app.include_router(federation.router, prefix="/api/v1/federation", tags=["Federa
 app.include_router(memory_commons.router)  # Memory Commons (includes own prefix)
 app.include_router(key_lifecycle.router)  # Key Lifecycle (W9, includes own prefix)
 app.include_router(governance.router)  # Governance (W11, includes own prefix)
+app.include_router(routing.router, prefix="/api/v1", tags=["Routing"])  # Bandit routing
 
 
 @app.get("/.well-known/agent.json", tags=["A2A"])

@@ -425,6 +425,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v12_migration(db_path)
     # Run v13 migration for task output schemas
     run_v13_migration(db_path)
+    # Run v14 migration for bandit routing
+    run_v14_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -923,6 +925,44 @@ def run_v13_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v13 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v14_migration(db_path: Optional[Path] = None) -> None:
+    """Run v14 migration: LinUCB bandit routing tables."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v14_bandit_routing.sql"
+
+    if not migration_file.exists():
+        raise FileNotFoundError(f"Migration file not found: {migration_file}")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if routing_arms table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='routing_arms'")
+        if cursor.fetchone():
+            logger.debug("v14 migration: routing tables already exist, skipping")
+            return
+
+        # Read and execute migration SQL
+        with open(migration_file, "r") as f:
+            sql_script = f.read()
+
+        # Execute all statements
+        cursor.executescript(sql_script)
+        conn.commit()
+        logger.info("v14 migration: created routing tables (routing_arms, routing_decisions, routing_feature_stats)")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v14 migration failed: %s", e)
         raise
     finally:
         conn.close()

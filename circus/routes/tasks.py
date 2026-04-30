@@ -156,6 +156,35 @@ async def update_task_state(
             ) VALUES (?, ?, ?, ?, ?)
         """, (task_id, current_state.value, new_state.value, request.notes, now))
 
+        # Auto-update routing reward if task reached terminal state
+        from circus.services.routing import update_reward, is_terminal_state, compute_default_reward
+        if is_terminal_state(new_state.value):
+            try:
+                # Determine if output_schema was validated
+                schema_valid = None
+                if new_state == TaskState.COMPLETED and task["output_schema"] and request.result:
+                    try:
+                        stored_schema = json.loads(task["output_schema"])
+                        jsonschema.validate(instance=request.result, schema=stored_schema)
+                        schema_valid = True
+                    except (jsonschema.ValidationError, json.JSONDecodeError):
+                        schema_valid = False
+                elif new_state == TaskState.COMPLETED and not task["output_schema"]:
+                    schema_valid = None  # no schema to validate
+
+                reward, reason = compute_default_reward(
+                    task_state=new_state.value,
+                    output_schema_valid=schema_valid,
+                    deadline=task["deadline"],
+                    completed_at=now
+                )
+                update_reward(task_id, reward, reason, conn)
+            except Exception as e:
+                # Never fail task update because of routing bookkeeping
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Failed to update routing reward for task {task_id}: {e}")
+
         conn.commit()
 
         # Fetch updated task

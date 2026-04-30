@@ -1,0 +1,34 @@
+{
+  "random": {
+    "name": "random",
+    "n": 1000,
+    "cum_regret": 325.9818825766776,
+    "avg_regret": 0.3259818825766776,
+    "avg_reward": 0.5149161753117405,
+    "final_100_avg_regret": 3.259818825766776
+  },
+  "round_robin": {
+    "name": "round_robin",
+    "n": 1000,
+    "cum_regret": 322.5718378322589,
+    "avg_regret": 0.3225718378322589,
+    "avg_reward": 0.5175059532804087,
+    "final_100_avg_regret": 3.225718378322589
+  },
+  "semantic": {
+    "name": "semantic",
+    "n": 1000,
+    "cum_regret": 164.04954888907452,
+    "avg_regret": 0.16404954888907453,
+    "avg_reward": 0.6818739510622999,
+    "final_100_avg_regret": 1.6404954888907453
+  },
+  "linucb": {
+    "name": "linucb",
+    "n": 1000,
+    "cum_regret": 88.36276792478732,
+    "avg_regret": 0.08836276792478732,
+    "avg_reward": 0.7649540291277812,
+    "final_100_avg_regret": 0.8836276792478732
+  }
+}
