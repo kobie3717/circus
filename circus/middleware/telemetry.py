@@ -4,56 +4,46 @@ import os
 from typing import Optional
 
 from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 from circus.config import settings
 
 
 def setup_tracing(app):
-    """Configure OpenTelemetry tracing."""
-    # Create tracer provider
+    """Configure OpenTelemetry tracing.
+
+    No-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set.
+    OTLP/gRPC and FastAPI instrumentation imports are lazy to avoid
+    loading heavy gRPC libs (~700MB) on every startup.
+    """
+    otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+    if not otlp_endpoint and not settings.debug:
+        # No tracing configured — return bare provider (no-op)
+        return TracerProvider()
+
+    # Heavy imports only when actually needed
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
     resource = Resource(attributes={
         SERVICE_NAME: "circus-api",
         "service.version": settings.app_version,
     })
-
     provider = TracerProvider(resource=resource)
 
-    # Add span processors
-    if settings.debug:
-        # Console exporter for development
-        provider.add_span_processor(
-            BatchSpanProcessor(ConsoleSpanExporter())
-        )
+    if settings.debug or not otlp_endpoint:
+        provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
     else:
-        # OTLP exporter for production (Jaeger, Tempo, etc.)
-        # Requires OTEL_EXPORTER_OTLP_ENDPOINT env var
-        otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-        if otlp_endpoint:
-            try:
-                provider.add_span_processor(
-                    BatchSpanProcessor(OTLPSpanExporter())
-                )
-            except Exception:
-                # Fallback to console if OTLP fails
-                provider.add_span_processor(
-                    BatchSpanProcessor(ConsoleSpanExporter())
-                )
-        else:
-            # No OTLP endpoint configured, use console
-            provider.add_span_processor(
-                BatchSpanProcessor(ConsoleSpanExporter())
-            )
+        try:
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+            provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        except Exception:
+            provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
 
     trace.set_tracer_provider(provider)
-
-    # Instrument FastAPI
     FastAPIInstrumentor.instrument_app(app)
-
     return provider
 
 

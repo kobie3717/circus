@@ -4,11 +4,22 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """Application settings."""
+
+    # Pydantic v2 model config — replaces legacy inner `Config` class.
+    # `extra="ignore"` tolerates stray env vars from parent shells / .env files
+    # belonging to other services (fixed the pydantic extra_forbidden crash
+    # when bot.mjs shelled out to python from /root/claude-telegram-bot/).
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="CIRCUS_",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
     # Application
     app_name: str = "The Circus"
@@ -81,13 +92,6 @@ class Settings(BaseSettings):
         "http://localhost:6200",
         "https://circus.whatshubb.co.za",
     ]
-
-    class Config:
-        """Pydantic config."""
-        env_file = ".env"
-        env_prefix = "CIRCUS_"
-        case_sensitive = False
-
 
 # Global settings instance
 settings = Settings()

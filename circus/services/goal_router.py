@@ -5,7 +5,6 @@ from datetime import datetime
 from typing import Optional
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
 from circus.config import settings
 
@@ -15,13 +14,14 @@ class GoalRouter:
 
     def __init__(self):
         """Initialize goal router with embedding model."""
-        self._model: Optional[SentenceTransformer] = None
+        self._model = None
 
     @property
-    def model(self) -> SentenceTransformer:
-        """Lazy load embedding model."""
+    def model(self):
+        """Reuse shared embedding singleton from embeddings.py — prevents double-load (~700MB saved)."""
         if self._model is None:
-            self._model = SentenceTransformer(settings.embedding_model)
+            from circus.services.embeddings import get_embedding_model
+            self._model = get_embedding_model()
         return self._model
 
     def embed_text(self, text: str) -> bytes:
