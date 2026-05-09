@@ -144,6 +144,43 @@ def init_database(db_path: Optional[Path] = None) -> None:
         )
     """)
 
+    # FTS5 virtual table for full-text search on shared memories
+    cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts_shared_memories
+        USING fts5(content, content='shared_memories', content_rowid='rowid')
+    """)
+
+    # Populate FTS from existing rows (idempotent - fts5 deduplicates on rebuild)
+    cursor.execute("""
+        INSERT OR IGNORE INTO fts_shared_memories(rowid, content)
+        SELECT rowid, content FROM shared_memories
+    """)
+
+    # Triggers to keep FTS in sync
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS shared_memories_ai
+        AFTER INSERT ON shared_memories BEGIN
+            INSERT INTO fts_shared_memories(rowid, content) VALUES (new.rowid, new.content);
+        END
+    """)
+
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS shared_memories_ad
+        AFTER DELETE ON shared_memories BEGIN
+            INSERT INTO fts_shared_memories(fts_shared_memories, rowid, content)
+            VALUES ('delete', old.rowid, old.content);
+        END
+    """)
+
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS shared_memories_au
+        AFTER UPDATE ON shared_memories BEGIN
+            INSERT INTO fts_shared_memories(fts_shared_memories, rowid, content)
+            VALUES ('delete', old.rowid, old.content);
+            INSERT INTO fts_shared_memories(rowid, content) VALUES (new.rowid, new.content);
+        END
+    """)
+
     # Trust events table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS trust_events (
