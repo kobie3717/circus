@@ -142,6 +142,25 @@ async def release_quarantine(
 
                 # Force-activate with confidence=1.0 (operator override)
                 from datetime import datetime
+                now_dt = datetime.utcnow()
+
+                # Audit the force-activation before executing it
+                quar_service.write_audit_event(
+                    conn,
+                    event_type="preference_force_activated",
+                    actor=agent_id,
+                    owner_id=owner_id,
+                    detail=json.dumps({
+                        "quarantine_id": quarantine_id,
+                        "memory_id": memory_id,
+                        "preference_field": preference_field,
+                        "forced_confidence": 1.0,
+                        "quarantine_reason": quar_reason,
+                        "release_reason": request.reason,
+                        "authorized_by": agent_id,
+                    }),
+                )
+
                 decision = admit_preference(
                     conn,
                     memory_id=memory_id,
@@ -149,7 +168,7 @@ async def release_quarantine(
                     preference_field=preference_field,
                     preference_value=preference_value,
                     effective_confidence=1.0,  # Operator override
-                    now=datetime.utcnow(),
+                    now=now_dt,
                     agent_id=from_agent_id,
                     shared_at=shared_at,
                     owner_binding=owner_binding,

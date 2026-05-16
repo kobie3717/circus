@@ -402,7 +402,7 @@ async def push_federation_bundle(
     except AuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc))
 
-    # 6. Rate limit
+    # 6. Rate limit (per-peer, per-minute)
     try:
         _enforce_rate_limit(bundle_peer_id)
     except RateLimitExceeded as exc:
@@ -411,6 +411,35 @@ async def push_federation_bundle(
             detail=str(exc),
             headers={"Retry-After": "60"}
         )
+
+    # 6b. Per-peer hourly admission cap (500 bundles/peer/hour)
+    hour_bucket = int(time.time() / 3600)
+    hour_key = f"hour:{bundle_peer_id}"
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT request_count FROM federation_rate_limits
+            WHERE peer_id = ? AND window_start = ?
+        """, (hour_key, hour_bucket))
+        row = cursor.fetchone()
+        if row and row["request_count"] >= 500:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Hourly bundle admission cap exceeded for peer {bundle_peer_id}",
+                headers={"Retry-After": "3600"}
+            )
+        cursor.execute("""
+            INSERT INTO federation_rate_limits (peer_id, window_start, request_count)
+            VALUES (?, ?, 1)
+            ON CONFLICT (peer_id, window_start)
+            DO UPDATE SET request_count = request_count + 1
+        """, (hour_key, hour_bucket))
+        # Cleanup old hour buckets
+        cursor.execute("""
+            DELETE FROM federation_rate_limits
+            WHERE peer_id = ? AND window_start < ? AND window_start != ?
+        """, (hour_key, hour_bucket - 48, hour_bucket))
+        conn.commit()
 
     # 7. Admission
     now = datetime.utcnow()
