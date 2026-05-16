@@ -78,6 +78,25 @@ async def trust_decay_task():
             print(f"Error in trust decay task: {e}")
 
 
+async def liveness_monitor_task():
+    """Mark agents inactive when no heartbeat for 15 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Check every 5 minutes
+            cutoff = (datetime.utcnow() - timedelta(minutes=15)).isoformat()
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE agents SET is_active = 0 WHERE is_active = 1 AND last_seen < ? AND trust_tier != 'Elder'",
+                    (cutoff,)
+                )
+                if cursor.rowcount:
+                    print(f"[Liveness] Marked {cursor.rowcount} agent(s) inactive (no heartbeat >15min)")
+                conn.commit()
+        except Exception as e:
+            print(f"[Liveness] Monitor error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -93,6 +112,7 @@ async def lifespan(app: FastAPI):
 
     # Start background tasks
     trust_task = asyncio.create_task(trust_decay_task())
+    liveness_task = asyncio.create_task(liveness_monitor_task())
 
     # Start federation worker (W10)
     from circus.services.federation_worker import run_federation_worker
@@ -102,15 +122,13 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     trust_task.cancel()
+    liveness_task.cancel()
     federation_task.cancel()
-    try:
-        await trust_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await federation_task
-    except asyncio.CancelledError:
-        pass
+    for task in [trust_task, liveness_task, federation_task]:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(

@@ -1,5 +1,6 @@
 """Agent registration and discovery routes."""
 
+import hashlib
 import json
 import secrets
 from datetime import datetime, timedelta
@@ -104,122 +105,141 @@ async def register_agent(request: AgentRegisterRequest):
             detail="Invalid passport: identity.name is required"
         )
 
-    # Generate agent ID
-    agent_id = f"{request.name.lower().replace(' ', '-')}-{secrets.token_hex(3)}"
+    # Generate stable agent ID deterministically from name + home instance
+    name_slug = request.name.lower().replace(' ', '-')
+    stable_suffix = hashlib.sha256(f"{name_slug}:{request.home}".encode()).hexdigest()[:6]
+    agent_id = f"{name_slug}-{stable_suffix}"
 
     # Compute passport hash
     passport_hash = calculate_passport_hash(request.passport)
-
-    # Generate ring token
-    ring_token_value = secrets.token_urlsafe(32)
-    token_hash = bcrypt.hash(ring_token_value)
 
     # Calculate initial trust score
     now = datetime.utcnow().isoformat()
     trust_score = calculate_trust_score(request.passport, now)
     trust_tier = get_trust_tier(trust_score)
 
-    # Generate Ed25519 keypair for signing
-    private_key_bytes, public_key_bytes = generate_keypair()
+    # Passport metrics
+    predictions = request.passport.get("predictions", {})
+    confirmed = predictions.get("confirmed", 0)
+    refuted = predictions.get("refuted", 0)
+    total_predictions = confirmed + refuted
+    prediction_accuracy = confirmed / total_predictions if total_predictions > 0 else 0.5
 
-    # Sign agent card
-    card_data = {
-        "agent_id": agent_id,
-        "name": request.name,
-        "role": request.role,
-        "capabilities": request.capabilities,
-        "registered_at": now
-    }
-    signed_card = sign_agent_card(card_data, private_key_bytes)
+    beliefs = request.passport.get("beliefs", {})
+    total_beliefs = beliefs.get("total", 1)
+    contradictions = beliefs.get("contradictions", 0)
+    belief_stability = 1.0 - (contradictions / total_beliefs) if total_beliefs > 0 else 1.0
 
-    # Store in database
+    memory_stats = request.passport.get("memory_stats", {})
+    memory_quality = memory_stats.get("proof_count_avg", 0.0)
+
+    score_data = request.passport.get("score", {})
+    if isinstance(score_data, dict):
+        passport_score = score_data.get("total", 0.0)
+    else:
+        passport_score = score_data if isinstance(score_data, (int, float)) else 0.0
+
     expires_at = datetime.utcnow() + timedelta(days=settings.access_token_expire_days)
 
     with get_db() as conn:
         cursor = conn.cursor()
 
-        # Check if agent with same name exists
-        cursor.execute("SELECT id FROM agents WHERE name = ?", (request.name,))
-        if cursor.fetchone():
-            raise HTTPException(status_code=409, detail="Agent name already registered")
+        # Upsert: if agent_id already exists, refresh it and issue a new JWT
+        cursor.execute("SELECT id FROM agents WHERE id = ?", (agent_id,))
+        existing = cursor.fetchone()
 
-        # Insert agent
-        cursor.execute("""
-            INSERT INTO agents (
-                id, name, role, capabilities, home_instance, contact,
-                passport_hash, token_hash, trust_score, trust_tier,
-                public_key, signed_card,
-                registered_at, last_seen
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            agent_id, request.name, request.role,
-            json.dumps(request.capabilities), request.home,
-            request.contact, passport_hash, token_hash,
-            trust_score, trust_tier,
-            public_key_bytes, signed_card,
-            now, now
-        ))
+        # New ring token on every register (covers re-registration after JWT expiry)
+        ring_token_value = secrets.token_urlsafe(32)
+        token_hash = bcrypt.hash(ring_token_value)
 
-        # Insert passport
-        # Calculate prediction accuracy from confirmed/refuted
-        predictions = request.passport.get("predictions", {})
-        confirmed = predictions.get("confirmed", 0)
-        refuted = predictions.get("refuted", 0)
-        total_predictions = confirmed + refuted
-        prediction_accuracy = confirmed / total_predictions if total_predictions > 0 else 0.5
-
-        # Belief stability (lower contradictions = higher stability)
-        beliefs = request.passport.get("beliefs", {})
-        total_beliefs = beliefs.get("total", 1)
-        contradictions = beliefs.get("contradictions", 0)
-        belief_stability = 1.0 - (contradictions / total_beliefs) if total_beliefs > 0 else 1.0
-
-        # Memory quality from memory_stats
-        memory_stats = request.passport.get("memory_stats", {})
-        memory_quality = memory_stats.get("proof_count_avg", 0.0)
-
-        # Passport score - handle both dict and float formats
-        score_data = request.passport.get("score", {})
-        if isinstance(score_data, dict):
-            passport_score = score_data.get("total", 0.0)
-        else:
-            passport_score = score_data if isinstance(score_data, (int, float)) else 0.0
-
-        cursor.execute("""
-            INSERT INTO passports (
-                agent_id, passport_data, trust_score,
-                prediction_accuracy, belief_stability,
-                memory_quality, passport_score, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            agent_id, json.dumps(request.passport),
-            trust_score, prediction_accuracy,
-            belief_stability, memory_quality,
-            passport_score, now
-        ))
-
-        # Generate and store embedding (optional - only if embeddings available)
-        try:
-            from circus.services.embeddings import embed_agent_profile
-            embedding = await embed_agent_profile(
-                request.name,
-                request.role,
-                request.capabilities
-            )
-            # Store both blob (for sqlite-vec) and JSON (for fallback)
-            import numpy as np
-            embedding_array = np.array(embedding, dtype=np.float32)
+        if existing:
+            # Preserve trust if existing is higher (re-registration must not downgrade Elders)
+            cursor.execute("SELECT trust_score, trust_tier FROM agents WHERE id = ?", (agent_id,))
+            existing_trust_row = cursor.fetchone()
+            final_trust = existing_trust_row["trust_score"] if existing_trust_row and existing_trust_row["trust_score"] > trust_score else trust_score
+            final_tier = existing_trust_row["trust_tier"] if existing_trust_row and existing_trust_row["trust_score"] > trust_score else trust_tier
             cursor.execute("""
-                INSERT INTO agent_embeddings (agent_id, embedding, embedding_json, created_at)
-                VALUES (?, ?, ?, ?)
-            """, (agent_id, embedding_array.tobytes(), json.dumps(embedding), now))
-        except (ImportError, RuntimeError):
-            # sentence-transformers not installed, skip embeddings
-            pass
+                UPDATE agents SET
+                    role = ?, capabilities = ?, home_instance = ?, contact = ?,
+                    passport_hash = ?, token_hash = ?, trust_score = ?,
+                    trust_tier = ?, last_seen = ?
+                WHERE id = ?
+            """, (
+                request.role, json.dumps(request.capabilities), request.home,
+                request.contact, passport_hash, token_hash,
+                final_trust, final_tier, now, agent_id
+            ))
+            cursor.execute("""
+                INSERT INTO passports (
+                    agent_id, passport_data, trust_score,
+                    prediction_accuracy, belief_stability,
+                    memory_quality, passport_score, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                agent_id, json.dumps(request.passport),
+                trust_score, prediction_accuracy,
+                belief_stability, memory_quality,
+                passport_score, now
+            ))
+        else:
+            # Generate Ed25519 keypair for signing (new agents only)
+            private_key_bytes, public_key_bytes = generate_keypair()
+            card_data = {
+                "agent_id": agent_id,
+                "name": request.name,
+                "role": request.role,
+                "capabilities": request.capabilities,
+                "registered_at": now
+            }
+            signed_card = sign_agent_card(card_data, private_key_bytes)
+
+            cursor.execute("""
+                INSERT INTO agents (
+                    id, name, role, capabilities, home_instance, contact,
+                    passport_hash, token_hash, trust_score, trust_tier,
+                    public_key, signed_card,
+                    registered_at, last_seen
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                agent_id, request.name, request.role,
+                json.dumps(request.capabilities), request.home,
+                request.contact, passport_hash, token_hash,
+                trust_score, trust_tier,
+                public_key_bytes, signed_card,
+                now, now
+            ))
+            cursor.execute("""
+                INSERT INTO passports (
+                    agent_id, passport_data, trust_score,
+                    prediction_accuracy, belief_stability,
+                    memory_quality, passport_score, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                agent_id, json.dumps(request.passport),
+                trust_score, prediction_accuracy,
+                belief_stability, memory_quality,
+                passport_score, now
+            ))
+
+            # Generate and store embedding (optional - only if embeddings available)
+            try:
+                from circus.services.embeddings import embed_agent_profile
+                embedding = await embed_agent_profile(
+                    request.name,
+                    request.role,
+                    request.capabilities
+                )
+                import numpy as np
+                embedding_array = np.array(embedding, dtype=np.float32)
+                cursor.execute("""
+                    INSERT INTO agent_embeddings (agent_id, embedding, embedding_json, created_at)
+                    VALUES (?, ?, ?, ?)
+                """, (agent_id, embedding_array.tobytes(), json.dumps(embedding), now))
+            except (ImportError, RuntimeError):
+                pass
 
         conn.commit()
 
-    # Create JWT token
     jwt_token = create_access_token(
         agent_id,
         timedelta(days=settings.access_token_expire_days)
@@ -892,6 +912,43 @@ async def get_agent_competence_scores(agent_id: str):
         "agent_id": agent_id,
         "competencies": competencies,
         "count": len(competencies)
+    }
+
+
+@router.post("/heartbeat")
+async def agent_heartbeat(agent_id: str = Depends(verify_token)):
+    """Bump last_seen for the calling agent. Used by clients for liveness tracking."""
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE agents SET last_seen = ?, is_active = 1 WHERE id = ?",
+            (now, agent_id)
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        conn.commit()
+    return {"agent_id": agent_id, "last_seen": now, "status": "ok"}
+
+
+@router.get("/{agent_id}/liveness")
+async def get_agent_liveness(agent_id: str):
+    """Check if agent is live based on heartbeat. Stale = no heartbeat in >15 minutes."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT last_seen, is_active FROM agents WHERE id = ?", (agent_id,))
+        row = cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    last_seen = datetime.fromisoformat(row["last_seen"])
+    stale_after = timedelta(minutes=15)
+    is_live = (datetime.utcnow() - last_seen) < stale_after and row["is_active"]
+    return {
+        "agent_id": agent_id,
+        "is_live": is_live,
+        "last_seen": row["last_seen"],
+        "seconds_ago": int((datetime.utcnow() - last_seen).total_seconds()),
+        "is_active": bool(row["is_active"]),
     }
 
 
