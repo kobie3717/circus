@@ -71,7 +71,7 @@ async def register_peer(
 
 
 @router.get("/peers")
-async def list_peers():
+async def list_peers(agent_id: str = Depends(verify_token)):
     """List all federation peers."""
     with get_db() as conn:
         cursor = conn.cursor()
@@ -531,7 +531,7 @@ async def get_federation_outbox(
 
 
 @router.get("/api/v1/federation/metrics")
-async def get_federation_metrics():
+async def get_federation_metrics(agent_id: str = Depends(verify_token)):
     """Get federation outbox metrics (public, no auth)."""
     with get_db() as conn:
         cursor = conn.cursor()

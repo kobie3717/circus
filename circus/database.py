@@ -275,6 +275,17 @@ def init_database(db_path: Optional[Path] = None) -> None:
         )
     """)
 
+    # Token revocations table (JWT revocation)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS token_revocations (
+            jti TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            revoked_at TEXT NOT NULL,
+            reason TEXT DEFAULT 'manual'
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_token_revocations_agent ON token_revocations(agent_id)")
+
     # Federation peers table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS federation_peers (
@@ -316,6 +327,9 @@ def init_database(db_path: Optional[Path] = None) -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_agent ON audit_log(agent_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trust_events_agent_created ON trust_events(agent_id, created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_created_desc ON audit_log(created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_shared_memories_from_agent ON shared_memories(from_agent_id, shared_at DESC)")
 
     # Create FTS5 virtual table for agent search
     # Standalone FTS table (not content-based) for simplicity
@@ -1043,7 +1057,7 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
     # Set once on first connection; subsequent calls are no-ops but cheap.
     conn.execute("PRAGMA journal_mode=WAL")
     # Busy timeout prevents "database is locked" errors under concurrent writes
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
     finally:

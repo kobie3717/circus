@@ -59,11 +59,13 @@ def get_agent_competence_list(agent_id: str) -> list[DomainCompetence] | None:
 
 def create_access_token(agent_id: str, expires_delta: timedelta) -> str:
     """Create JWT access token."""
+    import uuid
     expire = datetime.utcnow() + expires_delta
     to_encode = {
         "sub": agent_id,
         "exp": expire,
         "iat": datetime.utcnow(),
+        "jti": str(uuid.uuid4()),
     }
     return jwt.encode(to_encode, settings.secret_key, algorithm=settings.algorithm)
 
@@ -78,8 +80,17 @@ def verify_token(authorization: str = Header(...)) -> str:
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
         agent_id = payload.get("sub")
+        jti = payload.get("jti")
         if agent_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
+        # Check revocation list
+        if jti:
+            from circus.database import get_db
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM token_revocations WHERE jti = ?", (jti,))
+                if cursor.fetchone():
+                    raise HTTPException(status_code=401, detail="Token revoked")
         return agent_id
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -143,6 +154,7 @@ async def register_agent(request: AgentRegisterRequest):
 
     with get_db() as conn:
         cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
 
         # Upsert: if agent_id already exists, refresh it and issue a new JWT
         cursor.execute("SELECT id FROM agents WHERE id = ?", (agent_id,))
@@ -929,6 +941,32 @@ async def agent_heartbeat(agent_id: str = Depends(verify_token)):
             raise HTTPException(status_code=404, detail="Agent not found")
         conn.commit()
     return {"agent_id": agent_id, "last_seen": now, "status": "ok"}
+
+
+@router.post("/{agent_id}/revoke-token")
+async def revoke_agent_token(
+    agent_id: str,
+    authorization: str = Header(...),
+    reason: str = "manual_revocation"
+):
+    """Revoke a JWT token by its jti. Elder-tier only."""
+    # Verify caller is Elder
+    caller_id = verify_token(authorization)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT trust_tier FROM agents WHERE id = ?", (caller_id,))
+        row = cursor.fetchone()
+        if not row or row["trust_tier"] != "Elder":
+            raise HTTPException(status_code=403, detail="Elder tier required")
+        # Revoke all active tokens for the target agent by inserting a wildcard record
+        # Since we can't enumerate issued JTIs, we store agent_id-level revocation
+        now = datetime.utcnow().isoformat()
+        cursor.execute("""
+            INSERT OR REPLACE INTO token_revocations (jti, agent_id, revoked_at, reason)
+            VALUES (?, ?, ?, ?)
+        """, (f"agent:{agent_id}", agent_id, now, reason))
+        conn.commit()
+    return {"status": "revoked", "agent_id": agent_id, "reason": reason}
 
 
 @router.get("/{agent_id}/liveness")

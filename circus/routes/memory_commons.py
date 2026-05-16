@@ -11,6 +11,23 @@ from typing import AsyncIterator, Optional
 _MEMORY_ID_PATTERN = re.compile(r'^shmem-[0-9a-f]{16,64}$')
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+
+# Rate limit for unauthenticated search: 30 req/min per IP
+_search_rate: dict = {}
+_search_rate_lock = __import__('threading').Lock()
+
+def _check_search_rate(client_ip: str) -> None:
+    import time
+    bucket = int(time.time() / 60)
+    with _search_rate_lock:
+        key = f"{client_ip}:{bucket}"
+        _search_rate[key] = _search_rate.get(key, 0) + 1
+        # Cleanup old buckets
+        stale = [k for k in _search_rate if not k.endswith(f":{bucket}")]
+        for k in stale:
+            del _search_rate[k]
+        if _search_rate[key] > 30:
+            raise HTTPException(status_code=429, detail="Search rate limit exceeded (30/min)")
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -158,8 +175,13 @@ async def delete_goal(
         reason="manually deleted"
     ))
 
-    # Clean up SSE queues
+    # Signal active SSE streams to close, then clean up
     if goal_id in _sse_queues:
+        for queue in list(_sse_queues[goal_id]):
+            try:
+                queue.put_nowait(None)  # Sentinel closes stream
+            except Exception:
+                pass
         del _sse_queues[goal_id]
 
     return {"status": "unsubscribed", "goal_id": goal_id}
@@ -753,6 +775,13 @@ async def claim_domain(
                 detail=f"Maximum {settings.max_domains_per_agent} domains per agent"
             )
 
+        # Validate domain: alphanumeric, hyphens, dots, max 100 chars
+        if not claim_req.domain or len(claim_req.domain) > 100:
+            raise HTTPException(status_code=400, detail="Domain must be 1-100 characters")
+        import re as _re_domain
+        if not _re_domain.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', claim_req.domain):
+            raise HTTPException(status_code=400, detail="Invalid domain format")
+
         # Insert or update claim
         now = datetime.utcnow().isoformat()
         try:
@@ -994,6 +1023,7 @@ async def get_conflicts(
 
 @router.get("/search")
 async def search_shared_knowledge(
+    request: Request,
     q: str,
     limit: int = 3,
     owner_id: Optional[str] = None
@@ -1007,6 +1037,7 @@ async def search_shared_knowledge(
 
     Optional owner_id filter for owner-specific knowledge.
     """
+    _check_search_rate(request.client.host or "unknown")
     if not settings.memory_commons_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
