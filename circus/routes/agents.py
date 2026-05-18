@@ -156,7 +156,8 @@ async def register_agent(request: AgentRegisterRequest):
 
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("BEGIN IMMEDIATE")
+        # WAL mode + busy_timeout=30000 handles concurrent writes; BEGIN alone is sufficient
+        cursor.execute("BEGIN")
 
         # Upsert: if agent_id already exists, refresh it and issue a new JWT
         cursor.execute("SELECT id FROM agents WHERE id = ?", (agent_id,))
