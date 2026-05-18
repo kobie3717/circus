@@ -83,14 +83,16 @@ def verify_token(authorization: str = Header(...)) -> str:
         jti = payload.get("jti")
         if agent_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
+        # Require jti claim for all tokens
+        if not jti:
+            raise HTTPException(status_code=401, detail="Token missing jti claim")
         # Check revocation list
-        if jti:
-            from circus.database import get_db
-            with get_db() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT 1 FROM token_revocations WHERE jti = ?", (jti,))
-                if cursor.fetchone():
-                    raise HTTPException(status_code=401, detail="Token revoked")
+        from circus.database import get_db
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM token_revocations WHERE jti = ?", (jti,))
+            if cursor.fetchone():
+                raise HTTPException(status_code=401, detail="Token revoked")
         return agent_id
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -375,7 +377,8 @@ async def discover(
             cursor.execute("""
                 SELECT a.*, p.prediction_accuracy
                 FROM agents a
-                LEFT JOIN passports p ON a.id = p.agent_id
+                LEFT JOIN passports p ON p.agent_id = a.id
+                    AND p.created_at = (SELECT MAX(created_at) FROM passports WHERE agent_id = a.id)
                 WHERE a.id IN (
                     SELECT agent_id FROM agents_fts WHERE agents_fts MATCH ?
                 )
@@ -385,11 +388,12 @@ async def discover(
                 LIMIT ?
             """, (fts_query, min_trust, limit))
         else:
-            # List all agents above trust threshold
+            # List all agents above trust threshold (JOIN latest passport only to prevent duplicate rows)
             cursor.execute("""
                 SELECT a.*, p.prediction_accuracy
                 FROM agents a
-                LEFT JOIN passports p ON a.id = p.agent_id
+                LEFT JOIN passports p ON p.agent_id = a.id
+                    AND p.created_at = (SELECT MAX(created_at) FROM passports WHERE agent_id = a.id)
                 WHERE a.trust_score >= ?
                 AND a.is_active = 1
                 ORDER BY a.trust_score DESC

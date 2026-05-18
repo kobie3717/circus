@@ -432,21 +432,26 @@ async def publish_memory(
             except Exception:
                 pass  # Non-fatal — correction still stored even if superseding fails
 
-        # Week 2: Conflict detection
-        conflict_result = await apply_belief_merge_pipeline(
-            conn,
-            new_memory={
-                "id": memory_id,
-                "from_agent_id": agent_id,
-                "content": mem_req.content,
-                "category": mem_req.category,
-                "domain": normalized_domain,
-                "confidence": mem_req.confidence,
-                "shared_at": now.isoformat(),
-            },
-            agent_id=agent_id,
-            now=now,
-        )
+        # Week 2: Conflict detection — skip for accumulative categories (learning/fact/workflow).
+        # Embedding on CPU takes 95-130s per call; these categories don't conflict by nature.
+        _SKIP_CONFLICT_CATEGORIES = {"learning", "fact", "workflow"}
+        if mem_req.category in _SKIP_CONFLICT_CATEGORIES:
+            conflict_result = None
+        else:
+            conflict_result = await apply_belief_merge_pipeline(
+                conn,
+                new_memory={
+                    "id": memory_id,
+                    "from_agent_id": agent_id,
+                    "content": mem_req.content,
+                    "category": mem_req.category,
+                    "domain": normalized_domain,
+                    "confidence": mem_req.confidence,
+                    "shared_at": now.isoformat(),
+                },
+                agent_id=agent_id,
+                now=now,
+            )
 
         # Week 4 (4.2): Preference admission (if user_preference memory)
         # Week 6: Returns decision trace for observability
@@ -1021,15 +1026,18 @@ async def get_conflicts(
 # Cross-Agent Shared Learning API (W11)
 
 
+from fastapi import Header
+
 @router.get("/search")
 async def search_shared_knowledge(
     request: Request,
     q: str,
     limit: int = 3,
-    owner_id: Optional[str] = None
+    owner_id: Optional[str] = None,
+    agent_id: str = Depends(verify_token)
 ):
     """
-    Search shared memories (no auth required - read-only, public knowledge).
+    Search shared memories (authentication required).
 
     Query shared_memories table using LIKE on content (FTS if available).
     Score: confidence × (1 - hop_count × 0.1) — capped at 0.0
@@ -1037,6 +1045,15 @@ async def search_shared_knowledge(
 
     Optional owner_id filter for owner-specific knowledge.
     """
+    # Validate owner_id format if provided — alphanumeric + hyphens only (agent ID format)
+    if owner_id:
+        import re as _re_oid
+        if not _re_oid.match(r'^[a-zA-Z0-9_\-]{1,64}$', owner_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid owner_id format"
+            )
+
     _check_search_rate(request.client.host or "unknown")
     if not settings.memory_commons_enabled:
         raise HTTPException(
