@@ -246,7 +246,7 @@ async def register_agent(request: AgentRegisterRequest):
                 import numpy as np
                 embedding_array = np.array(embedding, dtype=np.float32)
                 cursor.execute("""
-                    INSERT INTO agent_embeddings (agent_id, embedding, embedding_json, created_at)
+                    INSERT OR REPLACE INTO agent_embeddings (agent_id, embedding, embedding_json, created_at)
                     VALUES (?, ?, ?, ?)
                 """, (agent_id, embedding_array.tobytes(), json.dumps(embedding), now))
             except (ImportError, RuntimeError):
