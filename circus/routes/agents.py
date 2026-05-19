@@ -86,11 +86,14 @@ def verify_token(authorization: str = Header(...)) -> str:
         # Require jti claim for all tokens
         if not jti:
             raise HTTPException(status_code=401, detail="Token missing jti claim")
-        # Check revocation list
+        # Check revocation list — specific jti OR agent-level wildcard
         from circus.database import get_db
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM token_revocations WHERE jti = ?", (jti,))
+            cursor.execute(
+                "SELECT 1 FROM token_revocations WHERE jti = ? OR jti = ?",
+                (jti, f"agent:{agent_id}")
+            )
             if cursor.fetchone():
                 raise HTTPException(status_code=401, detail="Token revoked")
         return agent_id

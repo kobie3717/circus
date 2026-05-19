@@ -28,6 +28,22 @@ def _check_search_rate(client_ip: str) -> None:
             del _search_rate[k]
         if _search_rate[key] > 30:
             raise HTTPException(status_code=429, detail="Search rate limit exceeded (30/min)")
+
+# Rate limit for /publish: 100 req/hr per agent_id
+_publish_rate: dict = {}
+_publish_rate_lock = __import__('threading').Lock()
+
+def _check_publish_rate(agent_id: str) -> None:
+    import time
+    bucket = int(time.time() / 3600)
+    with _publish_rate_lock:
+        key = f"{agent_id}:{bucket}"
+        _publish_rate[key] = _publish_rate.get(key, 0) + 1
+        stale = [k for k in _publish_rate if not k.endswith(f":{bucket}")]
+        for k in stale:
+            del _publish_rate[k]
+        if _publish_rate[key] > 100:
+            raise HTTPException(status_code=429, detail="Publish rate limit exceeded (100/hr)")
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -231,6 +247,7 @@ async def publish_memory(
     Week 2: Applies confidence decay and detects conflicts.
     Week 3: Domain field is required and validated.
     """
+    _check_publish_rate(agent_id)
     if not settings.memory_commons_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
