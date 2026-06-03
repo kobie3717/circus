@@ -433,27 +433,40 @@ async def publish_memory(
         )
 
         # Insert into shared_memories (use memory-commons room)
-        cursor.execute("""
-            INSERT INTO shared_memories (
-                id, room_id, from_agent_id, content, category, domain, tags, provenance,
-                privacy_tier, hop_count, original_author, confidence,
-                age_days, effective_confidence, shared_at, trust_verified
-            ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0)
-        """, (
-            memory_id,
-            agent_id,
-            mem_req.content,
-            mem_req.category,
-            normalized_domain,
-            json.dumps(mem_req.tags or []),
-            json.dumps(provenance_data),
-            mem_req.privacy_tier,
-            agent_id,
-            mem_req.confidence,
-            effective_conf,
-            now.isoformat()
-        ))
-        conn.commit()
+        # Retry on ID collision (max 3 attempts)
+        for attempt in range(3):
+            try:
+                cursor.execute("""
+                    INSERT INTO shared_memories (
+                        id, room_id, from_agent_id, content, category, domain, tags, provenance,
+                        privacy_tier, hop_count, original_author, confidence,
+                        age_days, effective_confidence, shared_at, trust_verified
+                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0)
+                """, (
+                    memory_id,
+                    agent_id,
+                    mem_req.content,
+                    mem_req.category,
+                    normalized_domain,
+                    json.dumps(mem_req.tags or []),
+                    json.dumps(provenance_data),
+                    mem_req.privacy_tier,
+                    agent_id,
+                    mem_req.confidence,
+                    effective_conf,
+                    now.isoformat()
+                ))
+                conn.commit()
+                break
+            except sqlite3.IntegrityError:
+                if attempt == 2:
+                    raise HTTPException(status_code=409, detail="Memory ID collision, please retry")
+                # Regenerate ID and retry (unless client-supplied ID from owner_binding)
+                if _client_memory_id:
+                    # Client-supplied ID collision is fatal (can't regenerate signed ID)
+                    raise HTTPException(status_code=409, detail="Memory ID collision (client-supplied), please retry")
+                memory_id = f"shmem-{secrets.token_hex(8)}"
+                continue
 
         # Corrections: mark superseded memory as inactive
         if (mem_req.category == 'correction'
