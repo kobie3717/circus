@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Dict
 
 from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse
 from jose import jwt, JWTError
 
 from circus.config import settings
@@ -24,8 +25,8 @@ TIER_LIMITS = {
     "Trusted": {"requests": 2000, "window_minutes": 60},
 }
 
-# Anonymous rate limit (no token)
-ANONYMOUS_LIMIT = {"requests": 30, "window_minutes": 60}
+# Anonymous rate limit (no token) - increased from 30 to 300 to give headroom
+ANONYMOUS_LIMIT = {"requests": 300, "window_minutes": 60}
 
 
 def get_agent_from_token(authorization: str) -> tuple[str | None, str]:
@@ -39,12 +40,16 @@ def get_agent_from_token(authorization: str) -> tuple[str | None, str]:
         payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
         agent_id = payload.get("sub")
         # We need to look up trust tier from DB
-        from circus.database import get_db
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT trust_tier FROM agents WHERE id = ?", (agent_id,))
-            row = cursor.fetchone()
-            trust_tier = row["trust_tier"] if row else "Newcomer"
+        try:
+            from circus.database import get_db
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT trust_tier FROM agents WHERE id = ?", (agent_id,))
+                row = cursor.fetchone()
+                trust_tier = row["trust_tier"] if row else "Newcomer"
+        except Exception:
+            # DB locked or unavailable — fallback to Newcomer tier, never 500
+            trust_tier = "Newcomer"
 
         return agent_id, trust_tier
     except JWTError:
@@ -84,13 +89,21 @@ async def check_rate_limit(request: Request):
         (ts, count) for ts, count in rate_limits[identifier] if ts > cutoff
     ]
 
+    # Periodic cleanup of all stale identifiers (every ~100 requests)
+    import random
+    if random.random() < 0.01:  # 1% chance = cleanup ~every 100 requests
+        stale_keys = [k for k, v in rate_limits.items() if not v]
+        for k in stale_keys:
+            del rate_limits[k]
+
     # Count requests in window
     total_requests = sum(count for _, count in rate_limits[identifier])
 
     if total_requests >= max_requests:
-        raise HTTPException(
+        # Return JSONResponse directly to avoid anyio ExceptionGroup wrapping that causes 500
+        return JSONResponse(
             status_code=429,
-            detail=f"Rate limit exceeded. Tier: {trust_tier}, Limit: {max_requests}/{window_minutes}m"
+            content={"detail": f"Rate limit exceeded. Tier: {trust_tier}, Limit: {max_requests}/{window_minutes}m"}
         )
 
     # Record this request

@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from circus.config import settings
 from circus.database import init_database, seed_default_rooms, get_db
 from circus.models import HealthResponse
-from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing
+from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens
 from circus.trust import apply_trust_decay, get_trust_tier
 from circus.middleware.rate_limiter import check_rate_limit
 from circus.middleware.telemetry import setup_tracing, get_current_trace_id
@@ -200,21 +200,14 @@ async def permission_error_handler(request: Request, exc: PermissionError):
 # Health check endpoint
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
-    """Health check endpoint."""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM agents WHERE is_active = 1")
-        agents_count = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM rooms")
-        rooms_count = cursor.fetchone()[0]
-
+    """Health check endpoint (non-blocking, no DB queries)."""
     trace_id = get_current_trace_id()
 
     return HealthResponse(
         status="healthy",
         version=settings.app_version,
-        agents_count=agents_count,
-        rooms_count=rooms_count,
+        agents_count=0,
+        rooms_count=0,
         timestamp=datetime.utcnow().isoformat(),
         trace_id=trace_id
     )
@@ -232,6 +225,8 @@ app.include_router(memory_commons.router)  # Memory Commons (includes own prefix
 app.include_router(key_lifecycle.router)  # Key Lifecycle (W9, includes own prefix)
 app.include_router(governance.router)  # Governance (W11, includes own prefix)
 app.include_router(routing.router, prefix="/api/v1", tags=["Routing"])  # Bandit routing
+app.include_router(graphs.router, prefix="/api/v1/graphs", tags=["Graphs"])  # Graph orchestration
+app.include_router(tokens.router, tags=["Tokens"])  # Token pool management
 
 
 @app.get("/.well-known/agent.json", tags=["A2A"])
