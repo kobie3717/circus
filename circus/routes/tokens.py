@@ -3,13 +3,45 @@
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from circus.config import settings
 from circus.database import get_db
 
 router = APIRouter()
+
+
+def verify_token(authorization: str = Header(...)) -> str:
+    """Verify JWT token and return agent_id."""
+    from jose import JWTError, jwt
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+    token = authorization[7:]  # Remove "Bearer " prefix
+
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+        agent_id = payload.get("sub")
+        jti = payload.get("jti")
+        if agent_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        # Require jti claim for all tokens
+        if not jti:
+            raise HTTPException(status_code=401, detail="Token missing jti claim")
+        # Check revocation list — specific jti OR agent-level wildcard
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM token_revocations WHERE jti = ? OR jti = ?",
+                (jti, f"agent:{agent_id}")
+            )
+            if cursor.fetchone():
+                raise HTTPException(status_code=401, detail="Token revoked")
+        return agent_id
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 
 class TokenCheckRequest(BaseModel):
@@ -105,7 +137,7 @@ def calculate_tier(pool_pct: float, conversation_limit_exceeded: bool) -> tuple[
 
 
 @router.get("/api/v1/tokens/status", response_model=TokenPoolStatus)
-async def get_token_pool_status():
+async def get_token_pool_status(agent_id: str = Depends(verify_token)):
     """Get current token pool status and per-bot breakdown."""
     with get_db() as conn:
         cursor = conn.cursor()
@@ -161,7 +193,7 @@ async def get_token_pool_status():
 
 
 @router.post("/api/v1/tokens/check", response_model=TokenCheckResponse)
-async def check_token_availability(request: TokenCheckRequest):
+async def check_token_availability(request: TokenCheckRequest, agent_id: str = Depends(verify_token)):
     """Check if bot can use tokens and get tier/delay."""
     with get_db() as conn:
         cursor = conn.cursor()
@@ -226,7 +258,7 @@ async def check_token_availability(request: TokenCheckRequest):
 
 
 @router.post("/api/v1/tokens/record", response_model=TokenRecordResponse)
-async def record_token_usage(request: TokenRecordRequest):
+async def record_token_usage(request: TokenRecordRequest, agent_id: str = Depends(verify_token)):
     """Record token usage for a bot."""
     with get_db() as conn:
         cursor = conn.cursor()
@@ -236,22 +268,25 @@ async def record_token_usage(request: TokenRecordRequest):
 
         now = datetime.utcnow().isoformat()
 
-        # Get pool status
-        cursor.execute("SELECT daily_budget, daily_used FROM token_pool WHERE id = 1")
+        # Get pool status (daily_budget only, no read-before-write for daily_used)
+        cursor.execute("SELECT daily_budget FROM token_pool WHERE id = 1")
         pool_row = cursor.fetchone()
 
         if not pool_row:
             raise HTTPException(status_code=500, detail="Token pool not initialized")
 
         daily_budget = pool_row["daily_budget"]
-        new_pool_daily_used = pool_row["daily_used"] + request.tokens_used
 
-        # Update pool
+        # H2: Atomic update — increment daily_used in single SQL statement
         cursor.execute("""
             UPDATE token_pool
-            SET daily_used = ?, updated_at = ?
+            SET daily_used = daily_used + ?, updated_at = ?
             WHERE id = 1
-        """, (new_pool_daily_used, now))
+        """, (request.tokens_used, now))
+
+        # Read back the new value for response
+        cursor.execute("SELECT daily_used FROM token_pool WHERE id = 1")
+        new_pool_daily_used = cursor.fetchone()["daily_used"]
 
         # Get or create bot record
         cursor.execute("""

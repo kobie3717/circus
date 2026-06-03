@@ -1,6 +1,7 @@
 """FastAPI application setup for The Circus."""
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
@@ -9,6 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from circus.config import settings
+
+logger = logging.getLogger(__name__)
 from circus.database import init_database, seed_default_rooms, get_db
 from circus.models import HealthResponse
 from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens
@@ -201,6 +204,16 @@ async def permission_error_handler(request: Request, exc: PermissionError):
     return JSONResponse(
         status_code=403,
         content={"detail": str(exc), "error_code": "PERMISSION_DENIED"}
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle all unhandled exceptions (M2)."""
+    logger.error(f"Unhandled exception on {request.url}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error_code": "INTERNAL_ERROR"}
     )
 
 

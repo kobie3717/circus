@@ -45,6 +45,7 @@ def generate_passport(
         active_clause = "1=1"
 
     # Extract basic memory stats
+    # C3: active_clause built from PRAGMA column names (trusted) — not user input
     cursor.execute(f"SELECT COUNT(*) as count FROM memories WHERE {active_clause}")
     memory_count = cursor.fetchone()['count']
 
@@ -94,6 +95,7 @@ def generate_passport(
         else:
             belief_active_clause = "1=1"
 
+        # C3: belief_active_clause built from PRAGMA column names (trusted) — not user input
         cursor.execute(f"""
             SELECT COUNT(*) FROM beliefs WHERE {belief_active_clause}
         """)
@@ -160,6 +162,7 @@ def generate_passport(
         pass
 
     # Extract memory quality metrics
+    # C3: active_clause built from PRAGMA column names (trusted) — not user input
     cursor.execute(f"""
         SELECT
             AVG(priority) as avg_priority,
@@ -175,6 +178,7 @@ def generate_passport(
     # Calculate proof count (citations) - check if column exists first
     avg_citations = 0.0
     try:
+        # C3: active_clause built from PRAGMA column names (trusted) — not user input
         cursor.execute(f"""
             SELECT AVG(json_array_length(citations)) as avg_citations
             FROM memories
@@ -185,6 +189,7 @@ def generate_passport(
     except sqlite3.OperationalError:
         # citations column doesn't exist, check for citationsJson
         try:
+            # C3: active_clause built from PRAGMA column names (trusted) — not user input
             cursor.execute(f"""
                 SELECT COUNT(*) as count
                 FROM memories
