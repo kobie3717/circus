@@ -110,6 +110,13 @@ async def lifespan(app: FastAPI):
     init_database()
     seed_default_rooms()
 
+    # H4: DB table existence check on startup
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='agents'")
+        if not cursor.fetchone():
+            raise RuntimeError("Critical: agents table missing after init")
+
     # Start background tasks
     trust_task = asyncio.create_task(trust_decay_task())
     liveness_task = asyncio.create_task(liveness_monitor_task())

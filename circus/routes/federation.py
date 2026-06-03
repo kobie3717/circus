@@ -378,6 +378,11 @@ async def push_federation_bundle(
     if peer_signature is None:
         raise HTTPException(status_code=401, detail="Missing X-Peer-Signature header")
 
+    # H3: Bundle size limit (max 10MB)
+    content_length = int(request.headers.get("content-length", 0))
+    if content_length > 10_485_760:  # 10MB
+        raise HTTPException(status_code=413, detail="Bundle too large (max 10MB)")
+
     # 2. Parse body
     try:
         bundle = await request.json()

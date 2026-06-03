@@ -147,6 +147,11 @@ async def run_graph(
     import subprocess
     import os
     import shutil
+    import re
+
+    # C2: Validate graph_id format before subprocess spawn
+    if not re.match(r'^[a-zA-Z0-9_\-]{1,64}$', str(resolved_graph_id)):
+        raise HTTPException(status_code=400, detail="Invalid graph_id format")
 
     node_bin = shutil.which('node') or 'node'
     # Support GRAPH_ENGINE_DIR env var; fall back to hydrabot path
@@ -155,6 +160,10 @@ async def run_graph(
         os.path.join(os.path.expanduser('~'), 'hydrabot', 'graph-engine')
     )
     graph_engine_script = os.path.join(graph_engine_dir, 'run-execution.mjs')
+
+    # C2: Validate graph engine script exists before spawn
+    if not os.path.isfile(graph_engine_script):
+        raise HTTPException(status_code=500, detail="Graph engine script not found")
 
     env = os.environ.copy()
     env['GRAPH_AGENT_ID'] = agent_id

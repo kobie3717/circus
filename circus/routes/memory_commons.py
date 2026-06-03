@@ -265,6 +265,10 @@ async def publish_memory(
             detail="Memory Commons is disabled"
         )
 
+    # C1: Validate content size (max 50KB)
+    if len(mem_req.content) > 50_000:
+        raise HTTPException(status_code=413, detail="Memory content too large (max 50KB)")
+
     # Week 3: Validate domain field (required, regex-validated)
     try:
         normalized_domain = validate_domain(mem_req.domain)
@@ -305,6 +309,10 @@ async def publish_memory(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"preference.field={mem_req.preference.field} not in allowlist"
             )
+
+        # C1: Validate preference value size (max 10KB)
+        if len(str(mem_req.preference.value)) > 10_000:
+            raise HTTPException(status_code=413, detail="Preference value too large (max 10KB)")
 
         # Gate 3: domain must be "preference.user"
         if normalized_domain != "preference.user":

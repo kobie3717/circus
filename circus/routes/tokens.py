@@ -310,14 +310,24 @@ async def record_token_usage(request: TokenRecordRequest):
 
 @router.post("/api/v1/tokens/reset")
 async def reset_token_pool(authorization: str = Header(...)):
-    """Reset token pool (owner-only, for testing/emergency)."""
+    """Reset token pool (owner-only, for testing/emergency).
+
+    C3: Uses CIRCUS_OWNER_KEY env var for admin auth (separate from JWT secret).
+    Falls back to CIRCUS_SECRET_KEY for backward compatibility.
+    """
+    import os
+
     # Verify secret key
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
 
     token = authorization[7:]  # Remove "Bearer " prefix
 
-    if token != settings.secret_key:
+    # C3: Use separate admin key (CIRCUS_OWNER_KEY) for owner operations
+    # CIRCUS_SECRET_KEY is used for JWT signing; CIRCUS_OWNER_KEY is for admin ops
+    admin_key = os.environ.get('CIRCUS_OWNER_KEY', settings.secret_key)
+
+    if token != admin_key:
         raise HTTPException(status_code=403, detail="Invalid secret key")
 
     with get_db() as conn:
