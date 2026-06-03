@@ -1214,11 +1214,13 @@ async def search_shared_knowledge(
 @router.post("/auto-resolve-conflicts")
 async def auto_resolve_conflicts(
     limit: int = 100,
+    agent_id: str = Depends(verify_token)
 ):
     """
     Batch-resolve unresolved belief conflicts using recency as tiebreaker.
     For refinement and update types: newer memory wins.
     Safe to call repeatedly — idempotent.
+    Requires authentication.
     """
     resolved_count = 0
     skipped_count = 0

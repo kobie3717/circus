@@ -88,7 +88,13 @@ def verify_token(authorization: str = Header(...)) -> str:
     token = authorization[7:]  # Remove "Bearer " prefix
 
     try:
-        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+        # python-jose validates exp by default, but explicitly enable to be safe
+        payload = jwt.decode(
+            token,
+            settings.secret_key,
+            algorithms=[settings.algorithm],
+            options={"verify_exp": True}
+        )
         agent_id = payload.get("sub")
         jti = payload.get("jti")
         if agent_id is None:
@@ -107,7 +113,12 @@ def verify_token(authorization: str = Header(...)) -> str:
             if cursor.fetchone():
                 raise HTTPException(status_code=401, detail="Token revoked")
         return agent_id
-    except JWTError:
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except JWTError as e:
+        # Check if error message indicates expiry (fallback for different jose versions)
+        if "expired" in str(e).lower():
+            raise HTTPException(status_code=401, detail="Token expired")
         raise HTTPException(status_code=401, detail="Invalid token")
 
 

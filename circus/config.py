@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_days: int = 30
 
+    def __post_init__(self):
+        """Validate security settings on initialization."""
+        if not self.secret_key:
+            raise ValueError("CIRCUS_SECRET_KEY environment variable must be set")
+        if len(self.secret_key) < 32:
+            raise ValueError("CIRCUS_SECRET_KEY must be at least 32 characters")
+
     # Trust system
     trust_decay_enabled: bool = True
     passport_refresh_days: int = 30
