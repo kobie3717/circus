@@ -1257,6 +1257,11 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
     try:
         yield conn
     finally:
+        # Warn if transaction was left uncommitted (common mistake in this codebase)
+        if conn.in_transaction:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("Database connection closed with uncommitted transaction - changes will be rolled back")
         conn.close()
 
 

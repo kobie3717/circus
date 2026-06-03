@@ -4,10 +4,20 @@ import json
 import jsonschema
 import secrets
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sse_starlette.sse import EventSourceResponse
+
+
+def safe_json_loads(json_str: str, context: str = "data", user_supplied: bool = False) -> Any:
+    """Parse JSON with error handling. Returns HTTPException on failure."""
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        status = 400 if user_supplied else 500
+        detail = f"Invalid JSON in {context}: {str(e)}"
+        raise HTTPException(status_code=status, detail=detail)
 
 from circus.database import get_db
 from circus.models import (
@@ -124,14 +134,14 @@ async def update_task_state(
         if new_state == TaskState.COMPLETED and request.result is not None:
             if task["output_schema"]:
                 try:
-                    stored_schema = json.loads(task["output_schema"])
+                    stored_schema = safe_json_loads(task["output_schema"], "output_schema", user_supplied=False)
                     jsonschema.validate(instance=request.result, schema=stored_schema)
                 except jsonschema.ValidationError as e:
                     raise HTTPException(
                         status_code=400,
                         detail=f"result does not match output_schema: {e.message}"
                     )
-                except json.JSONDecodeError:
+                except HTTPException:
                     # Schema stored but not valid JSON - log but allow completion
                     pass
 
@@ -164,10 +174,10 @@ async def update_task_state(
                 schema_valid = None
                 if new_state == TaskState.COMPLETED and task["output_schema"] and request.result:
                     try:
-                        stored_schema = json.loads(task["output_schema"])
+                        stored_schema = safe_json_loads(task["output_schema"], "output_schema", user_supplied=False)
                         jsonschema.validate(instance=request.result, schema=stored_schema)
                         schema_valid = True
-                    except (jsonschema.ValidationError, json.JSONDecodeError):
+                    except (jsonschema.ValidationError, HTTPException):
                         schema_valid = False
                 elif new_state == TaskState.COMPLETED and not task["output_schema"]:
                     schema_valid = None  # no schema to validate
@@ -239,14 +249,14 @@ async def get_inbox(
                 from_agent_id=row["from_agent_id"],
                 to_agent_id=row["to_agent_id"],
                 task_type=row["task_type"],
-                payload=json.loads(row["payload"]),
+                payload=safe_json_loads(row["payload"], f"payload for task {row['id']}"),
                 state=TaskState(row["state"]),
-                result=json.loads(row["result"]) if row["result"] else None,
+                result=safe_json_loads(row["result"], f"result for task {row['id']}") if row["result"] else None,
                 error=row["error"],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 deadline=row["deadline"],
-                output_schema=json.loads(row["output_schema"]) if row["output_schema"] else None
+                output_schema=safe_json_loads(row["output_schema"], f"output_schema for task {row['id']}") if row["output_schema"] else None
             ))
 
         return tasks
@@ -284,14 +294,14 @@ async def get_outbox(
                 from_agent_id=row["from_agent_id"],
                 to_agent_id=row["to_agent_id"],
                 task_type=row["task_type"],
-                payload=json.loads(row["payload"]),
+                payload=safe_json_loads(row["payload"], f"payload for task {row['id']}"),
                 state=TaskState(row["state"]),
-                result=json.loads(row["result"]) if row["result"] else None,
+                result=safe_json_loads(row["result"], f"result for task {row['id']}") if row["result"] else None,
                 error=row["error"],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 deadline=row["deadline"],
-                output_schema=json.loads(row["output_schema"]) if row["output_schema"] else None
+                output_schema=safe_json_loads(row["output_schema"], f"output_schema for task {row['id']}") if row["output_schema"] else None
             ))
 
         return tasks
@@ -416,7 +426,7 @@ async def stream_task_progress(
                         "task_id": task_row["id"],
                         "state": task_row["state"],
                         "updated_at": task_row["updated_at"],
-                        "result": json.loads(task_row["result"]) if task_row["result"] else None,
+                        "result": safe_json_loads(task_row["result"], "task result") if task_row["result"] else None,
                         "error": task_row["error"]
                     }
 

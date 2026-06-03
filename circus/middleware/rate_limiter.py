@@ -14,6 +14,7 @@ from circus.config import settings
 # In-memory rate limit store (consider Redis for production)
 # Structure: {agent_id: [(timestamp, count), ...]}
 rate_limits: Dict[str, list] = defaultdict(list)
+_cleanup_counter = 0  # Deterministic cleanup counter
 
 # Rate limit configuration by trust tier
 TIER_LIMITS = {
@@ -89,9 +90,11 @@ async def check_rate_limit(request: Request):
         (ts, count) for ts, count in rate_limits[identifier] if ts > cutoff
     ]
 
-    # Periodic cleanup of all stale identifiers (every ~100 requests)
-    import random
-    if random.random() < 0.01:  # 1% chance = cleanup ~every 100 requests
+    # Periodic cleanup of all stale identifiers (deterministic: every 1000 requests)
+    global _cleanup_counter
+    _cleanup_counter += 1
+    if _cleanup_counter >= 1000:
+        _cleanup_counter = 0
         stale_keys = [k for k, v in rate_limits.items() if not v]
         for k in stale_keys:
             del rate_limits[k]

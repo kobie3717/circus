@@ -3,7 +3,7 @@
 import re
 import secrets
 from datetime import datetime, timedelta
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, Any
 
 # W5.1: Valid memory_id format — client-supplied IDs must match this pattern
 # (hex suffix from secrets.token_hex, allowing 16-64 chars to cover both
@@ -77,6 +77,17 @@ import json
 import sqlite3
 
 router = APIRouter(prefix="/api/v1/memory-commons", tags=["memory-commons"])
+
+
+def safe_json_loads(json_str: str, context: str = "data", user_supplied: bool = False) -> Any:
+    """Parse JSON with error handling. Returns HTTPException on failure."""
+    from fastapi import HTTPException
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        status = 400 if user_supplied else 500
+        detail = f"Invalid JSON in {context}: {str(e)}"
+        raise HTTPException(status_code=status, detail=detail)
 
 
 # In-memory SSE connections tracker

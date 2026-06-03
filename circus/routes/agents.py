@@ -10,6 +10,16 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from jose import JWTError, jwt
 from passlib.hash import bcrypt
 
+
+def safe_json_loads(json_str: str, context: str = "data", user_supplied: bool = False) -> Any:
+    """Parse JSON with error handling. Returns HTTPException on failure."""
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        status = 400 if user_supplied else 500
+        detail = f"Invalid JSON in {context}: {str(e)}"
+        raise HTTPException(status_code=status, detail=detail)
+
 from circus.config import settings
 from circus.database import get_db
 from circus.models import (
@@ -220,7 +230,7 @@ async def register_agent(request: AgentRegisterRequest):
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 agent_id, request.name, request.role,
-                json.dumps(request.capabilities), request.home,
+                json.dumps(request.capabilities or []), request.home,
                 request.contact, passport_hash, token_hash,
                 trust_score, trust_tier,
                 public_key_bytes, signed_card,
@@ -447,7 +457,7 @@ async def discover(
             agent_id=row["id"],
             name=row["name"],
             role=row["role"],
-            capabilities=json.loads(row["capabilities"]),
+            capabilities=safe_json_loads(row["capabilities"], f"capabilities for agent {row['id']}"),
             home_instance=row["home_instance"],
             trust_score=row["trust_score"],
             trust_tier=row["trust_tier"],
@@ -542,7 +552,7 @@ async def get_agent(agent_id: str):
         agent_id=row["id"],
         name=row["name"],
         role=row["role"],
-        capabilities=json.loads(row["capabilities"]),
+        capabilities=safe_json_loads(row["capabilities"], f"capabilities for agent {row['id']}"),
         home_instance=row["home_instance"],
         trust_score=row["trust_score"],
         trust_tier=row["trust_tier"],
@@ -724,7 +734,7 @@ async def verify_agent_card(agent_id: str):
         "agent_id": row["id"],
         "name": row["name"],
         "role": row["role"],
-        "capabilities": json.loads(row["capabilities"]),
+        "capabilities": safe_json_loads(row["capabilities"], f"capabilities for agent {row['id']}"),
         "registered_at": row["registered_at"]
     }
 
@@ -831,7 +841,7 @@ async def discover_semantic(
                     agent_id=row["id"],
                     name=row["name"],
                     role=row["role"],
-                    capabilities=json.loads(row["capabilities"]),
+                    capabilities=safe_json_loads(row["capabilities"], f"capabilities for agent {row['id']}"),
                     home_instance=row["home_instance"],
                     trust_score=row["trust_score"],
                     trust_tier=row["trust_tier"],
