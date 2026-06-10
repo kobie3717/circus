@@ -208,6 +208,8 @@ async def register_agent(request: AgentRegisterRequest):
                 request.contact, passport_hash, token_hash,
                 final_trust, final_tier, now, agent_id
             ))
+            # Replace previous passport (keep only latest per agent)
+            cursor.execute("DELETE FROM passports WHERE agent_id = ?", (agent_id,))
             cursor.execute("""
                 INSERT INTO passports (
                     agent_id, passport_data, trust_score,
@@ -353,6 +355,8 @@ async def refresh_passport(
         else:
             passport_score = score_data if isinstance(score_data, (int, float)) else 0.0
 
+        # Replace previous passport (keep only latest per agent)
+        cursor.execute("DELETE FROM passports WHERE agent_id = ?", (agent_id,))
         cursor.execute("""
             INSERT INTO passports (
                 agent_id, passport_data, trust_score,
