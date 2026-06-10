@@ -507,6 +507,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v15_migration(db_path)
     # Run v16 migration for graph audit log
     run_v16_migration(db_path)
+    # Run v17 migration for troupe isolation
+    run_v17_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -1210,6 +1212,45 @@ def run_v16_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v16 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v17_migration(db_path: Optional[Path] = None) -> None:
+    """Run v17 migration: Troupe-scoped memory isolation."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v17_troupe_isolation.sql"
+
+    if not migration_file.exists():
+        raise FileNotFoundError(f"Migration file not found: {migration_file}")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if troupe_id column already exists in shared_memories
+        cursor.execute("PRAGMA table_info(shared_memories)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'troupe_id' in columns:
+            logger.debug("v17 migration: troupe_id column already exists, skipping")
+            return
+
+        # Read and execute migration SQL
+        with open(migration_file, "r") as f:
+            sql_script = f.read()
+
+        # Execute all statements
+        cursor.executescript(sql_script)
+        conn.commit()
+        logger.info("v17 migration: added troupe isolation (troupe_id column, troupe_members table)")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v17 migration failed: %s", e)
         raise
     finally:
         conn.close()

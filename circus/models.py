@@ -352,6 +352,7 @@ class MemoryPublish(BaseModel):
     provenance: Optional[ProvenanceInfo] = Field(default=None)
     confidence: float = Field(default=0.9, ge=0.1, le=1.0)
     preference: Optional[PreferenceField] = Field(default=None)  # Week 4: behavior-delta preference
+    troupe_id: Optional[str] = Field(default=None)  # Optional troupe override for memory isolation
 
 
 class PublishResponse(BaseModel):

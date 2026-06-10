@@ -16,7 +16,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 _search_rate: dict = {}
 _search_rate_lock = __import__('threading').Lock()
 
-def _check_search_rate(client_ip: str) -> None:
+def _check_search_rate(client_ip: str, is_authenticated: bool = False) -> None:
+    """Check unauthenticated search rate (30/min per IP). Authenticated requests bypass."""
+    if is_authenticated:
+        return  # No rate limit for authenticated searches
+
     import time
     bucket = int(time.time() / 60)
     with _search_rate_lock:
@@ -77,6 +81,20 @@ import json
 import sqlite3
 
 router = APIRouter(prefix="/api/v1/memory-commons", tags=["memory-commons"])
+
+# Default troupe ID for agents not in any troupe
+DEFAULT_TROUPE_ID = 'default'
+
+
+def get_agent_troupe(conn: sqlite3.Connection, agent_id: str) -> str:
+    """Get the troupe_id for an agent. Returns 'default' if not in any troupe or on error."""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT troupe_id FROM troupe_members WHERE agent_id = ? LIMIT 1", (agent_id,))
+        row = cursor.fetchone()
+        return row[0] if row else DEFAULT_TROUPE_ID
+    except Exception:
+        return DEFAULT_TROUPE_ID
 
 
 def safe_json_loads(json_str: str, context: str = "data", user_supplied: bool = False) -> Any:
@@ -432,6 +450,19 @@ async def publish_memory(
             author_trust_score=trust_score
         )
 
+        # Determine troupe_id: use request override or agent's troupe membership
+        if mem_req.troupe_id:
+            # Verify agent is a member of the requested troupe
+            cursor.execute(
+                "SELECT 1 FROM troupe_members WHERE troupe_id = ? AND agent_id = ?",
+                (mem_req.troupe_id, agent_id)
+            )
+            if not cursor.fetchone():
+                raise HTTPException(status_code=403, detail="Not authorized to publish to this troupe")
+            troupe_id = mem_req.troupe_id
+        else:
+            troupe_id = get_agent_troupe(conn, agent_id)
+
         # Insert into shared_memories (use memory-commons room)
         # Retry on ID collision (max 3 attempts)
         for attempt in range(3):
@@ -440,8 +471,8 @@ async def publish_memory(
                     INSERT INTO shared_memories (
                         id, room_id, from_agent_id, content, category, domain, tags, provenance,
                         privacy_tier, hop_count, original_author, confidence,
-                        age_days, effective_confidence, shared_at, trust_verified
-                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0)
+                        age_days, effective_confidence, shared_at, trust_verified, troupe_id
+                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0, ?)
                 """, (
                     memory_id,
                     agent_id,
@@ -454,7 +485,8 @@ async def publish_memory(
                     agent_id,
                     mem_req.confidence,
                     effective_conf,
-                    now.isoformat()
+                    now.isoformat(),
+                    troupe_id
                 ))
                 conn.commit()
                 break
@@ -1103,7 +1135,8 @@ async def search_shared_knowledge(
                 detail="Invalid owner_id format"
             )
 
-    _check_search_rate(request.client.host or "unknown")
+    # Authenticated requests bypass rate limit
+    _check_search_rate(request.client.host or "unknown", is_authenticated=True)
     if not settings.memory_commons_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1123,6 +1156,15 @@ async def search_shared_knowledge(
     with get_db() as conn:
         cursor = conn.cursor()
 
+        # Build troupe filter: agent can see default troupe + their own troupes
+        troupe_list = [DEFAULT_TROUPE_ID]  # Always include default troupe
+        cursor.execute("SELECT troupe_id FROM troupe_members WHERE agent_id = ?", (agent_id,))
+        agent_troupes = [r[0] for r in cursor.fetchall()]
+        if agent_troupes:
+            troupe_list.extend(agent_troupes)
+
+        troupe_placeholders = ','.join('?' * len(troupe_list))
+
         # Check if FTS table exists (fts_shared_memories)
         cursor.execute("""
             SELECT name FROM sqlite_master
@@ -1130,31 +1172,36 @@ async def search_shared_knowledge(
         """)
         has_fts = cursor.fetchone() is not None
 
+        # Build troupe filter clause
+        troupe_filter = f"AND sm.troupe_id IN ({troupe_placeholders})" if has_fts else f"AND troupe_id IN ({troupe_placeholders})"
+
         # Build query
         if has_fts:
             # FTS search
             if owner_id:
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT sm.id, sm.content, sm.category, sm.domain, sm.confidence,
                            sm.hop_count, sm.from_agent_id, sm.shared_at
                     FROM fts_shared_memories fts
                     JOIN shared_memories sm ON fts.rowid = sm.rowid
                     WHERE fts.content MATCH ? AND sm.provenance LIKE ?
                       AND (sm.status IS NULL OR sm.status = 'active')
+                      {troupe_filter}
                     ORDER BY rank
                     LIMIT ?
-                """, (fts_query, f'%"owner_id": "{owner_id}"%', limit))
+                """, (fts_query, f'%"owner_id": "{owner_id}"%', *troupe_list, limit))
             else:
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT sm.id, sm.content, sm.category, sm.domain, sm.confidence,
                            sm.hop_count, sm.from_agent_id, sm.shared_at
                     FROM fts_shared_memories fts
                     JOIN shared_memories sm ON fts.rowid = sm.rowid
                     WHERE fts.content MATCH ?
                       AND (sm.status IS NULL OR sm.status = 'active')
+                      {troupe_filter}
                     ORDER BY rank
                     LIMIT ?
-                """, (fts_query, limit))
+                """, (fts_query, *troupe_list, limit))
         else:
             # Fallback: LIKE search — split multi-word queries into individual OR conditions
             # "whatsauction deploy" → content LIKE '%whatsauction%' OR content LIKE '%deploy%'
@@ -1169,9 +1216,10 @@ async def search_shared_knowledge(
                     FROM shared_memories
                     WHERE ({like_clauses}) AND provenance LIKE ?
                       AND (status IS NULL OR status = 'active')
+                      {troupe_filter}
                     ORDER BY shared_at DESC
                     LIMIT ?
-                """, (*like_params, f'%"owner_id": "{owner_id}"%', limit))
+                """, (*like_params, f'%"owner_id": "{owner_id}"%', *troupe_list, limit))
             else:
                 cursor.execute(f"""
                     SELECT id, content, category, domain, confidence,
@@ -1179,9 +1227,10 @@ async def search_shared_knowledge(
                     FROM shared_memories
                     WHERE ({like_clauses})
                       AND (status IS NULL OR status = 'active')
+                      {troupe_filter}
                     ORDER BY shared_at DESC
                     LIMIT ?
-                """, (*like_params, limit))
+                """, (*like_params, *troupe_list, limit))
 
         results = []
         for row in cursor.fetchall():

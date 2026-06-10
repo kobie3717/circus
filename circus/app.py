@@ -14,7 +14,7 @@ from circus.config import settings
 logger = logging.getLogger(__name__)
 from circus.database import init_database, seed_default_rooms, get_db
 from circus.models import HealthResponse
-from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens
+from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens, troupes
 from circus.trust import apply_trust_decay, get_trust_tier
 from circus.middleware.rate_limiter import check_rate_limit
 from circus.middleware.telemetry import setup_tracing, get_current_trace_id
@@ -247,6 +247,7 @@ app.include_router(governance.router)  # Governance (W11, includes own prefix)
 app.include_router(routing.router, prefix="/api/v1", tags=["Routing"])  # Bandit routing
 app.include_router(graphs.router, prefix="/api/v1/graphs", tags=["Graphs"])  # Graph orchestration
 app.include_router(tokens.router, tags=["Tokens"])  # Token pool management
+app.include_router(troupes.router)  # Troupe membership (includes own prefix)
 
 
 @app.get("/.well-known/agent.json", tags=["A2A"])
