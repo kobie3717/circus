@@ -523,6 +523,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v23_migration(db_path)
     # Run v24 migration for trust-decay escrow with cross-backing
     run_v24_migration(db_path)
+    # Run v25 migration for stake-driven task compression
+    run_v25_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -1703,6 +1705,37 @@ def run_v24_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v24 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v25_migration(db_path: Optional[Path] = None) -> None:
+    """Run v25 migration: Stake-driven task compression (Round 3 Gap 4)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(task_backing_stakes)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if 'compression_id' not in existing_columns:
+            try:
+                cursor.execute("ALTER TABLE task_backing_stakes ADD COLUMN compression_id TEXT")
+            except Exception as e:
+                logger.warning(f"v25: compression_id column: {e}")
+        if 'compression_discount' not in existing_columns:
+            try:
+                cursor.execute("ALTER TABLE task_backing_stakes ADD COLUMN compression_discount REAL DEFAULT 1.0")
+            except Exception as e:
+                logger.warning(f"v25: compression_discount column: {e}")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tbs_compression ON task_backing_stakes(compression_id)")
+        conn.commit()
+        logger.info("v25 migration complete: stake compression columns added")
+    except Exception as e:
+        conn.rollback()
+        logger.error("v25 migration failed: %s", e)
         raise
     finally:
         conn.close()
