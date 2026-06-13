@@ -323,6 +323,9 @@ class TaskResponse(BaseModel):
     output_schema: Optional[dict[str, Any]] = None
     reversibility_class: Optional[str] = None  # Phase 2: READ | REVERSIBLE | HARD_TO_REVERSE | IRREVERSIBLE
     required_capabilities: Optional[list[str]] = None  # Phase 2: capability tags required
+    escrow_required: Optional[bool] = None  # Phase 4: True if IRREVERSIBLE task requires escrow
+    escrow_amount: Optional[float] = None  # Phase 4: 3x payout amount
+    escrow_endpoint: Optional[str] = None  # Phase 4: /api/v1/escrow/lock
 
 
 class BroadcastTaskResponse(BaseModel):
@@ -335,6 +338,9 @@ class BroadcastTaskResponse(BaseModel):
     candidates_evaluated: int
     state: TaskState
     created_at: str
+    escrow_required: Optional[bool] = None  # Phase 4: True if IRREVERSIBLE task requires escrow
+    escrow_amount: Optional[float] = None  # Phase 4: 3x payout amount
+    escrow_endpoint: Optional[str] = None  # Phase 4: /api/v1/escrow/lock
 
 
 class TaskStateTransition(BaseModel):

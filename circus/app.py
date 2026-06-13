@@ -14,7 +14,7 @@ from circus.config import settings
 logger = logging.getLogger(__name__)
 from circus.database import init_database, seed_default_rooms, get_db
 from circus.models import HealthResponse
-from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens, troupes, backing, pools, memory_v2
+from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens, troupes, backing, pools, memory_v2, escrow
 from circus.trust import apply_trust_decay, get_trust_tier
 from circus.middleware.rate_limiter import check_rate_limit
 from circus.middleware.telemetry import setup_tracing, get_current_trace_id
@@ -272,6 +272,7 @@ app.include_router(troupes.router)  # Troupe membership (includes own prefix)
 app.include_router(backing.router)  # Trust-decay escrow with cross-backing (Round 3 Gap 1)
 app.include_router(pools.router)  # Trajectory-weighted mutual aid pools (Round 3 Gap 3)
 app.include_router(memory_v2.router)  # Memory Commons v2 - atomic claims (Phase 3)
+app.include_router(escrow.router)  # Phase 4: Attack-resistant escrow with graduated reversibility
 
 
 @app.get("/.well-known/agent.json", tags=["A2A"])
