@@ -2,6 +2,7 @@
 
 import re
 import secrets
+import hashlib
 from datetime import datetime, timedelta
 from typing import AsyncIterator, Optional, Any
 
@@ -72,6 +73,7 @@ from circus.models import (
     DomainSteward,
     DomainShiftSignalRequest,
     DomainShiftSignalResponse,
+    ReShareRequest,
 )
 from circus.services.goal_router import goal_router
 from circus.services.provenance import decay_confidence
@@ -468,6 +470,18 @@ async def publish_memory(
         # Calculate expires_at (90 days from now)
         expires_at = (now + timedelta(days=90)).isoformat()
 
+        # Initialize custody_chain as JSON array with first entry
+        custody_chain = json.dumps([{
+            "agent_id": agent_id,
+            "action": "origin",
+            "ts": now.isoformat(),
+            "input_hash": hashlib.sha256(mem_req.content.encode()).hexdigest()[:12]
+        }])
+
+        # Determine domain_tag for escrow (use first segment of normalized_domain)
+        # E.g., "engineering.code" -> "engineering", "medical" -> "medical"
+        domain_tag = normalized_domain.split('.')[0] if '.' in normalized_domain else normalized_domain
+
         # Insert into shared_memories (use memory-commons room)
         # Retry on ID collision (max 3 attempts)
         for attempt in range(3):
@@ -477,8 +491,8 @@ async def publish_memory(
                         id, room_id, from_agent_id, content, category, domain, tags, provenance,
                         privacy_tier, hop_count, original_author, confidence,
                         age_days, effective_confidence, shared_at, trust_verified, troupe_id,
-                        expires_at, contradiction_count
-                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0, ?, ?, 0)
+                        expires_at, contradiction_count, custody_chain, stake_escrowed
+                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0, ?, ?, 0, ?, 0.0)
                 """, (
                     memory_id,
                     agent_id,
@@ -493,7 +507,8 @@ async def publish_memory(
                     effective_conf,
                     now.isoformat(),
                     troupe_id,
-                    expires_at
+                    expires_at,
+                    custody_chain
                 ))
                 conn.commit()
                 break
@@ -506,6 +521,48 @@ async def publish_memory(
                     raise HTTPException(status_code=409, detail="Memory ID collision (client-supplied), please retry")
                 memory_id = f"shmem-{secrets.token_hex(8)}"
                 continue
+
+        # Compute risk-weighted escrow based on domain difficulty
+        cursor.execute(
+            "SELECT difficulty_score, base_escrow_rate, creator_lock_days, lock_days FROM niche_difficulty_scores WHERE domain_tag = ?",
+            (domain_tag,)
+        )
+        nds_row = cursor.fetchone()
+        if nds_row:
+            difficulty, escrow_rate, creator_lock_days, lock_days = nds_row
+        else:
+            # Default values for unknown domains (use 'general' as fallback)
+            difficulty, escrow_rate, creator_lock_days, lock_days = 0.2, 0.04, 30, 90
+
+        # Escrow = trust_score × base_escrow_rate × difficulty_score
+        escrow_amount = round(trust_score * escrow_rate * difficulty, 4)
+
+        # Lock period: creator gets creator_lock_days
+        creator_unlocks_at = (now + timedelta(days=creator_lock_days)).isoformat()
+
+        # Create escrow lock for publisher (who is also the creator on initial publish)
+        lock_id = f"escrow-{secrets.token_hex(8)}"
+        cursor.execute("""
+            INSERT INTO escrow_locks (id, memory_id, agent_id, role, escrow_amount, locked_at, unlocks_at)
+            VALUES (?, ?, ?, 'creator', ?, ?, ?)
+        """, (lock_id, memory_id, agent_id, escrow_amount, now.isoformat(), creator_unlocks_at))
+
+        # Update stake_escrowed on the memory
+        cursor.execute(
+            "UPDATE shared_memories SET stake_escrowed = ? WHERE id = ?",
+            (escrow_amount, memory_id)
+        )
+
+        # Update observation_count + contradiction_rate on niche (only if domain found in niche_difficulty_scores)
+        if nds_row:
+            cursor.execute("""
+                UPDATE niche_difficulty_scores SET
+                    observation_count = observation_count + 1,
+                    updated_at = ?
+                WHERE domain_tag = ?
+            """, (now.isoformat(), domain_tag))
+
+        conn.commit()
 
         # Corrections: mark superseded memory as inactive
         if (mem_req.category == 'correction'
@@ -621,7 +678,9 @@ async def publish_memory(
             "routed_to": [m['goal_id'] for m in matches],
             "match_scores": [m['match_score'] for m in matches],
             "conflict_resolution": conflict_result,
-            "preference_activated": preference_activated
+            "preference_activated": preference_activated,
+            "escrow_locked": escrow_amount,
+            "escrow_unlocks_at": creator_unlocks_at
         }
 
         # W6: Add decision_trace if available
@@ -1401,6 +1460,65 @@ async def signal_domain_shift(
         )
 
 
+@router.post("/{memory_id}/re-share")
+async def re_share_memory(
+    memory_id: str,
+    request: ReShareRequest,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Re-share an existing memory. Appends to custody_chain.
+    2-hop max: if hop_count >= 2, raises 403 (use signal-shift instead).
+    Vouching stake logged (will be slashed proportionally if memory is later contradicted).
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, custody_chain, hop_count, status FROM shared_memories WHERE id = ?",
+            (memory_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        mem_id, custody_chain_raw, hop_count, status = row
+
+        if status != 'active':
+            raise HTTPException(status_code=403, detail="Cannot re-share quarantined memory")
+
+        if (hop_count or 0) >= 2:
+            raise HTTPException(
+                status_code=403,
+                detail="2-hop max reached. Full liability reattaches to origin. Use /signal-shift for domain corrections."
+            )
+
+        chain = json.loads(custody_chain_raw or '[]')
+        now = datetime.utcnow().isoformat()
+        chain.append({
+            "agent_id": agent_id,
+            "action": "reshare",
+            "ts": now,
+            "vouching_stake": request.vouching_stake,
+            "reason": request.reason
+        })
+
+        cursor.execute("""
+            UPDATE shared_memories
+            SET custody_chain = ?, hop_count = hop_count + 1, stake_escrowed = stake_escrowed + ?
+            WHERE id = ?
+        """, (json.dumps(chain), request.vouching_stake, memory_id))
+        conn.commit()
+
+    return {
+        "memory_id": memory_id,
+        "reshared_by": agent_id,
+        "hop_count": (hop_count or 0) + 1,
+        "custody_chain": chain,
+        "vouching_stake": request.vouching_stake,
+        "reshared_at": now
+    }
+
+
 @router.post("/contradict/{memory_id}")
 async def file_contradiction(
     memory_id: str,
@@ -1410,21 +1528,23 @@ async def file_contradiction(
     """
     File a contradiction against a shared memory.
     Increments contradiction_count. Auto-demotes to 'quarantined' at 3+ contradictions.
+    Round 2 Gap 1: Returns blame_attribution based on custody_chain.
+    Round 2 Gap 4: Penalizes escrow locks at 3+ contradictions.
     Auth required.
     """
     with get_db() as conn:
         cursor = conn.cursor()
 
-        # Verify memory exists and is active
+        # Verify memory exists and read custody chain
         cursor.execute(
-            "SELECT id, contradiction_count, status FROM shared_memories WHERE id = ?",
+            "SELECT id, contradiction_count, status, custody_chain, from_agent_id FROM shared_memories WHERE id = ?",
             (memory_id,)
         )
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Memory not found")
 
-        mem_id, current_count, current_status = row
+        mem_id, current_count, current_status, custody_chain_raw, from_agent_id = row
         new_count = (current_count or 0) + 1
 
         # Auto-demote at 3+ contradictions
@@ -1434,7 +1554,41 @@ async def file_contradiction(
             "UPDATE shared_memories SET contradiction_count = ?, status = ? WHERE id = ?",
             (new_count, new_status, memory_id)
         )
+
+        # Penalize all locked escrows for this memory when contradiction count reaches 3+
+        now_iso = datetime.utcnow().isoformat()
+        if new_count >= 3:
+            cursor.execute("""
+                UPDATE escrow_locks SET
+                    released_at = ?,
+                    release_reason = 'contradiction_penalized'
+                WHERE memory_id = ? AND released_at IS NULL
+            """, (now_iso, memory_id))
+
         conn.commit()
+
+        # Compute blame attribution from custody chain
+        chain = json.loads(custody_chain_raw or '[]') if custody_chain_raw else []
+        blame_attribution = []
+
+        if chain:
+            # Origin agent gets 60% blame
+            origin = chain[0]
+            blame_attribution.append({
+                "agent_id": origin.get("agent_id", from_agent_id),
+                "role": "origin",
+                "blame_pct": 60
+            })
+
+            # Remaining hops split 40% blame
+            if len(chain) > 1:
+                per_hop = 40 // (len(chain) - 1)
+                for hop in chain[1:]:
+                    blame_attribution.append({
+                        "agent_id": hop.get("agent_id", "unknown"),
+                        "role": "resharer",
+                        "blame_pct": per_hop
+                    })
 
     return {
         "memory_id": memory_id,
@@ -1442,4 +1596,49 @@ async def file_contradiction(
         "status": new_status,
         "auto_demoted": new_status == 'quarantined',
         "filed_by": agent_id,
+        "blame_attribution": blame_attribution,
+    }
+
+
+@router.get("/niches/difficulty", tags=["memory-commons"])
+async def list_niche_difficulties(agent_id: str = Depends(verify_token)):
+    """List all niche difficulty scores (risk-weighted escrow tiers)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT domain_tag, difficulty_score, base_escrow_rate, lock_days, creator_lock_days,
+                   observation_count, contradiction_rate, last_calibrated
+            FROM niche_difficulty_scores
+            ORDER BY difficulty_score DESC
+        """)
+        rows = cursor.fetchall()
+    return {"niches": [
+        {"domain_tag": r[0], "difficulty_score": r[1], "base_escrow_rate": r[2],
+         "lock_days": r[3], "creator_lock_days": r[4], "observation_count": r[5],
+         "contradiction_rate": r[6], "last_calibrated": r[7]}
+        for r in rows
+    ]}
+
+
+@router.get("/escrow/agent/{agent_id_param}", tags=["memory-commons"])
+async def agent_escrow_summary(agent_id_param: str, agent_id: str = Depends(verify_token)):
+    """Get total locked and unlocked escrow for an agent."""
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                SUM(CASE WHEN released_at IS NULL AND unlocks_at > ? THEN escrow_amount ELSE 0 END) as locked,
+                SUM(CASE WHEN released_at IS NULL AND unlocks_at <= ? THEN escrow_amount ELSE 0 END) as unlockable,
+                SUM(CASE WHEN release_reason = 'contradiction_penalized' THEN escrow_amount ELSE 0 END) as penalized,
+                COUNT(*) as total_locks
+            FROM escrow_locks WHERE agent_id = ?
+        """, (now, now, agent_id_param))
+        row = cursor.fetchone()
+    return {
+        "agent_id": agent_id_param,
+        "locked_escrow": row[0] or 0.0,
+        "unlockable_escrow": row[1] or 0.0,
+        "penalized_escrow": row[2] or 0.0,
+        "total_locks": row[3] or 0
     }
