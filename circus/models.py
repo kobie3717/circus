@@ -212,6 +212,33 @@ class TaskState(str, Enum):
     CANCELED = "canceled"
 
 
+class NicheTier(str, Enum):
+    """Task niche tier classification."""
+    SANDBOX = "SANDBOX"
+    PRODUCTION = "PRODUCTION"
+    SAFETY_CRITICAL = "SAFETY_CRITICAL"
+
+
+class NicheRegistryEntry(BaseModel):
+    """Task type niche registry entry."""
+    task_type: str
+    tier: NicheTier = NicheTier.SANDBOX
+    min_trust: float = 0.0
+    description: Optional[str] = None
+    requires_human_approval: bool = False
+
+
+class NicheRegistryResponse(BaseModel):
+    """Response for niche registry entry."""
+    task_type: str
+    tier: str
+    min_trust: float
+    description: Optional[str]
+    requires_human_approval: bool
+    completion_count: int
+    created_at: str
+
+
 class TaskSubmitRequest(BaseModel):
     """Submit task to another agent."""
     to_agent_id: str = Field(..., min_length=1)
@@ -480,6 +507,8 @@ class PublishResponseWithConflict(BaseModel):
     conflict_resolution: Optional[ConflictResolution] = None
     preference_activated: Optional[bool] = None  # Week 4: True if preference was admitted to active_preferences
     decision_trace: Optional[dict[str, Any]] = None  # Week 6: Gate-by-gate preference admission trace
+    escrow_locked: Optional[float] = None  # Round 2 Gap 4: Risk-weighted escrow amount
+    escrow_unlocks_at: Optional[str] = None  # Round 2 Gap 4: When escrow unlocks for creator
 
 
 # Domain shift signal models (Gap 1)
@@ -497,6 +526,15 @@ class DomainShiftSignalResponse(BaseModel):
     domain_tag: str
     affected_count: int
     filed_at: str
+
+
+# Re-share model (Round 2 Gap 1)
+
+
+class ReShareRequest(BaseModel):
+    """Request to re-share a memory with vouching stake."""
+    vouching_stake: float = Field(default=0.0, ge=0.0)
+    reason: Optional[str] = Field(default=None, max_length=500)
 
 
 # Task chain validation models (Gap 4)
@@ -534,3 +572,27 @@ class ChainValidationResult(BaseModel):
     chain_valid: bool
     blame: list
     details: list
+
+
+# Risk-weighted knowledge frontiers models (Round 2 Gap 4)
+
+
+class NicheDifficultyScore(BaseModel):
+    """Niche difficulty score for risk-weighted escrow."""
+    domain_tag: str
+    difficulty_score: float = Field(ge=0.0, le=1.0)
+    base_escrow_rate: float = Field(ge=0.0, le=1.0)
+    lock_days: int = 90
+    creator_lock_days: int = 30
+
+
+class EscrowLockInfo(BaseModel):
+    """Escrow lock information."""
+    id: str
+    memory_id: str
+    agent_id: str
+    role: str
+    escrow_amount: float
+    locked_at: str
+    unlocks_at: str
+    released_at: Optional[str] = None

@@ -513,6 +513,12 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v18_migration(db_path)
     # Run v19 migration for Merkle chain validation
     run_v19_migration(db_path)
+    # Run v20 migration for provenance chain-of-custody
+    run_v20_migration(db_path)
+    # Run v21 migration for niche tier classification
+    run_v21_migration(db_path)
+    # Run v22 migration for risk-weighted knowledge frontiers
+    run_v22_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -1369,6 +1375,201 @@ def run_v19_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v19 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v20_migration(db_path: Optional[Path] = None) -> None:
+    """Run v20 migration: Provenance chain-of-custody on shared memories (Round 2 Gap 1)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if custody_chain column already exists
+        cursor.execute("PRAGMA table_info(shared_memories)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        columns_added = []
+
+        # Add custody_chain column if it doesn't exist
+        if 'custody_chain' not in existing_columns:
+            cursor.execute("ALTER TABLE shared_memories ADD COLUMN custody_chain TEXT")
+            columns_added.append('custody_chain')
+
+        # Add stake_escrowed column if it doesn't exist
+        if 'stake_escrowed' not in existing_columns:
+            cursor.execute("ALTER TABLE shared_memories ADD COLUMN stake_escrowed REAL DEFAULT 0.0")
+            columns_added.append('stake_escrowed')
+
+        # Create index on from_agent_id
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sm_from_agent ON shared_memories(from_agent_id)")
+
+        conn.commit()
+        if columns_added:
+            logger.info(f"v20 migration: added columns {columns_added}, created idx_sm_from_agent index")
+        else:
+            logger.debug("v20 migration: columns already exist, created index if needed")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v20 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v21_migration(db_path: Optional[Path] = None) -> None:
+    """Run v21 migration: Niche tier classification for task types (Round 2 Gap 3)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if task_niche_registry table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='task_niche_registry'")
+        if cursor.fetchone():
+            logger.debug("v21 migration: task_niche_registry table already exists, skipping")
+            return
+
+        # Create task_niche_registry table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS task_niche_registry (
+                task_type TEXT PRIMARY KEY,
+                tier TEXT NOT NULL DEFAULT 'SANDBOX',
+                min_trust REAL NOT NULL DEFAULT 0.0,
+                description TEXT,
+                requires_human_approval INTEGER DEFAULT 0,
+                completion_count INTEGER DEFAULT 0,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (tier IN ('SANDBOX', 'PRODUCTION', 'SAFETY_CRITICAL'))
+            )
+        """)
+
+        # Create index on tier
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tnr_tier ON task_niche_registry(tier)")
+
+        # Seed default task types
+        now = datetime.utcnow().isoformat()
+        cursor.execute("""
+            INSERT OR IGNORE INTO task_niche_registry (task_type, tier, min_trust, description, created_by, created_at, updated_at)
+            VALUES
+                ('build', 'PRODUCTION', 40.0, 'Code build tasks', 'circus-system', ?, ?),
+                ('code-review', 'PRODUCTION', 40.0, 'Code review tasks', 'circus-system', ?, ?),
+                ('research', 'SANDBOX', 0.0, 'Research and lookup tasks', 'circus-system', ?, ?),
+                ('notify', 'SANDBOX', 0.0, 'Notification tasks', 'circus-system', ?, ?),
+                ('test-task', 'SANDBOX', 0.0, 'Test tasks', 'circus-system', ?, ?)
+        """, (now, now, now, now, now, now, now, now, now, now))
+
+        # Add niche_tier column to tasks table if it doesn't exist
+        cursor.execute("PRAGMA table_info(tasks)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        if 'niche_tier' not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN niche_tier TEXT DEFAULT 'SANDBOX'")
+            logger.info("v21 migration: added niche_tier column to tasks table")
+
+        conn.commit()
+        logger.info("v21 migration: created task_niche_registry table with seed data")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v21 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v22_migration(db_path: Optional[Path] = None) -> None:
+    """Run v22 migration: Risk-weighted knowledge frontiers (Round 2 Gap 4)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if niche_difficulty_scores table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='niche_difficulty_scores'")
+        if cursor.fetchone():
+            logger.debug("v22 migration: niche_difficulty_scores table already exists, skipping")
+            return
+
+        # Create niche_difficulty_scores table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS niche_difficulty_scores (
+                domain_tag TEXT PRIMARY KEY,
+                difficulty_score REAL NOT NULL DEFAULT 0.1,
+                base_escrow_rate REAL NOT NULL DEFAULT 0.05,
+                lock_days INTEGER NOT NULL DEFAULT 90,
+                creator_lock_days INTEGER NOT NULL DEFAULT 30,
+                observation_count INTEGER DEFAULT 0,
+                contradiction_rate REAL DEFAULT 0.0,
+                last_calibrated TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        # Create index on difficulty_score
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_nds_score ON niche_difficulty_scores(difficulty_score DESC)")
+
+        # Seed default difficulty scores for known domains
+        now = datetime.utcnow().isoformat()
+        cursor.execute("""
+            INSERT OR IGNORE INTO niche_difficulty_scores
+                (domain_tag, difficulty_score, base_escrow_rate, lock_days, creator_lock_days, created_at, updated_at)
+            VALUES
+                ('medical', 0.9, 0.20, 90, 30, ?, ?),
+                ('legal', 0.85, 0.18, 90, 30, ?, ?),
+                ('financial', 0.80, 0.16, 90, 30, ?, ?),
+                ('security', 0.75, 0.15, 90, 30, ?, ?),
+                ('engineering', 0.55, 0.10, 90, 30, ?, ?),
+                ('research', 0.40, 0.07, 90, 30, ?, ?),
+                ('general', 0.20, 0.04, 90, 30, ?, ?),
+                ('trivia', 0.05, 0.01, 90, 30, ?, ?)
+        """, (now, now, now, now, now, now, now, now, now, now, now, now, now, now, now, now))
+
+        # Create escrow_locks table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS escrow_locks (
+                id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'publisher',
+                escrow_amount REAL NOT NULL DEFAULT 0.0,
+                locked_at TEXT NOT NULL,
+                unlocks_at TEXT NOT NULL,
+                released_at TEXT,
+                release_reason TEXT,
+                FOREIGN KEY (memory_id) REFERENCES shared_memories(id)
+            )
+        """)
+
+        # Create indexes for escrow_locks
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_el_agent ON escrow_locks(agent_id, released_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_el_memory ON escrow_locks(memory_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_el_unlocks ON escrow_locks(unlocks_at)")
+
+        conn.commit()
+        logger.info("v22 migration: created niche_difficulty_scores and escrow_locks tables with seed data")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v22 migration failed: %s", e)
         raise
     finally:
         conn.close()

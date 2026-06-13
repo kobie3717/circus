@@ -27,6 +27,9 @@ from circus.models import (
     ChainNodeResponse,
     ChainNodeSubmit,
     ChainValidationResult,
+    NicheTier,
+    NicheRegistryEntry,
+    NicheRegistryResponse,
     TaskResponse,
     TaskState,
     TaskStateTransition,
@@ -55,6 +58,22 @@ async def broadcast_task(
         cursor = conn.cursor()
         now = datetime.utcnow().isoformat()
 
+        # Look up niche tier for this task_type
+        cursor.execute(
+            "SELECT tier, min_trust, requires_human_approval FROM task_niche_registry WHERE task_type = ?",
+            (request.task_type,)
+        )
+        niche_row = cursor.fetchone()
+        niche_tier = niche_row[0] if niche_row else 'SANDBOX'
+        min_trust_required = niche_row[1] if niche_row else 0.0
+        requires_approval = bool(niche_row[2]) if niche_row else False
+
+        if requires_approval:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Task type '{request.task_type}' is SAFETY_CRITICAL — requires human approval via /tasks/niches/{request.task_type}/approve"
+            )
+
         if request.domain:
             # Score = trust_score × competence_score for given domain
             cursor.execute("""
@@ -67,22 +86,23 @@ async def broadcast_task(
                     ON ac.agent_id = a.id AND ac.domain = ?
                 WHERE a.is_active = 1
                   AND a.id != ?
+                  AND a.trust_score >= ?
                 ORDER BY (a.trust_score * COALESCE(ac.score, 0.1)) DESC,
                          a.last_seen DESC
                 LIMIT 5
-            """, (request.domain, agent_id))
+            """, (request.domain, agent_id, min_trust_required))
         else:
             cursor.execute("""
                 SELECT a.id, a.trust_score, 0.5 AS comp_score, 0 AS obs, a.last_seen
                 FROM agents a
-                WHERE a.is_active = 1 AND a.id != ?
+                WHERE a.is_active = 1 AND a.id != ? AND a.trust_score >= ?
                 ORDER BY a.trust_score DESC, a.last_seen DESC
                 LIMIT 5
-            """, (agent_id,))
+            """, (agent_id, min_trust_required))
 
         candidates = cursor.fetchall()
         if not candidates:
-            raise HTTPException(status_code=404, detail="No eligible agents available")
+            raise HTTPException(status_code=404, detail=f"No eligible agents available (min_trust={min_trust_required})")
 
         winner = candidates[0]
         winner_id = winner[0]
@@ -391,6 +411,60 @@ async def get_outbox(
             ))
 
         return tasks
+
+
+@router.get("/niches", tags=["niches"])
+async def list_niches(agent_id: str = Depends(verify_token)):
+    """List all registered task type niches."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT task_type, tier, min_trust, description, requires_human_approval, completion_count, created_at FROM task_niche_registry ORDER BY tier, task_type")
+        rows = cursor.fetchall()
+    return {"niches": [
+        {"task_type": r[0], "tier": r[1], "min_trust": r[2], "description": r[3],
+         "requires_human_approval": bool(r[4]), "completion_count": r[5], "created_at": r[6]}
+        for r in rows
+    ]}
+
+
+@router.post("/niches", tags=["niches"], status_code=201)
+async def register_niche(
+    entry: NicheRegistryEntry,
+    agent_id: str = Depends(verify_token)
+):
+    """Register or update a task type niche tier."""
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO task_niche_registry (task_type, tier, min_trust, description, requires_human_approval, completion_count, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+            ON CONFLICT(task_type) DO UPDATE SET
+                tier = excluded.tier,
+                min_trust = excluded.min_trust,
+                description = excluded.description,
+                requires_human_approval = excluded.requires_human_approval,
+                updated_at = excluded.updated_at
+        """, (entry.task_type, entry.tier.value, entry.min_trust, entry.description,
+              1 if entry.requires_human_approval else 0, agent_id, now, now))
+        conn.commit()
+    return {"task_type": entry.task_type, "tier": entry.tier.value, "registered_at": now}
+
+
+@router.get("/niches/{task_type}", tags=["niches"])
+async def get_niche(task_type: str, agent_id: str = Depends(verify_token)):
+    """Get tier info for a specific task type."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT task_type, tier, min_trust, description, requires_human_approval, completion_count, created_at FROM task_niche_registry WHERE task_type = ?",
+            (task_type,)
+        )
+        row = cursor.fetchone()
+    if not row:
+        return {"task_type": task_type, "tier": "SANDBOX", "min_trust": 0.0, "note": "unregistered — defaults to SANDBOX"}
+    return {"task_type": row[0], "tier": row[1], "min_trust": row[2], "description": row[3],
+            "requires_human_approval": bool(row[4]), "completion_count": row[5], "created_at": row[6]}
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
