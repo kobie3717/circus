@@ -527,6 +527,10 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v25_migration(db_path)
     # Run v26 migration for trajectory-weighted mutual aid pools
     run_v26_migration(db_path)
+    # Run v27 migration for agent_vouches table
+    run_v27_migration(db_path)
+    # Run v28 migration for vouch chain columns
+    run_v28_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -1825,6 +1829,153 @@ def run_v26_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v26 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v27_migration(db_path: Optional[Path] = None) -> None:
+    """Run v27 migration: agent_vouches table for ai-mesh trust scaffolding."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if agent_vouches table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='agent_vouches'")
+        if cursor.fetchone():
+            logger.debug("v27 migration: agent_vouches table already exists, skipping")
+            return
+
+        # Create agent_vouches table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_vouches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                voucher_id TEXT NOT NULL,
+                vouchee_id TEXT NOT NULL,
+                vouch_date TEXT NOT NULL,
+                liability_pct REAL DEFAULT 100.0,
+                status TEXT DEFAULT 'active',
+                note TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(voucher_id, vouchee_id),
+                FOREIGN KEY (voucher_id) REFERENCES agents(id) ON DELETE CASCADE,
+                FOREIGN KEY (vouchee_id) REFERENCES agents(id) ON DELETE CASCADE
+            )
+        """)
+
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_vouches_voucher ON agent_vouches(voucher_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_vouches_vouchee ON agent_vouches(vouchee_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_vouches_status ON agent_vouches(status)")
+
+        conn.commit()
+        logger.info("v27 migration: created agent_vouches table")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v27 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v28_migration(db_path: Optional[Path] = None) -> None:
+    """Run v28 migration: Add vouch chain columns to agents table."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if columns already exist
+        cursor.execute("PRAGMA table_info(agents)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        columns_added = []
+
+        # Add sponsor_id column if it doesn't exist
+        if 'sponsor_id' not in existing_columns:
+            cursor.execute("ALTER TABLE agents ADD COLUMN sponsor_id TEXT REFERENCES agents(id)")
+            columns_added.append('sponsor_id')
+
+        # Add vouch_depth column if it doesn't exist
+        if 'vouch_depth' not in existing_columns:
+            cursor.execute("ALTER TABLE agents ADD COLUMN vouch_depth INTEGER DEFAULT 0")
+            columns_added.append('vouch_depth')
+
+        # Add ancestry_chain column if it doesn't exist
+        if 'ancestry_chain' not in existing_columns:
+            cursor.execute("ALTER TABLE agents ADD COLUMN ancestry_chain TEXT")
+            columns_added.append('ancestry_chain')
+
+        # Create index on sponsor_id
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agents_sponsor ON agents(sponsor_id)")
+
+        conn.commit()
+        if columns_added:
+            logger.info(f"v28 migration: added columns {columns_added} to agents table")
+        else:
+            logger.debug("v28 migration: vouch chain columns already exist, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v28 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def decay_vouch_liability(db_path: Optional[Path] = None) -> None:
+    """Decay vouch liability from 100% -> 10% over 90 days (linear).
+
+    Called by periodic background job to update all active vouches.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Fetch all active vouches
+        cursor.execute("""
+            SELECT id, vouch_date FROM agent_vouches WHERE status = 'active'
+        """)
+        vouches = cursor.fetchall()
+
+        now = datetime.utcnow()
+        updated_count = 0
+
+        for vouch in vouches:
+            vouch_id = vouch[0]
+            vouch_date = datetime.fromisoformat(vouch[1])
+            days_since_vouch = (now - vouch_date).days
+
+            # Linear decay: 100 -> 10 over 90 days
+            # Formula: liability_pct = max(10.0, 100.0 - (days_since_vouch / 90.0) * 90.0)
+            # Simplifies to: max(10.0, 100.0 - days_since_vouch)
+            new_liability = max(10.0, 100.0 - days_since_vouch)
+
+            # Update liability_pct
+            cursor.execute("""
+                UPDATE agent_vouches SET liability_pct = ? WHERE id = ?
+            """, (new_liability, vouch_id))
+            updated_count += 1
+
+        conn.commit()
+        if updated_count > 0:
+            logger.info(f"Vouch liability decay: updated {updated_count} active vouches")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Vouch liability decay failed: {e}")
         raise
     finally:
         conn.close()
