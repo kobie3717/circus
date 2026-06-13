@@ -73,6 +73,39 @@ class VouchRequest(BaseModel):
     note: Optional[str] = None
 
 
+class MeshVouchRequest(BaseModel):
+    """Mesh vouch request (ai-mesh trust scaffolding)."""
+    voucher_id: str = Field(..., min_length=1)
+    vouchee_id: str = Field(..., min_length=1)
+    note: Optional[str] = None
+
+
+class VouchRevokeRequest(BaseModel):
+    """Vouch revoke request."""
+    voucher_id: str = Field(..., min_length=1)
+    vouchee_id: str = Field(..., min_length=1)
+
+
+class VouchRecord(BaseModel):
+    """Vouch record."""
+    id: int
+    voucher_id: str
+    vouchee_id: str
+    vouch_date: str
+    liability_pct: float
+    status: str
+    note: Optional[str]
+    created_at: str
+
+
+class VouchTree(BaseModel):
+    """Vouch tree (ancestry chain)."""
+    agent_id: str
+    sponsor_id: Optional[str]
+    vouch_depth: int
+    ancestry: list[dict[str, Any]]
+
+
 # Competence models
 
 class DomainCompetence(BaseModel):

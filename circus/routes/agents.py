@@ -34,6 +34,10 @@ from circus.models import (
     PassportRefreshResponse,
     VouchRequest,
     VouchResponse,
+    MeshVouchRequest,
+    VouchRevokeRequest,
+    VouchRecord,
+    VouchTree,
 )
 from circus.passport import calculate_passport_hash
 from circus.trust import calculate_trust_score, calculate_trust_delta, can_vouch, get_trust_tier
@@ -1058,3 +1062,364 @@ async def get_boot_briefing():
         agents=agents,
         generated_at=briefing_data["generated_at"]
     )
+
+
+# AI-Mesh Trust Scaffolding (Phase 1)
+
+
+@router.post("/vouch", response_model=VouchRecord)
+async def create_vouch(
+    request: MeshVouchRequest,
+    current_agent_id: str = Depends(verify_token)
+):
+    """
+    Create a vouch relationship (ai-mesh trust scaffolding).
+
+    Voucher must be Established+ trust tier. Vouchee gets added to voucher's ancestry chain.
+    Voucher pays 2.0 trust points (skin in game, floored at 10.0).
+    """
+    # Validate voucher is the current agent (only vouch as yourself)
+    if request.voucher_id != current_agent_id:
+        raise HTTPException(status_code=403, detail="Can only vouch as yourself")
+
+    # Validate not vouching for self
+    if request.voucher_id == request.vouchee_id:
+        raise HTTPException(status_code=400, detail="Cannot vouch for yourself")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get voucher agent
+        cursor.execute("""
+            SELECT trust_tier, trust_score, vouch_depth, ancestry_chain
+            FROM agents WHERE id = ?
+        """, (request.voucher_id,))
+        voucher_row = cursor.fetchone()
+        if not voucher_row:
+            raise HTTPException(status_code=404, detail="Voucher not found")
+
+        # Validate voucher trust tier (must be Established, Trusted, or Elder)
+        voucher_tier = voucher_row["trust_tier"]
+        if voucher_tier not in ("Established", "Trusted", "Elder"):
+            raise HTTPException(
+                status_code=403,
+                detail="Voucher must be Established, Trusted, or Elder tier"
+            )
+
+        voucher_trust = voucher_row["trust_score"]
+        voucher_depth = voucher_row["vouch_depth"]
+        voucher_ancestry = voucher_row["ancestry_chain"]
+
+        # Validate vouch depth limit (prevent infinite chains)
+        if voucher_depth >= 5:
+            raise HTTPException(
+                status_code=403,
+                detail="Vouch depth limit reached (max 5 hops from root)"
+            )
+
+        # Get vouchee agent
+        cursor.execute("SELECT id FROM agents WHERE id = ?", (request.vouchee_id,))
+        vouchee_row = cursor.fetchone()
+        if not vouchee_row:
+            raise HTTPException(status_code=404, detail="Vouchee not found")
+
+        # Check if vouch already exists
+        cursor.execute("""
+            SELECT id FROM agent_vouches
+            WHERE voucher_id = ? AND vouchee_id = ?
+        """, (request.voucher_id, request.vouchee_id))
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="Vouch already exists")
+
+        now = datetime.utcnow().isoformat()
+
+        # Insert vouch record
+        cursor.execute("""
+            INSERT INTO agent_vouches (
+                voucher_id, vouchee_id, vouch_date,
+                liability_pct, status, note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            request.voucher_id, request.vouchee_id, now,
+            100.0, 'active', request.note, now
+        ))
+        vouch_id = cursor.lastrowid
+
+        # Build new ancestry chain for vouchee
+        # Parse voucher's ancestry_chain (JSON array or None)
+        if voucher_ancestry:
+            try:
+                ancestry_list = json.loads(voucher_ancestry)
+            except json.JSONDecodeError:
+                ancestry_list = []
+        else:
+            ancestry_list = []
+
+        # Append voucher to ancestry
+        new_ancestry = ancestry_list + [request.voucher_id]
+        new_ancestry_json = json.dumps(new_ancestry)
+
+        # Update vouchee: sponsor_id, vouch_depth, ancestry_chain
+        new_vouch_depth = voucher_depth + 1
+        cursor.execute("""
+            UPDATE agents
+            SET sponsor_id = ?, vouch_depth = ?, ancestry_chain = ?
+            WHERE id = ?
+        """, (request.voucher_id, new_vouch_depth, new_ancestry_json, request.vouchee_id))
+
+        # Deduct 2.0 trust from voucher (skin in game), floored at 10.0
+        new_voucher_trust = max(10.0, voucher_trust - 2.0)
+        new_voucher_tier = get_trust_tier(new_voucher_trust)
+        cursor.execute("""
+            UPDATE agents SET trust_score = ?, trust_tier = ? WHERE id = ?
+        """, (new_voucher_trust, new_voucher_tier, request.voucher_id))
+
+        # Log trust event
+        cursor.execute("""
+            INSERT INTO trust_events (agent_id, event_type, delta, reason, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            request.voucher_id, "mesh_vouch_given", -2.0,
+            f"Vouched for {request.vouchee_id} (ai-mesh)", now
+        ))
+
+        conn.commit()
+
+    # Fetch the created vouch record to return
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, voucher_id, vouchee_id, vouch_date,
+                   liability_pct, status, note, created_at
+            FROM agent_vouches WHERE id = ?
+        """, (vouch_id,))
+        row = cursor.fetchone()
+
+    return VouchRecord(
+        id=row["id"],
+        voucher_id=row["voucher_id"],
+        vouchee_id=row["vouchee_id"],
+        vouch_date=row["vouch_date"],
+        liability_pct=row["liability_pct"],
+        status=row["status"],
+        note=row["note"],
+        created_at=row["created_at"]
+    )
+
+
+@router.get("/{agent_id}/vouch-tree", response_model=VouchTree)
+async def get_vouch_tree(agent_id: str):
+    """
+    Get the full ancestry chain for an agent.
+
+    Returns sponsor_id, vouch_depth, and full ancestry with trust scores and liability.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get agent
+        cursor.execute("""
+            SELECT id, sponsor_id, vouch_depth, ancestry_chain
+            FROM agents WHERE id = ?
+        """, (agent_id,))
+        agent_row = cursor.fetchone()
+        if not agent_row:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        sponsor_id = agent_row["sponsor_id"]
+        vouch_depth = agent_row["vouch_depth"]
+        ancestry_chain_json = agent_row["ancestry_chain"]
+
+        # Parse ancestry chain
+        if ancestry_chain_json:
+            try:
+                ancestry_ids = json.loads(ancestry_chain_json)
+            except json.JSONDecodeError:
+                ancestry_ids = []
+        else:
+            ancestry_ids = []
+
+        # Build ancestry with details
+        ancestry = []
+        for ancestor_id in ancestry_ids:
+            # Get ancestor agent details
+            cursor.execute("""
+                SELECT id, name, trust_score, trust_tier
+                FROM agents WHERE id = ?
+            """, (ancestor_id,))
+            ancestor_row = cursor.fetchone()
+            if not ancestor_row:
+                continue
+
+            # Get vouch details (liability_pct, vouch_date)
+            # Find the vouch where this ancestor vouched for someone in the chain
+            # Since ancestry is ordered, we need to find the vouch from this ancestor to the next in chain
+            # For the last ancestor in chain, they vouched for the agent itself
+            if ancestry_ids[-1] == ancestor_id:
+                # This ancestor vouched for the agent
+                vouchee_for_liability = agent_id
+            else:
+                # This ancestor vouched for the next in chain
+                ancestor_index = ancestry_ids.index(ancestor_id)
+                if ancestor_index + 1 < len(ancestry_ids):
+                    # Vouched for next ancestor
+                    vouchee_for_liability = ancestry_ids[ancestor_index + 1]
+                else:
+                    # Vouched for agent
+                    vouchee_for_liability = agent_id
+
+            cursor.execute("""
+                SELECT vouch_date, liability_pct
+                FROM agent_vouches
+                WHERE voucher_id = ? AND vouchee_id = ?
+            """, (ancestor_id, vouchee_for_liability))
+            vouch_row = cursor.fetchone()
+
+            if vouch_row:
+                vouch_date = vouch_row["vouch_date"]
+                liability_pct = vouch_row["liability_pct"]
+            else:
+                vouch_date = None
+                liability_pct = 0.0
+
+            ancestry.append({
+                "agent_id": ancestor_row["id"],
+                "name": ancestor_row["name"],
+                "trust_score": ancestor_row["trust_score"],
+                "trust_tier": ancestor_row["trust_tier"],
+                "vouch_date": vouch_date,
+                "liability_pct": liability_pct
+            })
+
+    return VouchTree(
+        agent_id=agent_id,
+        sponsor_id=sponsor_id,
+        vouch_depth=vouch_depth,
+        ancestry=ancestry
+    )
+
+
+@router.get("/{agent_id}/vouches-given")
+async def get_vouches_given(agent_id: str):
+    """
+    Get all agents this agent has vouched for.
+
+    Returns vouchee details, current liability_pct, and vouchee trust_score.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get agent to verify existence
+        cursor.execute("SELECT id FROM agents WHERE id = ?", (agent_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        # Get all vouches given by this agent
+        cursor.execute("""
+            SELECT v.id, v.voucher_id, v.vouchee_id, v.vouch_date,
+                   v.liability_pct, v.status, v.note, v.created_at,
+                   a.name, a.trust_score, a.trust_tier
+            FROM agent_vouches v
+            JOIN agents a ON v.vouchee_id = a.id
+            WHERE v.voucher_id = ?
+            ORDER BY v.created_at DESC
+        """, (agent_id,))
+
+        vouches = []
+        for row in cursor.fetchall():
+            vouches.append({
+                "vouch_id": row["id"],
+                "vouchee_id": row["vouchee_id"],
+                "vouchee_name": row["name"],
+                "vouchee_trust_score": row["trust_score"],
+                "vouchee_trust_tier": row["trust_tier"],
+                "vouch_date": row["vouch_date"],
+                "liability_pct": row["liability_pct"],
+                "status": row["status"],
+                "note": row["note"],
+                "created_at": row["created_at"]
+            })
+
+    return {
+        "agent_id": agent_id,
+        "vouches_given": vouches,
+        "count": len(vouches)
+    }
+
+
+@router.post("/vouch/revoke")
+async def revoke_vouch(
+    request: VouchRevokeRequest,
+    current_agent_id: str = Depends(verify_token)
+):
+    """
+    Revoke a vouch.
+
+    Sets vouch status to 'revoked'. Restores 1.0 trust to voucher (partial penalty).
+    Does NOT change vouchee's ancestry_chain (history preserved).
+    """
+    # Validate voucher is the current agent
+    if request.voucher_id != current_agent_id:
+        raise HTTPException(status_code=403, detail="Can only revoke your own vouches")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get the vouch
+        cursor.execute("""
+            SELECT id, status FROM agent_vouches
+            WHERE voucher_id = ? AND vouchee_id = ?
+        """, (request.voucher_id, request.vouchee_id))
+        vouch_row = cursor.fetchone()
+        if not vouch_row:
+            raise HTTPException(status_code=404, detail="Vouch not found")
+
+        vouch_id = vouch_row["id"]
+        vouch_status = vouch_row["status"]
+
+        # Validate vouch is active
+        if vouch_status != 'active':
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot revoke vouch with status '{vouch_status}' (must be active)"
+            )
+
+        # Set vouch status to 'revoked'
+        cursor.execute("""
+            UPDATE agent_vouches SET status = 'revoked' WHERE id = ?
+        """, (vouch_id,))
+
+        # Restore 1.0 trust to voucher (partial penalty for revoking)
+        cursor.execute("""
+            SELECT trust_score FROM agents WHERE id = ?
+        """, (request.voucher_id,))
+        voucher_row = cursor.fetchone()
+        if not voucher_row:
+            raise HTTPException(status_code=404, detail="Voucher not found")
+
+        voucher_trust = voucher_row["trust_score"]
+        new_voucher_trust = min(100.0, voucher_trust + 1.0)
+        new_voucher_tier = get_trust_tier(new_voucher_trust)
+
+        cursor.execute("""
+            UPDATE agents SET trust_score = ?, trust_tier = ? WHERE id = ?
+        """, (new_voucher_trust, new_voucher_tier, request.voucher_id))
+
+        # Log trust event
+        now = datetime.utcnow().isoformat()
+        cursor.execute("""
+            INSERT INTO trust_events (agent_id, event_type, delta, reason, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            request.voucher_id, "mesh_vouch_revoked", 1.0,
+            f"Revoked vouch for {request.vouchee_id} (ai-mesh)", now
+        ))
+
+        conn.commit()
+
+    return {
+        "status": "revoked",
+        "voucher_id": request.voucher_id,
+        "vouchee_id": request.vouchee_id,
+        "trust_restored": 1.0
+    }
