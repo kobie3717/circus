@@ -525,6 +525,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v24_migration(db_path)
     # Run v25 migration for stake-driven task compression
     run_v25_migration(db_path)
+    # Run v26 migration for trajectory-weighted mutual aid pools
+    run_v26_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -1736,6 +1738,93 @@ def run_v25_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v25 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v26_migration(db_path: Optional[Path] = None) -> None:
+    """Run v26 migration: Trajectory-weighted mutual aid pools (Round 3 Gap 3)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if mutual_aid_pools table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mutual_aid_pools'")
+        if cursor.fetchone():
+            logger.debug("v26 migration: mutual_aid_pools table already exists, skipping")
+            return
+
+        # Create mutual_aid_pools table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS mutual_aid_pools (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                total_contributed REAL DEFAULT 0.0,
+                total_disbursed REAL DEFAULT 0.0,
+                balance REAL DEFAULT 0.0,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        # Create pool_contributions table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pool_contributions (
+                id TEXT PRIMARY KEY,
+                pool_id TEXT NOT NULL,
+                contributor_agent_id TEXT NOT NULL,
+                amount REAL NOT NULL,
+                contributed_at TEXT NOT NULL,
+                FOREIGN KEY (pool_id) REFERENCES mutual_aid_pools(id)
+            )
+        """)
+
+        # Create agent_trust_snapshots table for trajectory tracking
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_trust_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                trust_score REAL NOT NULL,
+                snapped_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ats_agent ON agent_trust_snapshots(agent_id, snapped_at)")
+
+        # Create pool_payouts table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pool_payouts (
+                id TEXT PRIMARY KEY,
+                pool_id TEXT NOT NULL,
+                recipient_agent_id TEXT NOT NULL,
+                amount REAL NOT NULL,
+                trust_slope REAL NOT NULL,
+                niche_diversity REAL NOT NULL,
+                paid_at TEXT NOT NULL,
+                FOREIGN KEY (pool_id) REFERENCES mutual_aid_pools(id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pp_recipient ON pool_payouts(recipient_agent_id, paid_at)")
+
+        # Seed default pool
+        now = datetime.utcnow().isoformat()
+        cursor.execute("""
+            INSERT OR IGNORE INTO mutual_aid_pools (id, name, description, total_contributed, total_disbursed, balance, created_by, created_at, updated_at)
+            VALUES ('default-pool', 'Circus Bootstrap Pool', 'Auto-funded pool for high-velocity new agents', 0.0, 0.0, 0.0, 'circus-system', ?, ?)
+        """, (now, now))
+
+        conn.commit()
+        logger.info("v26 migration: created mutual_aid_pools, pool_contributions, agent_trust_snapshots, pool_payouts tables + seed data")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v26 migration failed: %s", e)
         raise
     finally:
         conn.close()

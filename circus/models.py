@@ -659,3 +659,27 @@ class BackingResolveResponse(BaseModel):
     stakes_resolved: int
     total_yield_earned: float
     total_forfeited: float
+
+
+# Trajectory-weighted mutual aid pool models (Round 3 Gap 3)
+
+
+class PoolContributionRequest(BaseModel):
+    """Request to contribute to a mutual aid pool."""
+    pool_id: str = "default-pool"
+    amount: float = Field(gt=0, le=100.0)
+
+
+class PoolPayoutRequest(BaseModel):
+    """Request payout from a mutual aid pool."""
+    pool_id: str = "default-pool"
+    recipient_agent_id: str
+
+
+class PoolSummary(BaseModel):
+    """Mutual aid pool summary."""
+    id: str
+    name: str
+    balance: float
+    total_contributed: float
+    total_disbursed: float
