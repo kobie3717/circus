@@ -142,13 +142,24 @@ async def lifespan(app: FastAPI):
     from circus.services.federation_worker import run_federation_worker
     federation_task = asyncio.create_task(run_federation_worker())
 
+    # Start webhook delivery worker (Phase 6)
+    from circus.webhook_worker import start_webhook_worker
+    webhook_task = asyncio.create_task(start_webhook_worker())
+
+    # Start scheduler (memory consolidation + escrow auto-release)
+    from circus.scheduler import start_scheduler
+    scheduler_tasks = await start_scheduler(str(settings.database_path))
+
     yield
 
     # Shutdown
     trust_task.cancel()
     liveness_task.cancel()
     federation_task.cancel()
-    for task in [trust_task, liveness_task, federation_task]:
+    webhook_task.cancel()
+    for t in scheduler_tasks:
+        t.cancel()
+    for task in [trust_task, liveness_task, federation_task, webhook_task] + scheduler_tasks:
         try:
             await task
         except asyncio.CancelledError:

@@ -8,11 +8,13 @@ from typing import Optional, List
 import uuid
 from datetime import datetime
 import sqlite3
+import json
 
 from circus.database import get_db
 from circus.memory_engine import (
     triage_importance, extract_atomic_claims, check_near_duplicate,
-    reinforce_claim, contradict_claim, run_consolidation, recall_claims
+    reinforce_claim, contradict_claim, run_consolidation, recall_claims,
+    generate_embedding
 )
 
 router = APIRouter(prefix="/api/v1/memory", tags=["memory-v2"])
@@ -80,20 +82,24 @@ def publish_claims(req: PublishClaimRequest):
                 reinforced.append(dup_id)
                 continue
 
+            # Generate embedding for claim
+            embedding = generate_embedding(claim['claim_text'])
+            embedding_json = json.dumps(embedding) if embedding else None
+
             # Insert new claim
             conn.execute(
                 """INSERT INTO memory_claims
                    (id, namespace_id, agent_id, claim_text, subject, claim_type,
                     importance, confidence, status, source, episode_id,
-                    created_at, last_accessed, access_count, decay_rate)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    created_at, last_accessed, access_count, decay_rate, embedding)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     claim['id'], claim['namespace_id'], claim['agent_id'],
                     claim['claim_text'], claim['subject'], claim['claim_type'],
                     claim['importance'], claim['confidence'], claim['status'],
                     claim['source'], claim['episode_id'],
                     claim['created_at'], claim['last_accessed'],
-                    claim['access_count'], claim['decay_rate'],
+                    claim['access_count'], claim['decay_rate'], embedding_json,
                 )
             )
             conn.commit()

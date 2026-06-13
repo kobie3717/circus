@@ -547,6 +547,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v35_migration(db_path)
     # Run v36 migration for webhooks + observer_mode + platform economics (Phase 6: The Standard)
     run_v36_migration(db_path)
+    # Run v37 migration for memory claim embeddings (semantic search)
+    run_v37_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -2403,7 +2405,10 @@ def run_v36_migration(db_path: Optional[Path] = None) -> None:
                 payload TEXT NOT NULL,
                 status TEXT DEFAULT 'pending',
                 response_status INTEGER,
+                attempt_count INTEGER DEFAULT 0,
+                last_error TEXT,
                 attempted_at TEXT,
+                delivered_at TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (subscription_id) REFERENCES webhook_subscriptions(id)
             )
@@ -2461,6 +2466,38 @@ def run_v36_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v36 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v37_migration(db_path: Optional[Path] = None) -> None:
+    """Run v37 migration: Add embedding column to memory_claims for semantic search."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if embedding column already exists
+        cursor.execute("PRAGMA table_info(memory_claims)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        if 'embedding' not in existing_columns:
+            # Add embedding column (stores JSON array as TEXT)
+            cursor.execute("ALTER TABLE memory_claims ADD COLUMN embedding TEXT")
+            # Create index for future optimization
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_claims_embedding ON memory_claims(embedding) WHERE embedding IS NOT NULL")
+            conn.commit()
+            logger.info("v37 migration: added embedding column to memory_claims table")
+        else:
+            logger.debug("v37 migration: embedding column already exists, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v37 migration failed: %s", e)
         raise
     finally:
         conn.close()

@@ -7,7 +7,7 @@ import math
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 
 # Half-lives in days per claim type
 HALF_LIFE_DAYS = {'episodic': 14, 'semantic': 180, 'procedural': 365, 'identity': 3650}
@@ -17,6 +17,54 @@ DUP_THRESHOLD = 0.92  # cosine similarity for near-duplicate detection
 MIN_SCORE = 0.35  # recall gate
 MIN_CONFIDENCE = 0.25  # minimum confidence to surface
 IMPORTANCE_FLOOR = 0.30  # below this = leave in episodic only
+
+# Embedding model singleton (lazy-loaded)
+_embedding_model = None
+
+
+def get_embedding_model():
+    """Lazy-load sentence-transformers model for semantic embeddings."""
+    global _embedding_model
+    if _embedding_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            # Use all-MiniLM-L6-v2: small (80MB), fast, good quality
+            _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        except ImportError:
+            # Fallback: no embeddings if library not available
+            _embedding_model = False
+    return _embedding_model if _embedding_model is not False else None
+
+
+def generate_embedding(text: str) -> Optional[List[float]]:
+    """
+    Generate semantic embedding for text using sentence-transformers.
+    Returns 384-dimensional vector (all-MiniLM-L6-v2) or None if model unavailable.
+    """
+    model = get_embedding_model()
+    if model is None:
+        return None
+
+    try:
+        embedding = model.encode(text, convert_to_numpy=True)
+        return embedding.tolist()
+    except Exception:
+        return None
+
+
+def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+
+    dot_product = sum(a * b for a, b in zip(vec_a, vec_b))
+    magnitude_a = math.sqrt(sum(a * a for a in vec_a))
+    magnitude_b = math.sqrt(sum(b * b for b in vec_b))
+
+    if magnitude_a == 0 or magnitude_b == 0:
+        return 0.0
+
+    return dot_product / (magnitude_a * magnitude_b)
 
 
 def compute_decay_rate(claim_type: str) -> float:
@@ -313,18 +361,21 @@ def recall_claims(
     min_confidence: float = MIN_CONFIDENCE,
 ) -> list[dict]:
     """
-    4-channel hybrid recall (lexical + temporal; vector + graph deferred until embeddings added).
-    Returns top claims ranked by final_score.
+    4-channel hybrid recall: semantic (vector) + lexical (BM25/FTS) + subject + temporal.
+    Returns top claims ranked by final_score with cosine similarity.
     """
     cursor = conn.cursor()
     now = datetime.utcnow()
     candidates = {}
 
+    # Generate query embedding for semantic search
+    query_embedding = generate_embedding(query)
+
     # Channel 1: FTS lexical (BM25)
     try:
         fts_rows = cursor.execute(
             """SELECT mc.id, mc.claim_text, mc.subject, mc.confidence, mc.importance,
-                      mc.last_accessed, mc.claim_type, mc.namespace_id, mc.agent_id, mc.status
+                      mc.last_accessed, mc.claim_type, mc.namespace_id, mc.agent_id, mc.status, mc.embedding
                FROM fts_memory_claims fts
                JOIN memory_claims mc ON mc.rowid = fts.rowid
                WHERE fts_memory_claims MATCH ? AND mc.status IN ('candidate', 'active')
@@ -333,7 +384,7 @@ def recall_claims(
             (query, min_confidence)
         ).fetchall()
         for row in fts_rows:
-            candidates[row[0]] = row + (0.6,)  # bm25_norm proxy
+            candidates[row[0]] = tuple(row) + (0.6,)  # Convert Row to tuple, add bm25_norm
     except Exception:
         pass
 
@@ -343,7 +394,7 @@ def recall_claims(
         for word in words[:3]:
             subj_rows = cursor.execute(
                 """SELECT id, claim_text, subject, confidence, importance,
-                          last_accessed, claim_type, namespace_id, agent_id, status
+                          last_accessed, claim_type, namespace_id, agent_id, status, embedding
                    FROM memory_claims
                    WHERE subject LIKE ? AND status IN ('candidate', 'active')
                    AND confidence >= ?
@@ -352,7 +403,7 @@ def recall_claims(
             ).fetchall()
             for row in subj_rows:
                 if row[0] not in candidates:
-                    candidates[row[0]] = row + (0.4,)
+                    candidates[row[0]] = tuple(row) + (0.4,)  # Convert Row to tuple
     except Exception:
         pass
 
@@ -360,7 +411,7 @@ def recall_claims(
     try:
         recent_rows = cursor.execute(
             """SELECT id, claim_text, subject, confidence, importance,
-                      last_accessed, claim_type, namespace_id, agent_id, status
+                      last_accessed, claim_type, namespace_id, agent_id, status, embedding
                FROM memory_claims
                WHERE status IN ('candidate', 'active') AND confidence >= ?
                ORDER BY last_accessed DESC LIMIT 10""",
@@ -368,21 +419,31 @@ def recall_claims(
         ).fetchall()
         for row in recent_rows:
             if row[0] not in candidates:
-                candidates[row[0]] = row + (0.3,)
+                candidates[row[0]] = tuple(row) + (0.3,)  # Convert Row to tuple
     except Exception:
         pass
 
     # Score and rank
     results = []
     for claim_id, row in candidates.items():
-        _, claim_text, subject, confidence, importance, last_accessed, claim_type, namespace_id_c, agent_id, status, bm25_norm = row
+        _, claim_text, subject, confidence, importance, last_accessed, claim_type, namespace_id_c, agent_id, status, embedding_json, bm25_norm = row
+
+        # Compute cosine similarity if embeddings available
+        cosine_sim = 0.0
+        if query_embedding and embedding_json:
+            try:
+                claim_embedding = json.loads(embedding_json)
+                cosine_sim = cosine_similarity(query_embedding, claim_embedding)
+            except Exception:
+                pass
+
         try:
             last = datetime.fromisoformat(last_accessed) if last_accessed else now - timedelta(days=30)
         except Exception:
             last = now - timedelta(days=30)
         days_since = max(0, (now - last).days)
         recency = compute_recency(claim_type, days_since)
-        score = compute_final_score(confidence, importance, recency, bm25_norm=bm25_norm)
+        score = compute_final_score(confidence, importance, recency, cosine_sim=cosine_sim, bm25_norm=bm25_norm)
 
         if score >= MIN_SCORE:
             results.append({
@@ -397,6 +458,7 @@ def recall_claims(
                 'status': status,
                 'score': round(score, 4),
                 'recency': round(recency, 4),
+                'cosine_sim': round(cosine_sim, 4),
             })
 
     # Namespace filter if specified
