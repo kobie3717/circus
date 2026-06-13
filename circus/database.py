@@ -545,6 +545,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v34_migration(db_path)
     # Run v35 migration for task_events + doom loop detection (Phase 5: trust scaffolding)
     run_v35_migration(db_path)
+    # Run v36 migration for webhooks + observer_mode + platform economics (Phase 6: The Standard)
+    run_v36_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -2354,6 +2356,111 @@ def run_v35_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v35 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v36_migration(db_path: Optional[Path] = None) -> None:
+    """Run v36 migration: webhooks + observer_mode + platform economics (Phase 6: The Standard)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if webhook_subscriptions table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='webhook_subscriptions'")
+        if cursor.fetchone():
+            logger.debug("v36 migration: webhook tables already exist, skipping")
+            return
+
+        # Create webhook_subscriptions table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                events TEXT NOT NULL,
+                secret TEXT,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_triggered_at TEXT,
+                failure_count INTEGER DEFAULT 0,
+                FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_webhooks_agent ON webhook_subscriptions(agent_id, is_active)")
+
+        # Create webhook_deliveries table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subscription_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                response_status INTEGER,
+                attempted_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (subscription_id) REFERENCES webhook_subscriptions(id)
+            )
+        """)
+
+        # Add observer_mode column to agents table
+        cursor.execute("PRAGMA table_info(agents)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        if 'observer_mode' not in existing_columns:
+            try:
+                cursor.execute("ALTER TABLE agents ADD COLUMN observer_mode INTEGER DEFAULT 0")
+            except Exception as e:
+                logger.warning(f"v36: observer_mode column add failed (may already exist): {e}")
+
+        # Create platform_fees table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS platform_fees (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                payout_amount REAL NOT NULL,
+                fee_amount REAL NOT NULL,
+                fee_pct REAL DEFAULT 0.02,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                collected_at TEXT,
+                FOREIGN KEY (task_id) REFERENCES tasks(id),
+                FOREIGN KEY (agent_id) REFERENCES agents(id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_platform_fees_status ON platform_fees(status, created_at)")
+
+        # Create flywheel_snapshots table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS flywheel_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_date TEXT NOT NULL,
+                total_agents INTEGER DEFAULT 0,
+                active_agents INTEGER DEFAULT 0,
+                tasks_completed INTEGER DEFAULT 0,
+                tasks_failed INTEGER DEFAULT 0,
+                doom_loops_detected INTEGER DEFAULT 0,
+                memory_claims_published INTEGER DEFAULT 0,
+                escrow_volume REAL DEFAULT 0.0,
+                fees_collected REAL DEFAULT 0.0,
+                top_failure_signatures TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        conn.commit()
+        logger.info("v36 migration: created webhook_subscriptions, webhook_deliveries, platform_fees, flywheel_snapshots + observer_mode column")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v36 migration failed: %s", e)
         raise
     finally:
         conn.close()

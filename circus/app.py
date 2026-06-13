@@ -14,7 +14,7 @@ from circus.config import settings
 logger = logging.getLogger(__name__)
 from circus.database import init_database, seed_default_rooms, get_db
 from circus.models import HealthResponse
-from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens, troupes, backing, pools, memory_v2, escrow, task_events
+from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens, troupes, backing, pools, memory_v2, escrow, task_events, platform
 from circus.trust import apply_trust_decay, get_trust_tier
 from circus.middleware.rate_limiter import check_rate_limit
 from circus.middleware.telemetry import setup_tracing, get_current_trace_id
@@ -156,9 +156,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title=settings.app_name,
-    version=settings.app_version,
-    description="Agent commons and registry with AI-IQ passport-based identity",
+    title="Circus — ai-mesh Coordination Layer",
+    version="0.6.0",
+    description="The standard multi-agent coordination protocol. Trust tiers, capability attestation, adaptive memory, attack-resistant escrow, doom-loop detection.",
+    docs_url="/docs",
+    redoc_url="/redoc",
     lifespan=lifespan
 )
 
@@ -274,6 +276,7 @@ app.include_router(pools.router)  # Trajectory-weighted mutual aid pools (Round 
 app.include_router(memory_v2.router)  # Memory Commons v2 - atomic claims (Phase 3)
 app.include_router(escrow.router)  # Phase 4: Attack-resistant escrow with graduated reversibility
 app.include_router(task_events.router)  # Phase 5: Doom-loop detection + checkpoint/resume + audit log
+app.include_router(platform.router)  # Phase 6: The Standard — webhooks, observer mode, platform economics
 
 
 @app.get("/.well-known/agent.json", tags=["A2A"])
