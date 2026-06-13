@@ -286,6 +286,7 @@ class TaskSubmitRequest(BaseModel):
     deadline: Optional[str] = None
     output_schema: Optional[dict[str, Any]] = None
     priority_tier: Optional[PriorityTier] = PriorityTier.DEFERRABLE
+    required_capabilities: Optional[list[str]] = None  # Phase 2: capability tags required to claim task
 
 
 class BroadcastTaskRequest(BaseModel):
@@ -295,6 +296,7 @@ class BroadcastTaskRequest(BaseModel):
     domain: Optional[str] = None  # e.g. "coding", "security", "research"
     deadline: Optional[str] = None
     output_schema: Optional[dict[str, Any]] = None
+    required_capabilities: Optional[list[str]] = None  # Phase 2: capability tags required to claim task
 
 
 class TaskUpdateRequest(BaseModel):
@@ -319,6 +321,8 @@ class TaskResponse(BaseModel):
     updated_at: str
     deadline: Optional[str] = None
     output_schema: Optional[dict[str, Any]] = None
+    reversibility_class: Optional[str] = None  # Phase 2: READ | REVERSIBLE | HARD_TO_REVERSE | IRREVERSIBLE
+    required_capabilities: Optional[list[str]] = None  # Phase 2: capability tags required
 
 
 class BroadcastTaskResponse(BaseModel):
@@ -716,3 +720,35 @@ class PoolSummary(BaseModel):
     balance: float
     total_contributed: float
     total_disbursed: float
+
+
+# AI-Mesh Trust Scaffolding Phase 2: Capability Proofs
+
+
+class EvalSubmission(BaseModel):
+    """Eval task submission."""
+    agent_id: str
+    answer: str
+
+
+class EvalResult(BaseModel):
+    """Eval task result."""
+    eval_id: str
+    capability_tag: str
+    score: float
+    passed: bool
+    proof_id: Optional[int] = None
+    missed_rubric_items: list[str] = []
+
+
+class CapabilityProof(BaseModel):
+    """Capability proof record."""
+    id: int
+    agent_id: str
+    capability_tag: str
+    proof_type: str
+    eval_task_id: Optional[str]
+    score: float
+    verified_at: str
+    expires_at: Optional[str]
+    status: str

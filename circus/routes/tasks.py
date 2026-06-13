@@ -290,13 +290,14 @@ async def broadcast_task(
         cursor.execute("""
             INSERT INTO tasks (
                 id, from_agent_id, to_agent_id, task_type, payload,
-                state, created_at, updated_at, deadline, output_schema
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                state, created_at, updated_at, deadline, output_schema, required_capabilities
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             task_id, agent_id, winner_id,
             request.task_type, json.dumps(request.payload),
             TaskState.SUBMITTED.value, now, now, request.deadline,
-            json.dumps(request.output_schema) if request.output_schema else None
+            json.dumps(request.output_schema) if request.output_schema else None,
+            json.dumps(request.required_capabilities) if request.required_capabilities else None
         ))
         cursor.execute("""
             INSERT INTO task_state_transitions (task_id, from_state, to_state, created_at)
@@ -340,6 +341,28 @@ async def submit_task(
                 detail="Target agent trust too low (need 30+)"
             )
 
+        # Check required_capabilities if specified
+        if request.required_capabilities:
+            # Verify target agent has all required capability proofs
+            placeholders = ','.join('?' * len(request.required_capabilities))
+            cursor.execute(f"""
+                SELECT DISTINCT capability_tag
+                FROM capability_proofs
+                WHERE agent_id = ? AND status = 'active' AND capability_tag IN ({placeholders})
+            """, [request.to_agent_id] + request.required_capabilities)
+            agent_caps = {row["capability_tag"] for row in cursor.fetchall()}
+            missing_caps = set(request.required_capabilities) - agent_caps
+
+            if missing_caps:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "missing_capabilities",
+                        "required": request.required_capabilities,
+                        "missing": list(missing_caps)
+                    }
+                )
+
         # Create task
         task_id = f"task-{secrets.token_hex(6)}"
         now = datetime.utcnow().isoformat()
@@ -348,13 +371,14 @@ async def submit_task(
         cursor.execute("""
             INSERT INTO tasks (
                 id, from_agent_id, to_agent_id, task_type, payload,
-                state, priority_tier, created_at, updated_at, deadline, output_schema
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                state, priority_tier, created_at, updated_at, deadline, output_schema, required_capabilities
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             task_id, agent_id, request.to_agent_id,
             request.task_type, json.dumps(request.payload),
             TaskState.SUBMITTED.value, priority_tier, now, now, request.deadline,
-            json.dumps(request.output_schema) if request.output_schema else None
+            json.dumps(request.output_schema) if request.output_schema else None,
+            json.dumps(request.required_capabilities) if request.required_capabilities else None
         ))
 
         # Log state transition
@@ -385,7 +409,9 @@ async def submit_task(
         created_at=now,
         updated_at=now,
         deadline=request.deadline,
-        output_schema=request.output_schema
+        output_schema=request.output_schema,
+        reversibility_class=None,
+        required_capabilities=request.required_capabilities
     )
 
 
@@ -506,7 +532,9 @@ async def update_task_state(
         created_at=updated_task["created_at"],
         updated_at=updated_task["updated_at"],
         deadline=updated_task["deadline"],
-        output_schema=json.loads(updated_task["output_schema"]) if updated_task["output_schema"] else None
+        output_schema=json.loads(updated_task["output_schema"]) if updated_task["output_schema"] else None,
+        reversibility_class=updated_task.get("reversibility_class"),
+        required_capabilities=json.loads(updated_task["required_capabilities"]) if updated_task.get("required_capabilities") else None
     )
 
 
@@ -549,7 +577,9 @@ async def get_inbox(
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 deadline=row["deadline"],
-                output_schema=safe_json_loads(row["output_schema"], f"output_schema for task {row['id']}") if row["output_schema"] else None
+                output_schema=safe_json_loads(row["output_schema"], f"output_schema for task {row['id']}") if row["output_schema"] else None,
+                reversibility_class=row.get("reversibility_class"),
+                required_capabilities=safe_json_loads(row["required_capabilities"], f"required_capabilities for task {row['id']}") if row.get("required_capabilities") else None
             ))
 
         return tasks
@@ -594,7 +624,9 @@ async def get_outbox(
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 deadline=row["deadline"],
-                output_schema=safe_json_loads(row["output_schema"], f"output_schema for task {row['id']}") if row["output_schema"] else None
+                output_schema=safe_json_loads(row["output_schema"], f"output_schema for task {row['id']}") if row["output_schema"] else None,
+                reversibility_class=row.get("reversibility_class"),
+                required_capabilities=safe_json_loads(row["required_capabilities"], f"required_capabilities for task {row['id']}") if row.get("required_capabilities") else None
             ))
 
         return tasks
@@ -732,7 +764,9 @@ async def get_task(
             created_at=task["created_at"],
             updated_at=task["updated_at"],
             deadline=task["deadline"],
-            output_schema=json.loads(task["output_schema"]) if task["output_schema"] else None
+            output_schema=json.loads(task["output_schema"]) if task["output_schema"] else None,
+            reversibility_class=task.get("reversibility_class"),
+            required_capabilities=json.loads(task["required_capabilities"]) if task.get("required_capabilities") else None
         )
 
 
