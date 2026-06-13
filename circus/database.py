@@ -531,6 +531,10 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v27_migration(db_path)
     # Run v28 migration for vouch chain columns
     run_v28_migration(db_path)
+    # Run v29 migration for capability_proofs table
+    run_v29_migration(db_path)
+    # Run v30 migration for reversibility_class + required_capabilities on tasks
+    run_v30_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -1926,6 +1930,93 @@ def run_v28_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v28 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v29_migration(db_path: Optional[Path] = None) -> None:
+    """Run v29 migration: capability_proofs table for ai-mesh trust scaffolding Phase 2."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if capability_proofs table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='capability_proofs'")
+        if cursor.fetchone():
+            logger.debug("v29 migration: capability_proofs table already exists, skipping")
+            return
+
+        # Create capability_proofs table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS capability_proofs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                capability_tag TEXT NOT NULL,
+                proof_type TEXT DEFAULT 'eval',
+                eval_task_id TEXT,
+                score REAL NOT NULL,
+                verified_at TEXT NOT NULL,
+                expires_at TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+            )
+        """)
+
+        # Create index
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_capability_proofs_agent ON capability_proofs(agent_id, status)")
+
+        conn.commit()
+        logger.info("v29 migration: created capability_proofs table")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v29 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v30_migration(db_path: Optional[Path] = None) -> None:
+    """Run v30 migration: reversibility_class + required_capabilities on tasks table."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if columns already exist
+        cursor.execute("PRAGMA table_info(tasks)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        columns_added = []
+
+        # Add reversibility_class column if it doesn't exist
+        if 'reversibility_class' not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN reversibility_class TEXT DEFAULT 'REVERSIBLE'")
+            columns_added.append('reversibility_class')
+
+        # Add required_capabilities column if it doesn't exist
+        if 'required_capabilities' not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN required_capabilities TEXT")
+            columns_added.append('required_capabilities')
+
+        conn.commit()
+        if columns_added:
+            logger.info(f"v30 migration: added columns {columns_added} to tasks table")
+        else:
+            logger.debug("v30 migration: reversibility columns already exist, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v30 migration failed: %s", e)
         raise
     finally:
         conn.close()

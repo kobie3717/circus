@@ -27,9 +27,12 @@ from circus.models import (
     AgentRegisterResponse,
     AgentResponse,
     BootBriefingResponse,
+    CapabilityProof,
     CompetenceObservationRequest,
     DiscoverResponse,
     DomainCompetence,
+    EvalResult,
+    EvalSubmission,
     PassportRefreshRequest,
     PassportRefreshResponse,
     VouchRequest,
@@ -1422,4 +1425,204 @@ async def revoke_vouch(
         "voucher_id": request.voucher_id,
         "vouchee_id": request.vouchee_id,
         "trust_restored": 1.0
+    }
+
+
+# AI-Mesh Trust Scaffolding Phase 2: Capability Proofs & Eval Suite
+
+
+@router.get("/evals")
+async def list_evals():
+    """List all available eval tasks (without rubrics)."""
+    from circus.evals import EVAL_TASKS
+
+    return {
+        "evals": [
+            {
+                "id": t["id"],
+                "capability_tag": t["capability_tag"],
+                "title": t["title"],
+                "description": t["description"]
+            }
+            for t in EVAL_TASKS
+        ],
+        "count": len(EVAL_TASKS)
+    }
+
+
+@router.get("/evals/{eval_id}")
+async def get_eval(eval_id: str):
+    """Get specific eval task input (without rubric)."""
+    from circus.evals import get_eval_task
+
+    task = get_eval_task(eval_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Eval task not found")
+
+    return {
+        "id": task["id"],
+        "capability_tag": task["capability_tag"],
+        "title": task["title"],
+        "description": task["description"],
+        "input": task["input"]
+    }
+
+
+@router.post("/evals/{eval_id}/submit", response_model=EvalResult)
+async def submit_eval(
+    eval_id: str,
+    request: EvalSubmission,
+    current_agent_id: str = Depends(verify_token)
+):
+    """
+    Submit answer to an eval task and get scored.
+
+    Scores answer against rubric using simple keyword matching.
+    If score >= min_score: creates/updates capability_proof.
+    If score < min_score: returns 422 with missed rubric items.
+    """
+    from circus.evals import get_eval_task
+
+    task = get_eval_task(eval_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Eval task not found")
+
+    # Validate agent_id matches current user
+    if request.agent_id != current_agent_id:
+        raise HTTPException(status_code=403, detail="Can only submit evals as yourself")
+
+    # Score the answer against rubric (simple keyword matching)
+    answer_lower = request.answer.lower()
+    rubric = task["rubric"]
+    matched_items = []
+    missed_items = []
+
+    for rubric_item in rubric:
+        # Extract key terms from rubric item
+        key_terms = rubric_item.lower().split()
+        # Check if any key terms appear in answer
+        if any(term in answer_lower for term in key_terms if len(term) > 3):
+            matched_items.append(rubric_item)
+        else:
+            missed_items.append(rubric_item)
+
+    score = len(matched_items) / len(rubric) if rubric else 0.0
+    passed = score >= task["min_score"]
+
+    now = datetime.utcnow().isoformat()
+    proof_id = None
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        if passed:
+            # Upsert capability_proof (one active proof per agent+capability_tag)
+            cursor.execute("""
+                SELECT id FROM capability_proofs
+                WHERE agent_id = ? AND capability_tag = ? AND status = 'active'
+            """, (request.agent_id, task["capability_tag"]))
+            existing_proof = cursor.fetchone()
+
+            if existing_proof:
+                # Update existing proof
+                proof_id = existing_proof["id"]
+                cursor.execute("""
+                    UPDATE capability_proofs
+                    SET eval_task_id = ?, score = ?, verified_at = ?, created_at = ?
+                    WHERE id = ?
+                """, (eval_id, score, now, now, proof_id))
+            else:
+                # Insert new proof
+                cursor.execute("""
+                    INSERT INTO capability_proofs (
+                        agent_id, capability_tag, proof_type, eval_task_id,
+                        score, verified_at, status, created_at
+                    ) VALUES (?, ?, 'eval', ?, ?, ?, 'active', ?)
+                """, (request.agent_id, task["capability_tag"], eval_id, score, now, now))
+                proof_id = cursor.lastrowid
+
+            conn.commit()
+
+    if not passed:
+        # Return 422 with missed items
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "eval_failed",
+                "eval_id": eval_id,
+                "capability_tag": task["capability_tag"],
+                "score": score,
+                "min_score": task["min_score"],
+                "missed_rubric_items": missed_items
+            }
+        )
+
+    return EvalResult(
+        eval_id=eval_id,
+        capability_tag=task["capability_tag"],
+        score=score,
+        passed=passed,
+        proof_id=proof_id,
+        missed_rubric_items=missed_items
+    )
+
+
+@router.get("/{agent_id}/capabilities")
+async def get_agent_capabilities(agent_id: str):
+    """List all active capability proofs for an agent."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Verify agent exists
+        cursor.execute("SELECT id FROM agents WHERE id = ?", (agent_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        # Get active capability proofs
+        cursor.execute("""
+            SELECT id, agent_id, capability_tag, proof_type, eval_task_id,
+                   score, verified_at, expires_at, status
+            FROM capability_proofs
+            WHERE agent_id = ? AND status = 'active'
+            ORDER BY verified_at DESC
+        """, (agent_id,))
+
+        proofs = []
+        for row in cursor.fetchall():
+            proofs.append({
+                "capability_tag": row["capability_tag"],
+                "proof_type": row["proof_type"],
+                "score": row["score"],
+                "verified_at": row["verified_at"],
+                "expires_at": row["expires_at"],
+                "eval_task_id": row["eval_task_id"]
+            })
+
+    return {
+        "agent_id": agent_id,
+        "capabilities": proofs,
+        "count": len(proofs)
+    }
+
+
+@router.get("/evals/capabilities")
+async def get_capability_tags():
+    """List all available capability tags with eval counts."""
+    from circus.evals import EVAL_TASKS
+
+    # Group by capability_tag
+    capabilities = {}
+    for task in EVAL_TASKS:
+        tag = task["capability_tag"]
+        if tag not in capabilities:
+            capabilities[tag] = {
+                "capability_tag": tag,
+                "eval_count": 0,
+                "description": f"Capability: {tag}"
+            }
+        capabilities[tag]["eval_count"] += 1
+
+    return {
+        "capabilities": list(capabilities.values()),
+        "count": len(capabilities)
     }
