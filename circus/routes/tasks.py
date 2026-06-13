@@ -46,7 +46,7 @@ router = APIRouter()
 
 
 def run_task_synthesis(conn) -> dict:
-    """Mine pending deferrable tasks for consolidation opportunities. Groups by task_type."""
+    """Mine pending deferrable tasks for consolidation. Stake-graph first, then task_type fallback."""
     import secrets
     import json
     from datetime import datetime
@@ -62,31 +62,115 @@ def run_task_synthesis(conn) -> dict:
         ORDER BY task_type, created_at
     """)
     pending = cursor.fetchall()
-
-    # Group by task_type
-    groups = {}
-    for task in pending:
-        t = task['task_type']
-        if t not in groups:
-            groups[t] = []
-        groups[t].append(task)
+    pending_ids = {t['id'] for t in pending}
 
     synthesis_groups = []
     tasks_consumed = 0
     tasks_created = 0
+    compressed_ids = set()  # track which tasks already handled
 
-    for task_type, tasks in groups.items():
+    # === STAGE 1: Stake-graph compression ===
+    # Find backers who have staked on 2+ pending deferrable tasks
+    if pending_ids:
+        placeholders = ','.join('?' * len(pending_ids))
+        cursor.execute(f"""
+            SELECT backer_agent_id, GROUP_CONCAT(task_id) as task_ids, COUNT(*) as task_count
+            FROM task_backing_stakes
+            WHERE task_id IN ({placeholders}) AND state = 'staked'
+            GROUP BY backer_agent_id
+            HAVING task_count >= 2
+            ORDER BY task_count DESC
+        """, list(pending_ids))
+        backer_groups = cursor.fetchall()
+
+        for bg in backer_groups:
+            backer_id = bg['backer_agent_id']
+            related_task_ids = [tid for tid in bg['task_ids'].split(',') if tid in pending_ids and tid not in compressed_ids]
+            if len(related_task_ids) < 2:
+                continue
+
+            # Get the task records
+            related_tasks = [t for t in pending if t['id'] in related_task_ids]
+            compression_id = secrets.token_hex(6)
+
+            # Cancel originals
+            for tid in related_task_ids:
+                cursor.execute("UPDATE tasks SET state='canceled', error='stake_compressed', updated_at=? WHERE id=?", (now, tid))
+                compressed_ids.add(tid)
+
+            # Transfer stakes at 0.7× discount
+            cursor.execute(f"""
+                UPDATE task_backing_stakes SET
+                    compression_id = ?,
+                    compression_discount = 0.7,
+                    stake_amount = ROUND(stake_amount * 0.7, 4)
+                WHERE task_id IN ({','.join('?' * len(related_task_ids))}) AND state = 'staked'
+            """, [compression_id] + related_task_ids)
+
+            # Create synthesized task
+            synth_id = secrets.token_hex(8)
+            payloads = []
+            for t in related_tasks:
+                try:
+                    p = json.loads(t['payload']) if t['payload'] else {}
+                    payloads.append(p)
+                except Exception:
+                    payloads.append({"raw": t['payload']})
+
+            merged_payload = json.dumps({
+                "synthesized": True,
+                "method": "stake_graph",
+                "compression_id": compression_id,
+                "backer_signal": backer_id,
+                "source_count": len(related_tasks),
+                "source_ids": related_task_ids,
+                "merged_payloads": payloads,
+                "stake_discount": 0.7,
+                "failure_refund": 0.5,
+                "success_yield_multiplier": 1.3
+            })
+
+            cursor.execute("""
+                INSERT INTO tasks (id, from_agent_id, to_agent_id, task_type, payload, state, priority_tier, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'submitted', 'deferrable', ?, ?)
+            """, (synth_id, related_tasks[0]['from_agent_id'],
+                  related_tasks[0]['to_agent_id'], related_tasks[0]['task_type'], merged_payload, now, now))
+
+            # Transfer stakes to synthesized task
+            cursor.execute(f"""
+                UPDATE task_backing_stakes SET task_id = ?
+                WHERE task_id IN ({','.join('?' * len(related_task_ids))}) AND state = 'staked'
+            """, [synth_id] + related_task_ids)
+
+            synthesis_groups.append({
+                "method": "stake_graph",
+                "backer_signal": backer_id,
+                "compression_id": compression_id,
+                "original_ids": related_task_ids,
+                "synthesized_id": synth_id,
+                "task_type": related_tasks[0]['task_type']
+            })
+            tasks_consumed += len(related_task_ids)
+            tasks_created += 1
+
+    # === STAGE 2: task_type grouping fallback (existing behavior) ===
+    remaining = [t for t in pending if t['id'] not in compressed_ids]
+    type_groups = {}
+    for task in remaining:
+        t = task['task_type']
+        if t not in type_groups:
+            type_groups[t] = []
+        type_groups[t].append(task)
+
+    for task_type, tasks in type_groups.items():
         if len(tasks) < 3:
-            continue  # Only synthesize groups of 3+
+            continue
 
-        # Cancel originals
         original_ids = [t['id'] for t in tasks]
         for tid in original_ids:
-            cursor.execute("UPDATE tasks SET state = 'canceled', error = 'synthesized', updated_at = ? WHERE id = ?", (now, tid))
+            cursor.execute("UPDATE tasks SET state='canceled', error='synthesized', updated_at=? WHERE id=?", (now, tid))
 
-        # Create synthesized task
         synth_id = secrets.token_hex(8)
-        # Merge payloads
         payloads = []
         for t in tasks:
             try:
@@ -97,6 +181,7 @@ def run_task_synthesis(conn) -> dict:
 
         merged_payload = json.dumps({
             "synthesized": True,
+            "method": "task_type",
             "source_count": len(tasks),
             "source_ids": original_ids,
             "merged_payloads": payloads
@@ -107,13 +192,17 @@ def run_task_synthesis(conn) -> dict:
             VALUES (?, ?, ?, ?, ?, 'submitted', 'deferrable', ?, ?)
         """, (synth_id, tasks[0]['from_agent_id'], tasks[0]['to_agent_id'], task_type, merged_payload, now, now))
 
-        synthesis_groups.append({"original_ids": original_ids, "synthesized_id": synth_id, "task_type": task_type})
+        synthesis_groups.append({
+            "method": "task_type",
+            "original_ids": original_ids,
+            "synthesized_id": synth_id,
+            "task_type": task_type
+        })
         tasks_consumed += len(tasks)
         tasks_created += 1
 
     compression = round(tasks_consumed / tasks_created, 2) if tasks_created > 0 else 1.0
 
-    # Log the synthesis event
     log_id = secrets.token_hex(6)
     cursor.execute("""
         INSERT INTO task_synthesis_log (id, triggered_at, queue_depth_before, tasks_consumed, tasks_created, compression_ratio, synthesis_groups, completed_at)
@@ -121,7 +210,13 @@ def run_task_synthesis(conn) -> dict:
     """, (log_id, now, len(pending), tasks_consumed, tasks_created, compression, json.dumps(synthesis_groups), now))
 
     conn.commit()
-    return {"synthesis_id": log_id, "tasks_consumed": tasks_consumed, "tasks_created": tasks_created, "compression_ratio": compression, "groups": synthesis_groups, "triggered_at": now}
+    return {
+        "synthesis_id": log_id,
+        "tasks_consumed": tasks_consumed,
+        "tasks_created": tasks_created,
+        "compression_ratio": compression,
+        "groups": synthesis_groups
+    }
 
 
 @router.post("/broadcast", response_model=BroadcastTaskResponse, status_code=201)
