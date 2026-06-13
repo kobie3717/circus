@@ -70,6 +70,8 @@ from circus.models import (
     DomainClaim,
     DomainClaimResponse,
     DomainSteward,
+    DomainShiftSignalRequest,
+    DomainShiftSignalResponse,
 )
 from circus.services.goal_router import goal_router
 from circus.services.provenance import decay_confidence
@@ -463,6 +465,9 @@ async def publish_memory(
         else:
             troupe_id = get_agent_troupe(conn, agent_id)
 
+        # Calculate expires_at (90 days from now)
+        expires_at = (now + timedelta(days=90)).isoformat()
+
         # Insert into shared_memories (use memory-commons room)
         # Retry on ID collision (max 3 attempts)
         for attempt in range(3):
@@ -471,8 +476,9 @@ async def publish_memory(
                     INSERT INTO shared_memories (
                         id, room_id, from_agent_id, content, category, domain, tags, provenance,
                         privacy_tier, hop_count, original_author, confidence,
-                        age_days, effective_confidence, shared_at, trust_verified, troupe_id
-                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0, ?)
+                        age_days, effective_confidence, shared_at, trust_verified, troupe_id,
+                        expires_at, contradiction_count
+                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0, ?, ?, 0)
                 """, (
                     memory_id,
                     agent_id,
@@ -486,7 +492,8 @@ async def publish_memory(
                     mem_req.confidence,
                     effective_conf,
                     now.isoformat(),
-                    troupe_id
+                    troupe_id,
+                    expires_at
                 ))
                 conn.commit()
                 break
@@ -1181,7 +1188,7 @@ async def search_shared_knowledge(
             if owner_id:
                 cursor.execute(f"""
                     SELECT sm.id, sm.content, sm.category, sm.domain, sm.confidence,
-                           sm.hop_count, sm.from_agent_id, sm.shared_at
+                           sm.hop_count, sm.from_agent_id, sm.shared_at, sm.contradiction_count, sm.expires_at
                     FROM fts_shared_memories fts
                     JOIN shared_memories sm ON fts.rowid = sm.rowid
                     WHERE fts.content MATCH ? AND sm.provenance LIKE ?
@@ -1193,7 +1200,7 @@ async def search_shared_knowledge(
             else:
                 cursor.execute(f"""
                     SELECT sm.id, sm.content, sm.category, sm.domain, sm.confidence,
-                           sm.hop_count, sm.from_agent_id, sm.shared_at
+                           sm.hop_count, sm.from_agent_id, sm.shared_at, sm.contradiction_count, sm.expires_at
                     FROM fts_shared_memories fts
                     JOIN shared_memories sm ON fts.rowid = sm.rowid
                     WHERE fts.content MATCH ?
@@ -1212,7 +1219,7 @@ async def search_shared_knowledge(
             if owner_id:
                 cursor.execute(f"""
                     SELECT id, content, category, domain, confidence,
-                           hop_count, from_agent_id, shared_at
+                           hop_count, from_agent_id, shared_at, contradiction_count, expires_at
                     FROM shared_memories
                     WHERE ({like_clauses}) AND provenance LIKE ?
                       AND (status IS NULL OR status = 'active')
@@ -1223,7 +1230,7 @@ async def search_shared_knowledge(
             else:
                 cursor.execute(f"""
                     SELECT id, content, category, domain, confidence,
-                           hop_count, from_agent_id, shared_at
+                           hop_count, from_agent_id, shared_at, contradiction_count, expires_at
                     FROM shared_memories
                     WHERE ({like_clauses})
                       AND (status IS NULL OR status = 'active')
@@ -1234,7 +1241,7 @@ async def search_shared_knowledge(
 
         results = []
         for row in cursor.fetchall():
-            memory_id, content, category, domain, confidence, hop_count, from_agent_id, shared_at = row
+            memory_id, content, category, domain, confidence, hop_count, from_agent_id, shared_at, contradiction_count, expires_at = row
 
             # Calculate score: confidence × (1 - hop_count × 0.1) — capped at 0.0
             score = max(0.0, confidence * (1.0 - hop_count * 0.1))
@@ -1250,7 +1257,9 @@ async def search_shared_knowledge(
                 "confidence": confidence,
                 "score": round(score, 2),
                 "source_agent": source_agent,
-                "shared_at": shared_at
+                "shared_at": shared_at,
+                "contradiction_count": contradiction_count or 0,
+                "expires_at": expires_at
             })
 
         return {
@@ -1330,4 +1339,107 @@ async def auto_resolve_conflicts(
         "skipped": skipped_count,
         "errors": errors,
         "message": f"Auto-resolved {resolved_count} conflicts ({skipped_count} skipped as already superseded)"
+    }
+
+
+@router.post("/signal-shift", response_model=DomainShiftSignalResponse)
+async def signal_domain_shift(
+    signal_req: DomainShiftSignalRequest,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Signal a domain shift to quarantine stale memories.
+
+    When a domain undergoes significant change (e.g., architecture refactor,
+    API migration), this endpoint quarantines all memories matching the domain_tag.
+    """
+    if not settings.memory_commons_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Memory Commons is disabled"
+        )
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Generate signal ID
+        signal_id = f"dss-{secrets.token_hex(8)}"
+        now = datetime.utcnow().isoformat()
+
+        # Quarantine matching memories (domain LIKE search for partial matches)
+        # E.g., domain_tag="whatsauction" matches "whatsauction.bidding", "whatsauction.payment", etc.
+        cursor.execute("""
+            UPDATE shared_memories
+            SET status = 'quarantined'
+            WHERE domain LIKE '%' || ? || '%'
+              AND status = 'active'
+        """, (signal_req.domain_tag,))
+
+        affected_count = cursor.rowcount
+
+        # Insert signal record
+        cursor.execute("""
+            INSERT INTO domain_shift_signals (
+                id, domain_tag, filed_by, reason, filed_at, affected_count
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            signal_id,
+            signal_req.domain_tag,
+            agent_id,
+            signal_req.reason,
+            now,
+            affected_count
+        ))
+
+        conn.commit()
+
+        return DomainShiftSignalResponse(
+            signal_id=signal_id,
+            domain_tag=signal_req.domain_tag,
+            affected_count=affected_count,
+            filed_at=now
+        )
+
+
+@router.post("/contradict/{memory_id}")
+async def file_contradiction(
+    memory_id: str,
+    agent_id: str = Depends(verify_token),
+    request: Request = None,
+):
+    """
+    File a contradiction against a shared memory.
+    Increments contradiction_count. Auto-demotes to 'quarantined' at 3+ contradictions.
+    Auth required.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Verify memory exists and is active
+        cursor.execute(
+            "SELECT id, contradiction_count, status FROM shared_memories WHERE id = ?",
+            (memory_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        mem_id, current_count, current_status = row
+        new_count = (current_count or 0) + 1
+
+        # Auto-demote at 3+ contradictions
+        new_status = 'quarantined' if new_count >= 3 else current_status
+
+        cursor.execute(
+            "UPDATE shared_memories SET contradiction_count = ?, status = ? WHERE id = ?",
+            (new_count, new_status, memory_id)
+        )
+        conn.commit()
+
+    return {
+        "memory_id": memory_id,
+        "contradiction_count": new_count,
+        "status": new_status,
+        "auto_demoted": new_status == 'quarantined',
+        "filed_by": agent_id,
     }

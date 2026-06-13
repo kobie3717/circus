@@ -509,6 +509,10 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v16_migration(db_path)
     # Run v17 migration for troupe isolation
     run_v17_migration(db_path)
+    # Run v18 migration for TTL + domain shift signals
+    run_v18_migration(db_path)
+    # Run v19 migration for Merkle chain validation
+    run_v19_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -1256,6 +1260,120 @@ def run_v17_migration(db_path: Optional[Path] = None) -> None:
         conn.close()
 
 
+def run_v18_migration(db_path: Optional[Path] = None) -> None:
+    """Run v18 migration: TTL + domain shift signals (Gap 1)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+    migration_file = Path(__file__).parent / "database_migrations" / "v18_ttl_domain_shift.sql"
+
+    if not migration_file.exists():
+        raise FileNotFoundError(f"Migration file not found: {migration_file}")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if expires_at column already exists in shared_memories
+        cursor.execute("PRAGMA table_info(shared_memories)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        columns_added = []
+
+        # Add expires_at column if it doesn't exist
+        if 'expires_at' not in columns:
+            cursor.execute("ALTER TABLE shared_memories ADD COLUMN expires_at TEXT")
+            columns_added.append('expires_at')
+
+        # Add contradiction_count column if it doesn't exist
+        if 'contradiction_count' not in columns:
+            cursor.execute("ALTER TABLE shared_memories ADD COLUMN contradiction_count INTEGER DEFAULT 0")
+            columns_added.append('contradiction_count')
+
+        # Execute migration SQL (creates domain_shift_signals table)
+        with open(migration_file, "r") as f:
+            sql_script = f.read()
+        cursor.executescript(sql_script)
+
+        conn.commit()
+        if columns_added:
+            logger.info(f"v18 migration: added columns {columns_added}, created domain_shift_signals table")
+        else:
+            logger.debug("v18 migration: columns already exist, created domain_shift_signals table if needed")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v18 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v19_migration(db_path: Optional[Path] = None) -> None:
+    """Run v19 migration: Merkle chain validation for multi-bot task chains (Gap 4)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if task_chain_nodes table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='task_chain_nodes'")
+        if cursor.fetchone():
+            logger.debug("v19 migration: task_chain_nodes table already exists, skipping")
+            return
+
+        # Create task_chain_nodes table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS task_chain_nodes (
+                id TEXT PRIMARY KEY,
+                root_task_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                parent_task_id TEXT,
+                agent_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'sub-agent',
+                input_hash TEXT,
+                output_hash TEXT,
+                verdict TEXT,
+                output_summary TEXT,
+                contradiction_with TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+        """)
+
+        # Create indexes for task_chain_nodes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tcn_root ON task_chain_nodes(root_task_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tcn_parent ON task_chain_nodes(parent_task_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tcn_agent ON task_chain_nodes(agent_id)")
+
+        # Check if synthesis_score and validation_score columns exist in agent_competence
+        cursor.execute("PRAGMA table_info(agent_competence)")
+        competence_columns = {row[1] for row in cursor.fetchall()}
+
+        # Add synthesis_score column if it doesn't exist
+        if 'synthesis_score' not in competence_columns:
+            cursor.execute("ALTER TABLE agent_competence ADD COLUMN synthesis_score REAL DEFAULT 0.5")
+
+        # Add validation_score column if it doesn't exist
+        if 'validation_score' not in competence_columns:
+            cursor.execute("ALTER TABLE agent_competence ADD COLUMN validation_score REAL DEFAULT 0.5")
+
+        conn.commit()
+        logger.info("v19 migration: created task_chain_nodes table + synthesis_score/validation_score columns")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v19 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
 @contextmanager
 def get_db() -> Generator[sqlite3.Connection, None, None]:
     """Get database connection context manager.
@@ -1285,10 +1403,13 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
     """
     conn = sqlite3.connect(str(settings.database_path))
     conn.row_factory = sqlite3.Row
-    # Enforce referential integrity — 20+ FK constraints are defined in schema
-    # but SQLite ships with foreign_keys=OFF by default. Without this, deleting
-    # an agent leaves orphaned passports/trust_events/vouches/etc.
-    conn.execute("PRAGMA foreign_keys=ON")
+
+    # CRITICAL: Enable foreign key enforcement FIRST (before any queries)
+    # Without this, cascade deletes don't work — orphaned passport/embedding rows
+    # accumulate when agents are deleted, causing DB bloat and stale data bugs.
+    # SQLite ships with FK enforcement OFF by default (legacy compat).
+    conn.execute("PRAGMA foreign_keys = ON")
+
     # WAL mode allows concurrent reads during writes — required for federation
     # PUSH throughput and SSE polling while memory commons writes land.
     # Set once on first connection; subsequent calls are no-ops but cheap.

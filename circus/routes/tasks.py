@@ -1,5 +1,6 @@
 """A2A task lifecycle routes."""
 
+import hashlib
 import json
 import jsonschema
 import secrets
@@ -21,6 +22,11 @@ def safe_json_loads(json_str: str, context: str = "data", user_supplied: bool = 
 
 from circus.database import get_db
 from circus.models import (
+    BroadcastTaskRequest,
+    BroadcastTaskResponse,
+    ChainNodeResponse,
+    ChainNodeSubmit,
+    ChainValidationResult,
     TaskResponse,
     TaskState,
     TaskStateTransition,
@@ -31,6 +37,86 @@ from circus.routes.agents import verify_token
 from circus.services.task_engine import is_valid_transition
 
 router = APIRouter()
+
+
+@router.post("/broadcast", response_model=BroadcastTaskResponse, status_code=201)
+async def broadcast_task(
+    request: BroadcastTaskRequest,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Route a task to the best available agent via trust × competence auction.
+
+    If domain is provided: score = trust_score × competence_score for that domain.
+    If no domain: score = trust_score only (picks highest-trust active agent).
+    Ties broken by most recent last_seen.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        now = datetime.utcnow().isoformat()
+
+        if request.domain:
+            # Score = trust_score × competence_score for given domain
+            cursor.execute("""
+                SELECT a.id, a.trust_score,
+                       COALESCE(ac.score, 0.1) AS comp_score,
+                       COALESCE(ac.observations, 0) AS obs,
+                       a.last_seen
+                FROM agents a
+                LEFT JOIN agent_competence ac
+                    ON ac.agent_id = a.id AND ac.domain = ?
+                WHERE a.is_active = 1
+                  AND a.id != ?
+                ORDER BY (a.trust_score * COALESCE(ac.score, 0.1)) DESC,
+                         a.last_seen DESC
+                LIMIT 5
+            """, (request.domain, agent_id))
+        else:
+            cursor.execute("""
+                SELECT a.id, a.trust_score, 0.5 AS comp_score, 0 AS obs, a.last_seen
+                FROM agents a
+                WHERE a.is_active = 1 AND a.id != ?
+                ORDER BY a.trust_score DESC, a.last_seen DESC
+                LIMIT 5
+            """, (agent_id,))
+
+        candidates = cursor.fetchall()
+        if not candidates:
+            raise HTTPException(status_code=404, detail="No eligible agents available")
+
+        winner = candidates[0]
+        winner_id = winner[0]
+        winner_score = round(winner[1] * winner[2], 3)
+
+        # Create the task assigned to winner
+        task_id = f"task-{secrets.token_hex(6)}"
+        cursor.execute("""
+            INSERT INTO tasks (
+                id, from_agent_id, to_agent_id, task_type, payload,
+                state, created_at, updated_at, deadline, output_schema
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            task_id, agent_id, winner_id,
+            request.task_type, json.dumps(request.payload),
+            TaskState.SUBMITTED.value, now, now, request.deadline,
+            json.dumps(request.output_schema) if request.output_schema else None
+        ))
+        cursor.execute("""
+            INSERT INTO task_state_transitions (task_id, from_state, to_state, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (task_id, None, TaskState.SUBMITTED.value, now))
+        conn.commit()
+
+        return BroadcastTaskResponse(
+            task_id=task_id,
+            winner_agent_id=winner_id,
+            winner_score=winner_score,
+            domain=request.domain,
+            task_type=request.task_type,
+            candidates_evaluated=len(candidates),
+            state=TaskState.SUBMITTED,
+            created_at=now,
+        )
 
 
 @router.post("", response_model=TaskResponse, status_code=201)
@@ -447,3 +533,169 @@ async def stream_task_progress(
             await asyncio.sleep(1)
 
     return EventSourceResponse(event_generator())
+
+
+@router.post("/{task_id}/chain-node", response_model=ChainNodeResponse, status_code=201)
+async def submit_chain_node(
+    task_id: str,
+    request: ChainNodeSubmit,
+    agent_id: str = Depends(verify_token)
+):
+    """Submit this bot's findings as a node in a multi-bot chain."""
+    now = datetime.utcnow().isoformat()
+    node_id = f"tcn-{secrets.token_hex(8)}"
+
+    input_hash = hashlib.sha256(json.dumps(request.input_payload, sort_keys=True).encode()).hexdigest()[:16]
+    output_hash = hashlib.sha256(json.dumps(request.output, sort_keys=True).encode()).hexdigest()[:16]
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO task_chain_nodes (
+                id, root_task_id, task_id, parent_task_id,
+                agent_id, role, input_hash, output_hash,
+                verdict, output_summary, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            node_id, request.root_task_id, task_id, request.parent_task_id,
+            agent_id, request.role, input_hash, output_hash,
+            request.verdict, request.output_summary, now
+        ))
+        conn.commit()
+
+    return ChainNodeResponse(
+        node_id=node_id,
+        root_task_id=request.root_task_id,
+        task_id=task_id,
+        agent_id=agent_id,
+        role=request.role,
+        verdict=request.verdict,
+        input_hash=input_hash,
+        output_hash=output_hash,
+        created_at=now
+    )
+
+
+@router.post("/{task_id}/validate-chain", response_model=ChainValidationResult)
+async def validate_chain(
+    task_id: str,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Validate a multi-bot task chain.
+    Detects contradictions: sub-agent said 'fail' but lead said 'ok'.
+    Applies role-specific trust penalties on contradiction.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Fetch all nodes for this chain
+        cursor.execute("""
+            SELECT id, task_id, parent_task_id, agent_id, role, verdict, output_summary
+            FROM task_chain_nodes
+            WHERE root_task_id = ?
+            ORDER BY created_at ASC
+        """, (task_id,))
+        nodes = cursor.fetchall()
+
+        if not nodes:
+            raise HTTPException(status_code=404, detail="No chain nodes found for this task")
+
+        # Find lead node (role = 'lead' or no parent)
+        lead_node = None
+        sub_nodes = []
+        for n in nodes:
+            nid, ntask, nparent, nagent, nrole, nverdict, nsummary = n
+            if nrole == 'lead' or nparent is None:
+                lead_node = n
+            else:
+                sub_nodes.append(n)
+
+        contradictions = []
+        blame = []
+        details = []
+
+        for node in nodes:
+            nid, ntask, nparent, nagent, nrole, nverdict, nsummary = node
+            details.append({
+                "node_id": nid,
+                "agent_id": nagent,
+                "role": nrole,
+                "verdict": nverdict,
+                "summary": nsummary,
+                "contradiction": False
+            })
+
+        # Contradiction: sub-agent said 'fail', lead said 'ok'
+        if lead_node:
+            lead_id, _, _, lead_agent, _, lead_verdict, _ = lead_node
+
+            for sub in sub_nodes:
+                sub_id, _, _, sub_agent, _, sub_verdict, sub_summary = sub
+
+                is_contradiction = (sub_verdict == 'fail' and lead_verdict == 'ok')
+
+                if is_contradiction:
+                    contradictions.append(sub_id)
+
+                    # Mark in DB
+                    cursor.execute(
+                        "UPDATE task_chain_nodes SET contradiction_with = ? WHERE id = ?",
+                        (lead_id, sub_id)
+                    )
+
+                    # Update detail entry
+                    for d in details:
+                        if d["node_id"] == sub_id:
+                            d["contradiction"] = True
+
+                    # Blame split: lead loses synthesis_score, sub keeps validation_score
+                    # Apply to agent_competence (synthesis_score for lead, validation_score for sub)
+                    now = datetime.utcnow().isoformat()
+
+                    # Lead: synthesis_score penalty (-0.05, min 0.0)
+                    cursor.execute("""
+                        INSERT INTO agent_competence (agent_id, domain, score, observations, last_updated)
+                        VALUES (?, 'synthesis', 0.4, 1, ?)
+                        ON CONFLICT(agent_id, domain) DO UPDATE SET
+                            synthesis_score = MAX(0.0, COALESCE(synthesis_score, 0.5) - 0.05),
+                            observations = observations + 1,
+                            last_updated = excluded.last_updated
+                    """, (lead_agent, now))
+
+                    blame.append({
+                        "agent_id": lead_agent,
+                        "role": "lead",
+                        "penalty_reason": f"synthesis_failure: buried sub-agent finding (node {sub_id})",
+                        "trust_penalty": -0.05
+                    })
+
+                    # Sub-agent: validation_score credit (+0.05) for catching an issue
+                    cursor.execute("""
+                        INSERT INTO agent_competence (agent_id, domain, score, observations, last_updated)
+                        VALUES (?, 'validation', 0.6, 1, ?)
+                        ON CONFLICT(agent_id, domain) DO UPDATE SET
+                            validation_score = MIN(1.0, COALESCE(validation_score, 0.5) + 0.05),
+                            observations = observations + 1,
+                            last_updated = excluded.last_updated
+                    """, (sub_agent, now))
+
+                    blame.append({
+                        "agent_id": sub_agent,
+                        "role": "sub-agent",
+                        "penalty_reason": "credit: correctly flagged issue buried by lead",
+                        "trust_penalty": +0.05
+                    })
+
+        conn.commit()
+
+        chain_valid = len(contradictions) == 0
+
+        return ChainValidationResult(
+            root_task_id=task_id,
+            node_count=len(nodes),
+            contradictions_found=len(contradictions),
+            chain_valid=chain_valid,
+            blame=blame,
+            details=details
+        )

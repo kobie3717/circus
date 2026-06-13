@@ -100,6 +100,17 @@ async def liveness_monitor_task():
             print(f"[Liveness] Monitor error: {e}")
 
 
+async def _warmup_embeddings():
+    """Warm up sentence-transformers model to avoid 14-16s cold start on first /register."""
+    try:
+        from circus.services.embeddings import embed_agent_profile
+        # Dummy warmup call with minimal data
+        await embed_agent_profile("warmup-agent", "system", [])
+        logger.info("[Startup] Sentence-transformers model warmed up")
+    except Exception as e:
+        logger.warning(f"[Startup] Embedding warmup failed (non-fatal): {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -119,6 +130,9 @@ async def lifespan(app: FastAPI):
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='agents'")
         if not cursor.fetchone():
             raise RuntimeError("Critical: agents table missing after init")
+
+    # Warm up embedding model to prevent 14-16s cold start on first /register
+    asyncio.create_task(_warmup_embeddings())
 
     # Start background tasks
     trust_task = asyncio.create_task(trust_decay_task())
@@ -220,14 +234,21 @@ async def general_exception_handler(request: Request, exc: Exception):
 # Health check endpoint
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
-    """Health check endpoint (non-blocking, no DB queries)."""
+    """Health check endpoint."""
     trace_id = get_current_trace_id()
+    try:
+        with get_db() as conn:
+            agents_count = conn.execute("SELECT COUNT(*) FROM agents WHERE is_active=1").fetchone()[0]
+            rooms_count = conn.execute("SELECT COUNT(*) FROM rooms").fetchone()[0]
+    except Exception:
+        agents_count = 0
+        rooms_count = 0
 
     return HealthResponse(
         status="healthy",
         version=settings.app_version,
-        agents_count=0,
-        rooms_count=0,
+        agents_count=agents_count,
+        rooms_count=rooms_count,
         timestamp=datetime.utcnow().isoformat(),
         trace_id=trace_id
     )
