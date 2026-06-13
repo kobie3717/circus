@@ -543,6 +543,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v33_migration(db_path)
     # Run v34 migration for fraud_reports table (Phase 4: fraud tracking)
     run_v34_migration(db_path)
+    # Run v35 migration for task_events + doom loop detection (Phase 5: trust scaffolding)
+    run_v35_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -2270,6 +2272,88 @@ def run_v34_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v34 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v35_migration(db_path: Optional[Path] = None) -> None:
+    """Run v35 migration: task_events + task_banned_strategies + checkpoint columns (Phase 5: doom-loop detection)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if task_events table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='task_events'")
+        if cursor.fetchone():
+            logger.debug("v35 migration: task_events table already exists, skipping")
+            return
+
+        # Create task_events table (append-only audit log)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload TEXT,
+                is_ok INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (task_id) REFERENCES tasks(id),
+                FOREIGN KEY (agent_id) REFERENCES agents(id)
+            )
+        """)
+
+        # Create indexes for task_events
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_events_agent ON task_events(agent_id, created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_events_type ON task_events(event_type, created_at)")
+
+        # Create task_banned_strategies table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS task_banned_strategies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                strategy_signature TEXT NOT NULL,
+                ban_reason TEXT,
+                banned_at TEXT NOT NULL,
+                UNIQUE(task_id, agent_id, strategy_signature)
+            )
+        """)
+
+        # Add checkpoint columns to tasks table (using try/except for idempotency)
+        cursor.execute("PRAGMA table_info(tasks)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        if 'checkpoint_state' not in existing_columns:
+            try:
+                cursor.execute("ALTER TABLE tasks ADD COLUMN checkpoint_state TEXT")
+            except Exception as e:
+                logger.warning(f"v35: checkpoint_state column add failed (may already exist): {e}")
+
+        if 'checkpoint_step' not in existing_columns:
+            try:
+                cursor.execute("ALTER TABLE tasks ADD COLUMN checkpoint_step INTEGER DEFAULT 0")
+            except Exception as e:
+                logger.warning(f"v35: checkpoint_step column add failed (may already exist): {e}")
+
+        if 'doom_loop_count' not in existing_columns:
+            try:
+                cursor.execute("ALTER TABLE tasks ADD COLUMN doom_loop_count INTEGER DEFAULT 0")
+            except Exception as e:
+                logger.warning(f"v35: doom_loop_count column add failed (may already exist): {e}")
+
+        conn.commit()
+        logger.info("v35 migration: created task_events, task_banned_strategies tables + checkpoint columns")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v35 migration failed: %s", e)
         raise
     finally:
         conn.close()
