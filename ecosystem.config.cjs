@@ -7,7 +7,8 @@ module.exports = {
     max_memory_restart: '2048M',
     autorestart: true,
     watch: false,
-    kill_timeout: 15000,             // wait 15s for graceful shutdown before SIGKILL (needs time to cancel background tasks)
+    kill_timeout: 20000,             // wait 20s for graceful shutdown before SIGKILL
+    restart_delay: 3000,             // wait 3s after kill before starting new process (lets OS release port 6200)
     env: {},
     min_uptime: 30000,               // <30s = counts as "crashed"
     max_restarts: 10,                // give up after 10 fast restarts

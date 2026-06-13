@@ -519,6 +519,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v21_migration(db_path)
     # Run v22 migration for risk-weighted knowledge frontiers
     run_v22_migration(db_path)
+    # Run v23 migration for backpressure synthesis
+    run_v23_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -1570,6 +1572,69 @@ def run_v22_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v22 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v23_migration(db_path: Optional[Path] = None) -> None:
+    """Run v23 migration: Backpressure-triggered memory synthesis (Round 3 Gap 2)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if priority_tier column already exists in tasks
+        cursor.execute("PRAGMA table_info(tasks)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        columns_added = []
+
+        # Add priority_tier column if it doesn't exist
+        if 'priority_tier' not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN priority_tier TEXT DEFAULT 'deferrable'")
+            columns_added.append('priority_tier')
+
+        # Create index on priority_tier
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tier ON tasks(priority_tier, state)")
+
+        # Check if task_synthesis_log table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='task_synthesis_log'")
+        if not cursor.fetchone():
+            # Create task_synthesis_log table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS task_synthesis_log (
+                    id TEXT PRIMARY KEY,
+                    triggered_at TEXT NOT NULL,
+                    queue_depth_before INTEGER NOT NULL,
+                    tasks_consumed INTEGER NOT NULL DEFAULT 0,
+                    tasks_created INTEGER NOT NULL DEFAULT 0,
+                    compression_ratio REAL DEFAULT 1.0,
+                    synthesis_groups TEXT,
+                    completed_at TEXT
+                )
+            """)
+            logger.info("v23 migration: created task_synthesis_log table")
+
+        # Seed: mark known realtime task types
+        cursor.execute("""
+            UPDATE tasks SET priority_tier = 'realtime'
+            WHERE task_type IN ('notify', 'auction', 'bid', 'alert') AND priority_tier = 'deferrable'
+        """)
+
+        conn.commit()
+        if columns_added:
+            logger.info(f"v23 migration: added columns {columns_added}, created synthesis tracking")
+        else:
+            logger.debug("v23 migration: priority_tier column already exists, ensured synthesis table")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v23 migration failed: %s", e)
         raise
     finally:
         conn.close()
