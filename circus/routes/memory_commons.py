@@ -16,7 +16,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 _search_rate: dict = {}
 _search_rate_lock = __import__('threading').Lock()
 
-def _check_search_rate(client_ip: str) -> None:
+def _check_search_rate(client_ip: str, is_authenticated: bool = False) -> None:
+    """Check unauthenticated search rate (30/min per IP). Authenticated requests bypass."""
+    if is_authenticated:
+        return  # No rate limit for authenticated searches
+
     import time
     bucket = int(time.time() / 60)
     with _search_rate_lock:
@@ -66,6 +70,8 @@ from circus.models import (
     DomainClaim,
     DomainClaimResponse,
     DomainSteward,
+    DomainShiftSignalRequest,
+    DomainShiftSignalResponse,
 )
 from circus.services.goal_router import goal_router
 from circus.services.provenance import decay_confidence
@@ -77,6 +83,20 @@ import json
 import sqlite3
 
 router = APIRouter(prefix="/api/v1/memory-commons", tags=["memory-commons"])
+
+# Default troupe ID for agents not in any troupe
+DEFAULT_TROUPE_ID = 'default'
+
+
+def get_agent_troupe(conn: sqlite3.Connection, agent_id: str) -> str:
+    """Get the troupe_id for an agent. Returns 'default' if not in any troupe or on error."""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT troupe_id FROM troupe_members WHERE agent_id = ? LIMIT 1", (agent_id,))
+        row = cursor.fetchone()
+        return row[0] if row else DEFAULT_TROUPE_ID
+    except Exception:
+        return DEFAULT_TROUPE_ID
 
 
 def safe_json_loads(json_str: str, context: str = "data", user_supplied: bool = False) -> Any:
@@ -432,6 +452,22 @@ async def publish_memory(
             author_trust_score=trust_score
         )
 
+        # Determine troupe_id: use request override or agent's troupe membership
+        if mem_req.troupe_id:
+            # Verify agent is a member of the requested troupe
+            cursor.execute(
+                "SELECT 1 FROM troupe_members WHERE troupe_id = ? AND agent_id = ?",
+                (mem_req.troupe_id, agent_id)
+            )
+            if not cursor.fetchone():
+                raise HTTPException(status_code=403, detail="Not authorized to publish to this troupe")
+            troupe_id = mem_req.troupe_id
+        else:
+            troupe_id = get_agent_troupe(conn, agent_id)
+
+        # Calculate expires_at (90 days from now)
+        expires_at = (now + timedelta(days=90)).isoformat()
+
         # Insert into shared_memories (use memory-commons room)
         # Retry on ID collision (max 3 attempts)
         for attempt in range(3):
@@ -440,8 +476,9 @@ async def publish_memory(
                     INSERT INTO shared_memories (
                         id, room_id, from_agent_id, content, category, domain, tags, provenance,
                         privacy_tier, hop_count, original_author, confidence,
-                        age_days, effective_confidence, shared_at, trust_verified
-                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0)
+                        age_days, effective_confidence, shared_at, trust_verified, troupe_id,
+                        expires_at, contradiction_count
+                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0, ?, ?, 0)
                 """, (
                     memory_id,
                     agent_id,
@@ -454,7 +491,9 @@ async def publish_memory(
                     agent_id,
                     mem_req.confidence,
                     effective_conf,
-                    now.isoformat()
+                    now.isoformat(),
+                    troupe_id,
+                    expires_at
                 ))
                 conn.commit()
                 break
@@ -1103,7 +1142,8 @@ async def search_shared_knowledge(
                 detail="Invalid owner_id format"
             )
 
-    _check_search_rate(request.client.host or "unknown")
+    # Authenticated requests bypass rate limit
+    _check_search_rate(request.client.host or "unknown", is_authenticated=True)
     if not settings.memory_commons_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1123,6 +1163,15 @@ async def search_shared_knowledge(
     with get_db() as conn:
         cursor = conn.cursor()
 
+        # Build troupe filter: agent can see default troupe + their own troupes
+        troupe_list = [DEFAULT_TROUPE_ID]  # Always include default troupe
+        cursor.execute("SELECT troupe_id FROM troupe_members WHERE agent_id = ?", (agent_id,))
+        agent_troupes = [r[0] for r in cursor.fetchall()]
+        if agent_troupes:
+            troupe_list.extend(agent_troupes)
+
+        troupe_placeholders = ','.join('?' * len(troupe_list))
+
         # Check if FTS table exists (fts_shared_memories)
         cursor.execute("""
             SELECT name FROM sqlite_master
@@ -1130,31 +1179,36 @@ async def search_shared_knowledge(
         """)
         has_fts = cursor.fetchone() is not None
 
+        # Build troupe filter clause
+        troupe_filter = f"AND sm.troupe_id IN ({troupe_placeholders})" if has_fts else f"AND troupe_id IN ({troupe_placeholders})"
+
         # Build query
         if has_fts:
             # FTS search
             if owner_id:
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT sm.id, sm.content, sm.category, sm.domain, sm.confidence,
-                           sm.hop_count, sm.from_agent_id, sm.shared_at
+                           sm.hop_count, sm.from_agent_id, sm.shared_at, sm.contradiction_count, sm.expires_at
                     FROM fts_shared_memories fts
                     JOIN shared_memories sm ON fts.rowid = sm.rowid
                     WHERE fts.content MATCH ? AND sm.provenance LIKE ?
                       AND (sm.status IS NULL OR sm.status = 'active')
+                      {troupe_filter}
                     ORDER BY rank
                     LIMIT ?
-                """, (fts_query, f'%"owner_id": "{owner_id}"%', limit))
+                """, (fts_query, f'%"owner_id": "{owner_id}"%', *troupe_list, limit))
             else:
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT sm.id, sm.content, sm.category, sm.domain, sm.confidence,
-                           sm.hop_count, sm.from_agent_id, sm.shared_at
+                           sm.hop_count, sm.from_agent_id, sm.shared_at, sm.contradiction_count, sm.expires_at
                     FROM fts_shared_memories fts
                     JOIN shared_memories sm ON fts.rowid = sm.rowid
                     WHERE fts.content MATCH ?
                       AND (sm.status IS NULL OR sm.status = 'active')
+                      {troupe_filter}
                     ORDER BY rank
                     LIMIT ?
-                """, (fts_query, limit))
+                """, (fts_query, *troupe_list, limit))
         else:
             # Fallback: LIKE search — split multi-word queries into individual OR conditions
             # "whatsauction deploy" → content LIKE '%whatsauction%' OR content LIKE '%deploy%'
@@ -1165,27 +1219,29 @@ async def search_shared_knowledge(
             if owner_id:
                 cursor.execute(f"""
                     SELECT id, content, category, domain, confidence,
-                           hop_count, from_agent_id, shared_at
+                           hop_count, from_agent_id, shared_at, contradiction_count, expires_at
                     FROM shared_memories
                     WHERE ({like_clauses}) AND provenance LIKE ?
                       AND (status IS NULL OR status = 'active')
+                      {troupe_filter}
                     ORDER BY shared_at DESC
                     LIMIT ?
-                """, (*like_params, f'%"owner_id": "{owner_id}"%', limit))
+                """, (*like_params, f'%"owner_id": "{owner_id}"%', *troupe_list, limit))
             else:
                 cursor.execute(f"""
                     SELECT id, content, category, domain, confidence,
-                           hop_count, from_agent_id, shared_at
+                           hop_count, from_agent_id, shared_at, contradiction_count, expires_at
                     FROM shared_memories
                     WHERE ({like_clauses})
                       AND (status IS NULL OR status = 'active')
+                      {troupe_filter}
                     ORDER BY shared_at DESC
                     LIMIT ?
-                """, (*like_params, limit))
+                """, (*like_params, *troupe_list, limit))
 
         results = []
         for row in cursor.fetchall():
-            memory_id, content, category, domain, confidence, hop_count, from_agent_id, shared_at = row
+            memory_id, content, category, domain, confidence, hop_count, from_agent_id, shared_at, contradiction_count, expires_at = row
 
             # Calculate score: confidence × (1 - hop_count × 0.1) — capped at 0.0
             score = max(0.0, confidence * (1.0 - hop_count * 0.1))
@@ -1201,7 +1257,9 @@ async def search_shared_knowledge(
                 "confidence": confidence,
                 "score": round(score, 2),
                 "source_agent": source_agent,
-                "shared_at": shared_at
+                "shared_at": shared_at,
+                "contradiction_count": contradiction_count or 0,
+                "expires_at": expires_at
             })
 
         return {
@@ -1281,4 +1339,107 @@ async def auto_resolve_conflicts(
         "skipped": skipped_count,
         "errors": errors,
         "message": f"Auto-resolved {resolved_count} conflicts ({skipped_count} skipped as already superseded)"
+    }
+
+
+@router.post("/signal-shift", response_model=DomainShiftSignalResponse)
+async def signal_domain_shift(
+    signal_req: DomainShiftSignalRequest,
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Signal a domain shift to quarantine stale memories.
+
+    When a domain undergoes significant change (e.g., architecture refactor,
+    API migration), this endpoint quarantines all memories matching the domain_tag.
+    """
+    if not settings.memory_commons_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Memory Commons is disabled"
+        )
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Generate signal ID
+        signal_id = f"dss-{secrets.token_hex(8)}"
+        now = datetime.utcnow().isoformat()
+
+        # Quarantine matching memories (domain LIKE search for partial matches)
+        # E.g., domain_tag="whatsauction" matches "whatsauction.bidding", "whatsauction.payment", etc.
+        cursor.execute("""
+            UPDATE shared_memories
+            SET status = 'quarantined'
+            WHERE domain LIKE '%' || ? || '%'
+              AND status = 'active'
+        """, (signal_req.domain_tag,))
+
+        affected_count = cursor.rowcount
+
+        # Insert signal record
+        cursor.execute("""
+            INSERT INTO domain_shift_signals (
+                id, domain_tag, filed_by, reason, filed_at, affected_count
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            signal_id,
+            signal_req.domain_tag,
+            agent_id,
+            signal_req.reason,
+            now,
+            affected_count
+        ))
+
+        conn.commit()
+
+        return DomainShiftSignalResponse(
+            signal_id=signal_id,
+            domain_tag=signal_req.domain_tag,
+            affected_count=affected_count,
+            filed_at=now
+        )
+
+
+@router.post("/contradict/{memory_id}")
+async def file_contradiction(
+    memory_id: str,
+    agent_id: str = Depends(verify_token),
+    request: Request = None,
+):
+    """
+    File a contradiction against a shared memory.
+    Increments contradiction_count. Auto-demotes to 'quarantined' at 3+ contradictions.
+    Auth required.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Verify memory exists and is active
+        cursor.execute(
+            "SELECT id, contradiction_count, status FROM shared_memories WHERE id = ?",
+            (memory_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        mem_id, current_count, current_status = row
+        new_count = (current_count or 0) + 1
+
+        # Auto-demote at 3+ contradictions
+        new_status = 'quarantined' if new_count >= 3 else current_status
+
+        cursor.execute(
+            "UPDATE shared_memories SET contradiction_count = ?, status = ? WHERE id = ?",
+            (new_count, new_status, memory_id)
+        )
+        conn.commit()
+
+    return {
+        "memory_id": memory_id,
+        "contradiction_count": new_count,
+        "status": new_status,
+        "auto_demoted": new_status == 'quarantined',
+        "filed_by": agent_id,
     }

@@ -221,6 +221,15 @@ class TaskSubmitRequest(BaseModel):
     output_schema: Optional[dict[str, Any]] = None
 
 
+class BroadcastTaskRequest(BaseModel):
+    """Broadcast task to best available agent via competence auction."""
+    task_type: str = Field(..., min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    domain: Optional[str] = None  # e.g. "coding", "security", "research"
+    deadline: Optional[str] = None
+    output_schema: Optional[dict[str, Any]] = None
+
+
 class TaskUpdateRequest(BaseModel):
     """Update task state."""
     state: TaskState
@@ -243,6 +252,18 @@ class TaskResponse(BaseModel):
     updated_at: str
     deadline: Optional[str] = None
     output_schema: Optional[dict[str, Any]] = None
+
+
+class BroadcastTaskResponse(BaseModel):
+    """Response for broadcast task routing."""
+    task_id: str
+    winner_agent_id: str
+    winner_score: float
+    domain: Optional[str]
+    task_type: str
+    candidates_evaluated: int
+    state: TaskState
+    created_at: str
 
 
 class TaskStateTransition(BaseModel):
@@ -352,6 +373,7 @@ class MemoryPublish(BaseModel):
     provenance: Optional[ProvenanceInfo] = Field(default=None)
     confidence: float = Field(default=0.9, ge=0.1, le=1.0)
     preference: Optional[PreferenceField] = Field(default=None)  # Week 4: behavior-delta preference
+    troupe_id: Optional[str] = Field(default=None)  # Optional troupe override for memory isolation
 
 
 class PublishResponse(BaseModel):
@@ -458,3 +480,57 @@ class PublishResponseWithConflict(BaseModel):
     conflict_resolution: Optional[ConflictResolution] = None
     preference_activated: Optional[bool] = None  # Week 4: True if preference was admitted to active_preferences
     decision_trace: Optional[dict[str, Any]] = None  # Week 6: Gate-by-gate preference admission trace
+
+
+# Domain shift signal models (Gap 1)
+
+
+class DomainShiftSignalRequest(BaseModel):
+    """Request to signal a domain shift (Gap 1)."""
+    domain_tag: str
+    reason: Optional[str] = None
+
+
+class DomainShiftSignalResponse(BaseModel):
+    """Response for domain shift signal (Gap 1)."""
+    signal_id: str
+    domain_tag: str
+    affected_count: int
+    filed_at: str
+
+
+# Task chain validation models (Gap 4)
+
+
+class ChainNodeSubmit(BaseModel):
+    """Submit a node in a multi-bot task chain."""
+    root_task_id: str
+    parent_task_id: Optional[str] = None
+    role: str = "sub-agent"
+    input_payload: dict = {}
+    output: dict = {}
+    verdict: str
+    output_summary: str
+
+
+class ChainNodeResponse(BaseModel):
+    """Response for chain node submission."""
+    node_id: str
+    root_task_id: str
+    task_id: str
+    agent_id: str
+    role: str
+    verdict: str
+    input_hash: str
+    output_hash: str
+    created_at: str
+
+
+class ChainValidationResult(BaseModel):
+    """Result of validating a multi-bot task chain."""
+    root_task_id: str
+    node_count: int
+    contradictions_found: int
+    chain_valid: bool
+    blame: list
+    details: list
