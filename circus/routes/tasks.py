@@ -305,16 +305,29 @@ async def broadcast_task(
         """, (task_id, None, TaskState.SUBMITTED.value, now))
         conn.commit()
 
-        return BroadcastTaskResponse(
-            task_id=task_id,
-            winner_agent_id=winner_id,
-            winner_score=winner_score,
-            domain=request.domain,
-            task_type=request.task_type,
-            candidates_evaluated=len(candidates),
-            state=TaskState.SUBMITTED,
-            created_at=now,
-        )
+        # Fetch the created task to check reversibility_class
+        cursor.execute("SELECT reversibility_class FROM tasks WHERE id = ?", (task_id,))
+        task_row = cursor.fetchone()
+        reversibility_class = task_row['reversibility_class'] if task_row else None
+
+        response_dict = {
+            "task_id": task_id,
+            "winner_agent_id": winner_id,
+            "winner_score": winner_score,
+            "domain": request.domain,
+            "task_type": request.task_type,
+            "candidates_evaluated": len(candidates),
+            "state": TaskState.SUBMITTED,
+            "created_at": now,
+        }
+
+        # For IRREVERSIBLE tasks, add escrow flags
+        if reversibility_class == 'IRREVERSIBLE':
+            response_dict['escrow_required'] = True
+            response_dict['escrow_amount'] = request.payload.get('payout_amount', 0) * 3.0
+            response_dict['escrow_endpoint'] = '/api/v1/escrow/lock'
+
+        return BroadcastTaskResponse(**response_dict)
 
 
 @router.post("", response_model=TaskResponse, status_code=201)
@@ -399,20 +412,33 @@ async def submit_task(
                 with get_db() as conn2:
                     run_task_synthesis(conn2)
 
-    return TaskResponse(
-        task_id=task_id,
-        from_agent_id=agent_id,
-        to_agent_id=request.to_agent_id,
-        task_type=request.task_type,
-        payload=request.payload,
-        state=TaskState.SUBMITTED,
-        created_at=now,
-        updated_at=now,
-        deadline=request.deadline,
-        output_schema=request.output_schema,
-        reversibility_class=None,
-        required_capabilities=request.required_capabilities
-    )
+        # Fetch reversibility_class to check if escrow is needed
+        cursor.execute("SELECT reversibility_class FROM tasks WHERE id = ?", (task_id,))
+        task_row = cursor.fetchone()
+        reversibility_class = task_row['reversibility_class'] if task_row else None
+
+    # Build response with optional escrow fields for IRREVERSIBLE tasks
+    response_data = {
+        "task_id": task_id,
+        "from_agent_id": agent_id,
+        "to_agent_id": request.to_agent_id,
+        "task_type": request.task_type,
+        "payload": request.payload,
+        "state": TaskState.SUBMITTED,
+        "created_at": now,
+        "updated_at": now,
+        "deadline": request.deadline,
+        "output_schema": request.output_schema,
+        "reversibility_class": reversibility_class,
+        "required_capabilities": request.required_capabilities
+    }
+
+    if reversibility_class == 'IRREVERSIBLE':
+        response_data['escrow_required'] = True
+        response_data['escrow_amount'] = request.payload.get('payout_amount', 0) * 3.0
+        response_data['escrow_endpoint'] = '/api/v1/escrow/lock'
+
+    return TaskResponse(**response_data)
 
 
 @router.patch("/{task_id}", response_model=TaskResponse)

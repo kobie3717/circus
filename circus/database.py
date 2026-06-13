@@ -539,6 +539,10 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v31_migration(db_path)
     # Run v32 migration for memory_contradictions table (Phase 3: contradiction tracking)
     run_v32_migration(db_path)
+    # Run v33 migration for task_escrow table (Phase 4: attack-resistant escrow)
+    run_v33_migration(db_path)
+    # Run v34 migration for fraud_reports table (Phase 4: fraud tracking)
+    run_v34_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -2157,6 +2161,115 @@ def run_v32_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v32 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v33_migration(db_path: Optional[Path] = None) -> None:
+    """Run v33 migration: task_escrow table (Phase 4: attack-resistant escrow)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if task_escrow table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='task_escrow'")
+        if cursor.fetchone():
+            logger.debug("v33 migration: task_escrow table already exists, skipping")
+            return
+
+        # Create task_escrow table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS task_escrow (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                amount_staked REAL NOT NULL,
+                sponsor_1_id TEXT,
+                sponsor_1_stake REAL DEFAULT 0.0,
+                sponsor_2_id TEXT,
+                sponsor_2_stake REAL DEFAULT 0.0,
+                payout_amount REAL NOT NULL,
+                status TEXT DEFAULT 'locked',
+                locked_at TEXT NOT NULL,
+                release_date TEXT NOT NULL,
+                released_at TEXT,
+                dispute_id INTEGER,
+                FOREIGN KEY (task_id) REFERENCES tasks(id),
+                FOREIGN KEY (agent_id) REFERENCES agents(id),
+                FOREIGN KEY (sponsor_1_id) REFERENCES agents(id),
+                FOREIGN KEY (sponsor_2_id) REFERENCES agents(id),
+                CHECK (status IN ('locked', 'released', 'forfeited', 'disputed'))
+            )
+        """)
+
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_escrow_task ON task_escrow(task_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_escrow_agent ON task_escrow(agent_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_escrow_release ON task_escrow(release_date, status)")
+
+        conn.commit()
+        logger.info("v33 migration: created task_escrow table")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v33 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v34_migration(db_path: Optional[Path] = None) -> None:
+    """Run v34 migration: fraud_reports table (Phase 4: fraud tracking)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if fraud_reports table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='fraud_reports'")
+        if cursor.fetchone():
+            logger.debug("v34 migration: fraud_reports table already exists, skipping")
+            return
+
+        # Create fraud_reports table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS fraud_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                escrow_id INTEGER NOT NULL,
+                reporter_id TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                status TEXT DEFAULT 'open',
+                penalty_applied INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                resolved_by TEXT,
+                resolution_note TEXT,
+                FOREIGN KEY (task_id) REFERENCES tasks(id),
+                FOREIGN KEY (escrow_id) REFERENCES task_escrow(id),
+                FOREIGN KEY (reporter_id) REFERENCES agents(id),
+                CHECK (status IN ('open', 'confirmed', 'dismissed'))
+            )
+        """)
+
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_fraud_reports_task ON fraud_reports(task_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_fraud_reports_status ON fraud_reports(status)")
+
+        conn.commit()
+        logger.info("v34 migration: created fraud_reports table")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v34 migration failed: %s", e)
         raise
     finally:
         conn.close()
