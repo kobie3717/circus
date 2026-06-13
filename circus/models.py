@@ -212,6 +212,12 @@ class TaskState(str, Enum):
     CANCELED = "canceled"
 
 
+class PriorityTier(str, Enum):
+    """Priority tier for tasks."""
+    REALTIME = "realtime"
+    DEFERRABLE = "deferrable"
+
+
 class NicheTier(str, Enum):
     """Task niche tier classification."""
     SANDBOX = "SANDBOX"
@@ -246,6 +252,7 @@ class TaskSubmitRequest(BaseModel):
     payload: dict[str, Any] = Field(...)
     deadline: Optional[str] = None
     output_schema: Optional[dict[str, Any]] = None
+    priority_tier: Optional[PriorityTier] = PriorityTier.DEFERRABLE
 
 
 class BroadcastTaskRequest(BaseModel):
@@ -596,3 +603,24 @@ class EscrowLockInfo(BaseModel):
     locked_at: str
     unlocks_at: str
     released_at: Optional[str] = None
+
+
+# Task synthesis models (Round 3 Gap 2)
+
+
+class QueueDepthResponse(BaseModel):
+    """Queue depth by priority tier."""
+    realtime_pending: int
+    deferrable_pending: int
+    synthesis_threshold: int
+    synthesis_recommended: bool
+
+
+class SynthesisResult(BaseModel):
+    """Result of backpressure synthesis."""
+    synthesis_id: str
+    tasks_consumed: int
+    tasks_created: int
+    compression_ratio: float
+    groups: list[dict[str, Any]]
+    triggered_at: str

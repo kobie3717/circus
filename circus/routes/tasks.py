@@ -30,6 +30,9 @@ from circus.models import (
     NicheTier,
     NicheRegistryEntry,
     NicheRegistryResponse,
+    PriorityTier,
+    QueueDepthResponse,
+    SynthesisResult,
     TaskResponse,
     TaskState,
     TaskStateTransition,
@@ -40,6 +43,85 @@ from circus.routes.agents import verify_token
 from circus.services.task_engine import is_valid_transition
 
 router = APIRouter()
+
+
+def run_task_synthesis(conn) -> dict:
+    """Mine pending deferrable tasks for consolidation opportunities. Groups by task_type."""
+    import secrets
+    import json
+    from datetime import datetime
+
+    now = datetime.utcnow().isoformat()
+    cursor = conn.cursor()
+
+    # Get all pending deferrable tasks
+    cursor.execute("""
+        SELECT id, from_agent_id, to_agent_id, task_type, payload, created_at
+        FROM tasks
+        WHERE state = 'submitted' AND priority_tier = 'deferrable'
+        ORDER BY task_type, created_at
+    """)
+    pending = cursor.fetchall()
+
+    # Group by task_type
+    groups = {}
+    for task in pending:
+        t = task['task_type']
+        if t not in groups:
+            groups[t] = []
+        groups[t].append(task)
+
+    synthesis_groups = []
+    tasks_consumed = 0
+    tasks_created = 0
+
+    for task_type, tasks in groups.items():
+        if len(tasks) < 3:
+            continue  # Only synthesize groups of 3+
+
+        # Cancel originals
+        original_ids = [t['id'] for t in tasks]
+        for tid in original_ids:
+            cursor.execute("UPDATE tasks SET state = 'canceled', error = 'synthesized', updated_at = ? WHERE id = ?", (now, tid))
+
+        # Create synthesized task
+        synth_id = secrets.token_hex(8)
+        # Merge payloads
+        payloads = []
+        for t in tasks:
+            try:
+                p = json.loads(t['payload']) if t['payload'] else {}
+                payloads.append(p)
+            except Exception:
+                payloads.append({"raw": t['payload']})
+
+        merged_payload = json.dumps({
+            "synthesized": True,
+            "source_count": len(tasks),
+            "source_ids": original_ids,
+            "merged_payloads": payloads
+        })
+
+        cursor.execute("""
+            INSERT INTO tasks (id, from_agent_id, to_agent_id, task_type, payload, state, priority_tier, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'submitted', 'deferrable', ?, ?)
+        """, (synth_id, tasks[0]['from_agent_id'], tasks[0]['to_agent_id'], task_type, merged_payload, now, now))
+
+        synthesis_groups.append({"original_ids": original_ids, "synthesized_id": synth_id, "task_type": task_type})
+        tasks_consumed += len(tasks)
+        tasks_created += 1
+
+    compression = round(tasks_consumed / tasks_created, 2) if tasks_created > 0 else 1.0
+
+    # Log the synthesis event
+    log_id = secrets.token_hex(6)
+    cursor.execute("""
+        INSERT INTO task_synthesis_log (id, triggered_at, queue_depth_before, tasks_consumed, tasks_created, compression_ratio, synthesis_groups, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (log_id, now, len(pending), tasks_consumed, tasks_created, compression, json.dumps(synthesis_groups), now))
+
+    conn.commit()
+    return {"synthesis_id": log_id, "tasks_consumed": tasks_consumed, "tasks_created": tasks_created, "compression_ratio": compression, "groups": synthesis_groups, "triggered_at": now}
 
 
 @router.post("/broadcast", response_model=BroadcastTaskResponse, status_code=201)
@@ -166,16 +248,17 @@ async def submit_task(
         # Create task
         task_id = f"task-{secrets.token_hex(6)}"
         now = datetime.utcnow().isoformat()
+        priority_tier = request.priority_tier.value if request.priority_tier else PriorityTier.DEFERRABLE.value
 
         cursor.execute("""
             INSERT INTO tasks (
                 id, from_agent_id, to_agent_id, task_type, payload,
-                state, created_at, updated_at, deadline, output_schema
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                state, priority_tier, created_at, updated_at, deadline, output_schema
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             task_id, agent_id, request.to_agent_id,
             request.task_type, json.dumps(request.payload),
-            TaskState.SUBMITTED.value, now, now, request.deadline,
+            TaskState.SUBMITTED.value, priority_tier, now, now, request.deadline,
             json.dumps(request.output_schema) if request.output_schema else None
         ))
 
@@ -187,6 +270,15 @@ async def submit_task(
         """, (task_id, None, TaskState.SUBMITTED.value, now))
 
         conn.commit()
+
+        # Auto-trigger synthesis if deferrable queue exceeds threshold
+        if priority_tier == 'deferrable':
+            cursor.execute("SELECT COUNT(*) FROM tasks WHERE state='submitted' AND priority_tier='deferrable'")
+            depth = cursor.fetchone()[0]
+            if depth > 10:
+                # Run synthesis in a new connection context to avoid transaction issues
+                with get_db() as conn2:
+                    run_task_synthesis(conn2)
 
     return TaskResponse(
         task_id=task_id,
@@ -411,6 +503,54 @@ async def get_outbox(
             ))
 
         return tasks
+
+
+@router.get("/queue-depth", response_model=QueueDepthResponse, tags=["synthesis"])
+async def get_queue_depth(agent_id: str = Depends(verify_token)):
+    """Get current queue depth by tier."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM tasks WHERE state='submitted' AND priority_tier='realtime'")
+        rt = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM tasks WHERE state='submitted' AND priority_tier='deferrable'")
+        df = cursor.fetchone()[0]
+    return QueueDepthResponse(
+        realtime_pending=rt,
+        deferrable_pending=df,
+        synthesis_threshold=10,
+        synthesis_recommended=df > 10
+    )
+
+
+@router.post("/synthesize", response_model=SynthesisResult, tags=["synthesis"], status_code=200)
+async def trigger_synthesis(agent_id: str = Depends(verify_token)):
+    """Manually trigger backpressure synthesis on deferrable task queue."""
+    with get_db() as conn:
+        result = run_task_synthesis(conn)
+    return SynthesisResult(**result)
+
+
+@router.get("/synthesis-log", tags=["synthesis"])
+async def get_synthesis_log(limit: int = 10, agent_id: str = Depends(verify_token)):
+    """Get recent synthesis events."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, triggered_at, queue_depth_before, tasks_consumed, tasks_created, compression_ratio, completed_at
+            FROM task_synthesis_log ORDER BY triggered_at DESC LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+    return {"events": [
+        {
+            "id": r[0],
+            "triggered_at": r[1],
+            "queue_depth_before": r[2],
+            "tasks_consumed": r[3],
+            "tasks_created": r[4],
+            "compression_ratio": r[5],
+            "completed_at": r[6]
+        } for r in rows
+    ]}
 
 
 @router.get("/niches", tags=["niches"])
