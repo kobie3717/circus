@@ -535,6 +535,10 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v29_migration(db_path)
     # Run v30 migration for reversibility_class + required_capabilities on tasks
     run_v30_migration(db_path)
+    # Run v31 migration for memory_claims table (Phase 3: atomic claim store)
+    run_v31_migration(db_path)
+    # Run v32 migration for memory_contradictions table (Phase 3: contradiction tracking)
+    run_v32_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -2017,6 +2021,142 @@ def run_v30_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v30 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v31_migration(db_path: Optional[Path] = None) -> None:
+    """Run v31 migration: memory_claims table for atomic claim store (Phase 3)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if memory_claims table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_claims'")
+        if cursor.fetchone():
+            logger.debug("v31 migration: memory_claims table already exists, skipping")
+            return
+
+        # Create memory_claims table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS memory_claims (
+                id TEXT PRIMARY KEY,
+                namespace_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                claim_text TEXT NOT NULL,
+                subject TEXT,
+                claim_type TEXT DEFAULT 'semantic',
+                importance REAL DEFAULT 0.5,
+                confidence REAL DEFAULT 0.6,
+                status TEXT DEFAULT 'candidate',
+                source TEXT,
+                episode_id TEXT,
+                created_at TEXT NOT NULL,
+                last_accessed TEXT,
+                access_count INTEGER DEFAULT 0,
+                superseded_by TEXT,
+                decay_rate REAL,
+                FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+                CHECK (claim_type IN ('episodic', 'semantic', 'procedural', 'identity')),
+                CHECK (status IN ('candidate', 'active', 'superseded', 'archived'))
+            )
+        """)
+
+        # Create FTS5 virtual table for claim search
+        cursor.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts_memory_claims
+            USING fts5(claim_text, subject, content='memory_claims', content_rowid='rowid')
+        """)
+
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_claims_namespace ON memory_claims(namespace_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_claims_agent ON memory_claims(agent_id, claim_type, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_claims_subject ON memory_claims(subject, status)")
+
+        # Create FTS sync triggers
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS memory_claims_ai
+            AFTER INSERT ON memory_claims BEGIN
+                INSERT INTO fts_memory_claims(rowid, claim_text, subject) VALUES (new.rowid, new.claim_text, new.subject);
+            END
+        """)
+
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS memory_claims_ad
+            AFTER DELETE ON memory_claims BEGIN
+                INSERT INTO fts_memory_claims(fts_memory_claims, rowid, claim_text, subject)
+                VALUES ('delete', old.rowid, old.claim_text, old.subject);
+            END
+        """)
+
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS memory_claims_au
+            AFTER UPDATE ON memory_claims BEGIN
+                INSERT INTO fts_memory_claims(fts_memory_claims, rowid, claim_text, subject)
+                VALUES ('delete', old.rowid, old.claim_text, old.subject);
+                INSERT INTO fts_memory_claims(rowid, claim_text, subject) VALUES (new.rowid, new.claim_text, new.subject);
+            END
+        """)
+
+        conn.commit()
+        logger.info("v31 migration: created memory_claims table with FTS5 indexing")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v31 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v32_migration(db_path: Optional[Path] = None) -> None:
+    """Run v32 migration: memory_contradictions table (Phase 3)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if memory_contradictions table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_contradictions'")
+        if cursor.fetchone():
+            logger.debug("v32 migration: memory_contradictions table already exists, skipping")
+            return
+
+        # Create memory_contradictions table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS memory_contradictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                claim_id TEXT NOT NULL,
+                contradicting_claim_id TEXT NOT NULL,
+                contradicting_agent_id TEXT NOT NULL,
+                evidence TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                FOREIGN KEY (claim_id) REFERENCES memory_claims(id),
+                FOREIGN KEY (contradicting_agent_id) REFERENCES agents(id),
+                CHECK (status IN ('pending', 'confirmed', 'dismissed'))
+            )
+        """)
+
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mc_claim ON memory_contradictions(claim_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mc_agent ON memory_contradictions(contradicting_agent_id)")
+
+        conn.commit()
+        logger.info("v32 migration: created memory_contradictions table")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v32 migration failed: %s", e)
         raise
     finally:
         conn.close()
