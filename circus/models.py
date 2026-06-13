@@ -624,3 +624,38 @@ class SynthesisResult(BaseModel):
     compression_ratio: float
     groups: list[dict[str, Any]]
     triggered_at: str
+
+
+# Trust-decay escrow with cross-backing models (Round 3 Gap 1)
+
+
+class BackingStakeRequest(BaseModel):
+    """Request to stake escrow backing a lower-trust agent's task attempt."""
+    task_id: str
+    performer_agent_id: str
+    stake_amount: float = Field(gt=0, le=50.0)
+
+
+class BackingStakeResponse(BaseModel):
+    """Response for backing stake."""
+    stake_id: str
+    task_id: str
+    backer_agent_id: str
+    performer_agent_id: str
+    stake_amount: float
+    trust_delta: float
+    max_yield_rate: float
+    staked_at: str
+
+
+class BackingResolveRequest(BaseModel):
+    """Request to resolve backing stakes for a completed task."""
+    task_id: str
+    outcome: str
+
+
+class BackingResolveResponse(BaseModel):
+    """Response for backing resolution."""
+    stakes_resolved: int
+    total_yield_earned: float
+    total_forfeited: float

@@ -521,6 +521,8 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v22_migration(db_path)
     # Run v23 migration for backpressure synthesis
     run_v23_migration(db_path)
+    # Run v24 migration for trust-decay escrow with cross-backing
+    run_v24_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -1635,6 +1637,72 @@ def run_v23_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v23 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v24_migration(db_path: Optional[Path] = None) -> None:
+    """Run v24 migration: Trust-decay escrow with cross-backing (Round 3 Gap 1)."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if task_backing_stakes table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='task_backing_stakes'")
+        if cursor.fetchone():
+            logger.debug("v24 migration: task_backing_stakes table already exists, skipping")
+            return
+
+        # Create task_backing_stakes table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS task_backing_stakes (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                backer_agent_id TEXT NOT NULL,
+                performer_agent_id TEXT NOT NULL,
+                stake_amount REAL NOT NULL DEFAULT 0.0,
+                backer_trust_at_stake REAL NOT NULL,
+                performer_trust_at_stake REAL NOT NULL,
+                trust_delta REAL NOT NULL,
+                max_yield_rate REAL NOT NULL,
+                state TEXT NOT NULL DEFAULT 'staked',
+                yield_earned REAL DEFAULT 0.0,
+                staked_at TEXT NOT NULL,
+                resolved_at TEXT,
+                CHECK (state IN ('staked', 'yielded', 'forfeited', 'returned')),
+                FOREIGN KEY (task_id) REFERENCES tasks(id)
+            )
+        """)
+
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tbs_task ON task_backing_stakes(task_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tbs_backer ON task_backing_stakes(backer_agent_id, state)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tbs_performer ON task_backing_stakes(performer_agent_id, state)")
+
+        # Create backing concentration view (anti-cartel)
+        cursor.execute("""
+            CREATE VIEW IF NOT EXISTS backing_concentration AS
+                SELECT performer_agent_id, backer_agent_id,
+                       COUNT(*) as stake_count,
+                       SUM(stake_amount) as total_staked,
+                       SUM(stake_amount) / NULLIF((SELECT SUM(s2.stake_amount) FROM task_backing_stakes s2 WHERE s2.performer_agent_id = s.performer_agent_id AND s2.state = 'staked'), 0) as concentration_ratio
+                FROM task_backing_stakes s
+                WHERE state = 'staked'
+                GROUP BY performer_agent_id, backer_agent_id
+        """)
+
+        conn.commit()
+        logger.info("v24 migration: created task_backing_stakes table and backing_concentration view")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v24 migration failed: %s", e)
         raise
     finally:
         conn.close()
