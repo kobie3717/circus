@@ -554,6 +554,9 @@ def init_database(db_path: Optional[Path] = None) -> None:
     # Run v39 migration for dispute_votes table (Elder multi-sig)
     run_v39_migration(db_path)
 
+    # Run v40 migration for auto_discovered column (peer autodiscovery)
+    run_v40_migration(db_path)
+
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
     seed_owner_key_from_env(conn)
@@ -2598,6 +2601,35 @@ def run_v39_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v39 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v40_migration(db_path: Optional[Path] = None) -> None:
+    """Run v40 migration: auto_discovered column for federation_peers (peer autodiscovery)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if auto_discovered column already exists
+        cursor.execute("PRAGMA table_info(federation_peers)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        if 'auto_discovered' not in existing_columns:
+            cursor.execute("ALTER TABLE federation_peers ADD COLUMN auto_discovered INTEGER DEFAULT 0")
+            conn.commit()
+            logger.info("v40 migration: added auto_discovered column to federation_peers")
+        else:
+            logger.debug("v40 migration: auto_discovered column already exists, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v40 migration failed: %s", e)
         raise
     finally:
         conn.close()

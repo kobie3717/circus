@@ -296,6 +296,13 @@ app.include_router(platform.router)  # Phase 6: The Standard — webhooks, obser
 app.include_router(docvault.router)  # DocVault webhook receiver (internal localhost endpoint)
 
 
+@app.get("/.well-known/circus-peers.json", tags=["Federation"])
+async def circus_peers_well_known():
+    """Federation peer autodiscovery endpoint (RFC 9110 /.well-known/)."""
+    from circus.routes.federation import get_circus_peers_well_known
+    return await get_circus_peers_well_known()
+
+
 @app.get("/.well-known/agent.json", tags=["A2A"])
 async def agent_card():
     """A2A Protocol agent card (RFC 9110 /.well-known/)."""

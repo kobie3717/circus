@@ -1,7 +1,9 @@
 """Federation routes for cross-Circus agent discovery (TRQP) and Memory Commons."""
 
+import base64
 import json
 import logging
+import os
 import secrets
 import time
 from datetime import datetime
@@ -637,3 +639,185 @@ async def remove_federation_peer(
         conn.commit()
 
     return {"status": "removed", "url": url}
+
+
+async def get_circus_peers_well_known():
+    """GET /.well-known/circus-peers.json (public, no auth).
+
+    Returns this instance's identity + known active peers.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get instance identity
+        cursor.execute("""
+            SELECT key, value FROM instance_config
+            WHERE key IN ('instance_id', 'public_key')
+        """)
+        config_rows = cursor.fetchall()
+        config = {row[0]: row[1] for row in config_rows}
+
+        instance_id = config.get('instance_id')
+        public_key_b64_stored = config.get('public_key')
+
+        # Decode public key (it's stored as base64 in instance_config)
+        public_key_b64 = public_key_b64_stored if public_key_b64_stored else None
+
+        # Get public URL from env
+        public_url = os.getenv("CIRCUS_PUBLIC_URL", "http://45.10.161.148:6200")
+        api_base = public_url.rstrip('/')
+
+        # Get active peers
+        cursor.execute("""
+            SELECT url, name, public_key, is_healthy, last_seen_at
+            FROM federation_peers
+            WHERE is_healthy = 1
+            ORDER BY last_seen_at DESC
+        """)
+        peers_rows = cursor.fetchall()
+
+        peers = []
+        for row in peers_rows:
+            peer_url = row["url"]
+            peer_name = row["name"] or peer_url
+            peer_public_key_bytes = row["public_key"]
+            peer_is_healthy = bool(row["is_healthy"])
+            peer_last_seen = row["last_seen_at"]
+
+            # Encode public key (stored as bytes in DB)
+            peer_public_key_b64 = base64.b64encode(peer_public_key_bytes).decode('ascii') if peer_public_key_bytes else ""
+
+            peers.append({
+                "instance_id": peer_name,
+                "url": peer_url,
+                "name": peer_name,
+                "public_key": peer_public_key_b64,
+                "is_healthy": peer_is_healthy,
+                "last_seen_at": peer_last_seen
+            })
+
+        # Count agents
+        cursor.execute("SELECT COUNT(*) FROM agents WHERE is_active = 1")
+        agent_count = cursor.fetchone()[0]
+
+    return {
+        "instance_id": instance_id,
+        "version": "1.9.0",
+        "public_key": public_key_b64,
+        "endpoints": {
+            "api": api_base,
+            "push": f"{api_base}/api/v1/federation/push",
+            "peers": f"{api_base}/.well-known/circus-peers.json"
+        },
+        "peers": peers,
+        "agent_count": agent_count,
+        "generated_at": datetime.utcnow().isoformat()
+    }
+
+
+@router.post("/peers/discover")
+async def discover_peer(
+    url: str,
+    agent_id: str = Depends(verify_token)
+):
+    """Manually trigger peer discovery against a specific URL (Elder only).
+
+    Fetches /.well-known/circus-peers.json from the given URL and auto-registers
+    the peer plus any peers they know that we don't.
+
+    Returns: {discovered: N, already_known: N, failed: [...]}
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Check if agent is Elder
+        cursor.execute("SELECT trust_score FROM agents WHERE id = ?", (agent_id,))
+        row = cursor.fetchone()
+
+        if not row or not can_moderate(row["trust_score"]):
+            raise HTTPException(status_code=403, detail="Requires Elder tier")
+
+    discovered = 0
+    already_known = 0
+    failed = []
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            # Fetch well-known endpoint
+            well_known_url = f"{url.rstrip('/')}/.well-known/circus-peers.json"
+            response = await client.get(well_known_url)
+
+            if response.status_code != 200:
+                failed.append({"url": url, "reason": f"HTTP {response.status_code}"})
+                return {"discovered": 0, "already_known": 0, "failed": failed}
+
+            data = response.json()
+
+            # Process main peer
+            with get_db() as conn:
+                cursor = conn.cursor()
+                now = datetime.utcnow().isoformat()
+
+                # Check if main peer already exists
+                cursor.execute("SELECT url FROM federation_peers WHERE url = ?", (url,))
+                if cursor.fetchone():
+                    already_known += 1
+                else:
+                    # Register main peer
+                    peer_id = f"peer-{secrets.token_hex(8)}"
+                    public_key_b64 = data.get("public_key", "")
+                    public_key_bytes = base64.b64decode(public_key_b64) if public_key_b64 else b'\x00' * 32
+
+                    cursor.execute("""
+                        INSERT INTO federation_peers (
+                            id, url, name, public_key, created_at, registered_at,
+                            is_healthy, consecutive_failures, auto_discovered
+                        ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, 1)
+                    """, (peer_id, url, data.get("instance_id", url), public_key_bytes, now, now))
+                    discovered += 1
+
+                # Process peer's known peers
+                for peer_data in data.get("peers", []):
+                    peer_url = peer_data.get("url")
+                    if not peer_url:
+                        continue
+
+                    # Skip if we already know this peer
+                    cursor.execute("SELECT url FROM federation_peers WHERE url = ?", (peer_url,))
+                    if cursor.fetchone():
+                        already_known += 1
+                        continue
+
+                    # Register peer-of-peer
+                    peer_id = f"peer-{secrets.token_hex(8)}"
+                    peer_public_key_b64 = peer_data.get("public_key", "")
+                    peer_public_key_bytes = base64.b64decode(peer_public_key_b64) if peer_public_key_b64 else b'\x00' * 32
+
+                    try:
+                        cursor.execute("""
+                            INSERT INTO federation_peers (
+                                id, url, name, public_key, created_at, registered_at,
+                                is_healthy, consecutive_failures, auto_discovered
+                            ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, 1)
+                        """, (
+                            peer_id,
+                            peer_url,
+                            peer_data.get("name", peer_data.get("instance_id", peer_url)),
+                            peer_public_key_bytes,
+                            now,
+                            now
+                        ))
+                        discovered += 1
+                    except Exception as e:
+                        failed.append({"url": peer_url, "reason": str(e)})
+
+                conn.commit()
+
+    except Exception as e:
+        failed.append({"url": url, "reason": str(e)})
+
+    return {
+        "discovered": discovered,
+        "already_known": already_known,
+        "failed": failed
+    }
