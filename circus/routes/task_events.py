@@ -159,6 +159,24 @@ def log_action(req: ActionRequest):
                         "UPDATE tasks SET doom_loop_count = COALESCE(doom_loop_count, 0) + 1 WHERE id = ?",
                         (req.task_id,)
                     )
+
+                    # Also track doom-loop for delegated_by agent if this is a delegated task
+                    # This prevents agents from bypassing doom-loop detection by delegating
+                    task_info = conn.execute(
+                        "SELECT delegated_by FROM tasks WHERE id = ?",
+                        (req.task_id,)
+                    ).fetchone()
+                    if task_info and task_info["delegated_by"]:
+                        # Insert banned strategy for the delegating agent too
+                        conn.execute(
+                            """INSERT OR IGNORE INTO task_banned_strategies
+                               (task_id, agent_id, strategy_signature, ban_reason, banned_at)
+                               VALUES (?,?,?,?,?)""",
+                            (req.task_id, task_info["delegated_by"], sig,
+                             f"Doom-loop detected in delegated task: {req.tool} failed {DOOM_LOOP_THRESHOLD}+ times",
+                             datetime.utcnow().isoformat())
+                        )
+
                     conn.commit()
                 except Exception:
                     conn.commit()

@@ -27,6 +27,7 @@ from circus.models import (
     ChainNodeResponse,
     ChainNodeSubmit,
     ChainValidationResult,
+    DelegateTaskRequest,
     NicheTier,
     NicheRegistryEntry,
     NicheRegistryResponse,
@@ -902,6 +903,226 @@ async def stream_task_progress(
             await asyncio.sleep(1)
 
     return EventSourceResponse(event_generator())
+
+
+@router.post("/{task_id}/delegate", status_code=201)
+async def delegate_task(
+    task_id: str,
+    request: DelegateTaskRequest,
+    agent_id: str = Depends(verify_token)
+):
+    """Delegate a task to another agent (P2P delegation)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Verify task exists and caller owns it
+        cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        parent_task = cursor.fetchone()
+
+        if not parent_task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        # Verify ownership (either submitter or assignee)
+        if parent_task["from_agent_id"] != agent_id and parent_task["to_agent_id"] != agent_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Only task owner can delegate"
+            )
+
+        # Verify task is in valid state for delegation
+        if parent_task["state"] not in ["submitted", "working"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot delegate task in state {parent_task['state']}"
+            )
+
+        # Verify target agent exists and has sufficient trust
+        cursor.execute("""
+            SELECT trust_score FROM agents WHERE id = ? AND is_active = 1
+        """, (request.to_agent_id,))
+        target = cursor.fetchone()
+
+        if not target:
+            raise HTTPException(status_code=404, detail="Target agent not found")
+
+        if target["trust_score"] < 30:
+            raise HTTPException(
+                status_code=403,
+                detail="Target agent trust too low (need 30+)"
+            )
+
+        # Check delegation depth
+        current_depth = parent_task.get("delegation_depth") or 0
+        if current_depth >= 3:
+            raise HTTPException(
+                status_code=400,
+                detail="Max delegation depth (3) reached"
+            )
+
+        # Create child task
+        child_task_id = f"task-{secrets.token_hex(6)}"
+        now = datetime.utcnow().isoformat()
+
+        # Determine required capabilities (use request override or inherit from parent)
+        required_caps = request.required_capabilities
+        if required_caps is None and parent_task.get("required_capabilities"):
+            required_caps = safe_json_loads(
+                parent_task["required_capabilities"],
+                "required_capabilities",
+                user_supplied=False
+            )
+
+        # Verify target has required capabilities if specified
+        if required_caps:
+            placeholders = ','.join('?' * len(required_caps))
+            cursor.execute(f"""
+                SELECT DISTINCT capability_tag
+                FROM capability_proofs
+                WHERE agent_id = ? AND status = 'active' AND capability_tag IN ({placeholders})
+            """, [request.to_agent_id] + required_caps)
+            agent_caps = {row["capability_tag"] for row in cursor.fetchall()}
+            missing_caps = set(required_caps) - agent_caps
+
+            if missing_caps:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "missing_capabilities",
+                        "required": required_caps,
+                        "missing": list(missing_caps)
+                    }
+                )
+
+        # Determine deadline
+        deadline = parent_task["deadline"] if request.inherit_deadline else None
+
+        # Insert child task
+        cursor.execute("""
+            INSERT INTO tasks (
+                id, from_agent_id, to_agent_id, task_type, payload,
+                state, priority_tier, created_at, updated_at, deadline,
+                output_schema, required_capabilities, reversibility_class,
+                parent_task_id, delegated_by, delegation_depth, delegation_note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            child_task_id, agent_id, request.to_agent_id,
+            parent_task["task_type"], parent_task["payload"],
+            TaskState.SUBMITTED.value, parent_task.get("priority_tier", "deferrable"),
+            now, now, deadline,
+            parent_task.get("output_schema"),
+            json.dumps(required_caps) if required_caps else None,
+            parent_task.get("reversibility_class", "REVERSIBLE"),
+            task_id, agent_id, current_depth + 1, request.note
+        ))
+
+        # Log state transition for child task
+        cursor.execute("""
+            INSERT INTO task_state_transitions (
+                task_id, from_state, to_state, created_at
+            ) VALUES (?, ?, ?, ?)
+        """, (child_task_id, None, TaskState.SUBMITTED.value, now))
+
+        # Log audit entry for delegation
+        cursor.execute("""
+            INSERT INTO audit_log (
+                agent_id, action, resource_type, resource_id, allowed, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            agent_id, "delegation", "task", child_task_id, 1,
+            f"Delegated task {task_id} to {request.to_agent_id} (depth {current_depth + 1})",
+            now
+        ))
+
+        conn.commit()
+
+    return {
+        "child_task_id": child_task_id,
+        "parent_task_id": task_id,
+        "delegation_depth": current_depth + 1,
+        "to_agent_id": request.to_agent_id,
+        "state": TaskState.SUBMITTED.value,
+        "created_at": now
+    }
+
+
+@router.get("/{task_id}/delegation-chain")
+async def get_delegation_chain(
+    task_id: str,
+    agent_id: str = Depends(verify_token)
+):
+    """Get the full delegation chain for a task (ancestors + descendants)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Verify task exists
+        cursor.execute("SELECT id FROM tasks WHERE id = ?", (task_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        # Find root (walk up parent_task_id chain)
+        current_id = task_id
+        root_id = task_id
+        visited = set()
+
+        while current_id and current_id not in visited:
+            visited.add(current_id)
+            cursor.execute(
+                "SELECT parent_task_id FROM tasks WHERE id = ?",
+                (current_id,)
+            )
+            row = cursor.fetchone()
+            if row and row["parent_task_id"]:
+                root_id = row["parent_task_id"]
+                current_id = row["parent_task_id"]
+            else:
+                break
+
+        # Now fetch all tasks in the delegation tree starting from root
+        chain = []
+        to_visit = [root_id]
+        visited = set()
+
+        while to_visit:
+            current = to_visit.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+
+            cursor.execute("""
+                SELECT id, from_agent_id, to_agent_id, state, delegation_depth,
+                       delegated_by, delegation_note
+                FROM tasks WHERE id = ?
+            """, (current,))
+            task_row = cursor.fetchone()
+
+            if task_row:
+                chain.append({
+                    "task_id": task_row["id"],
+                    "from": task_row["from_agent_id"],
+                    "to": task_row["to_agent_id"],
+                    "depth": task_row["delegation_depth"] or 0,
+                    "state": task_row["state"],
+                    "delegated_by": task_row["delegated_by"],
+                    "note": task_row["delegation_note"]
+                })
+
+                # Find children
+                cursor.execute(
+                    "SELECT id FROM tasks WHERE parent_task_id = ?",
+                    (current,)
+                )
+                children = cursor.fetchall()
+                for child in children:
+                    to_visit.append(child["id"])
+
+        # Sort chain by depth
+        chain.sort(key=lambda x: x["depth"])
+
+        return {
+            "root_task_id": root_id,
+            "chain": chain,
+            "depth": max([c["depth"] for c in chain]) if chain else 0
+        }
 
 
 @router.post("/{task_id}/chain-node", response_model=ChainNodeResponse, status_code=201)

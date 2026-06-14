@@ -307,6 +307,14 @@ class TaskUpdateRequest(BaseModel):
     notes: Optional[str] = None
 
 
+class DelegateTaskRequest(BaseModel):
+    """Delegate task to another agent (P2P delegation)."""
+    to_agent_id: str = Field(..., min_length=1)
+    note: Optional[str] = None
+    inherit_deadline: bool = True
+    required_capabilities: Optional[list[str]] = None
+
+
 class TaskResponse(BaseModel):
     """Task response."""
     task_id: str

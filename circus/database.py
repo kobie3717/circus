@@ -557,6 +557,9 @@ def init_database(db_path: Optional[Path] = None) -> None:
     # Run v40 migration for auto_discovered column (peer autodiscovery)
     run_v40_migration(db_path)
 
+    # Run v41 migration for P2P task delegation chain tracking
+    run_v41_migration(db_path)
+
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
     seed_owner_key_from_env(conn)
@@ -2630,6 +2633,59 @@ def run_v40_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v40 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v41_migration(db_path: Optional[Path] = None) -> None:
+    """Run v41 migration: P2P task delegation chain tracking."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if delegation columns already exist
+        cursor.execute("PRAGMA table_info(tasks)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        columns_added = []
+
+        # Add parent_task_id column if it doesn't exist
+        if 'parent_task_id' not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT")
+            columns_added.append('parent_task_id')
+
+        # Add delegated_by column if it doesn't exist
+        if 'delegated_by' not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN delegated_by TEXT")
+            columns_added.append('delegated_by')
+
+        # Add delegation_depth column if it doesn't exist
+        if 'delegation_depth' not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN delegation_depth INTEGER DEFAULT 0")
+            columns_added.append('delegation_depth')
+
+        # Add delegation_note column if it doesn't exist
+        if 'delegation_note' not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN delegation_note TEXT")
+            columns_added.append('delegation_note')
+
+        # Create index on parent_task_id
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)")
+
+        conn.commit()
+        if columns_added:
+            logger.info(f"v41 migration: added delegation columns {columns_added} to tasks table")
+        else:
+            logger.debug("v41 migration: delegation columns already exist, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v41 migration failed: %s", e)
         raise
     finally:
         conn.close()
