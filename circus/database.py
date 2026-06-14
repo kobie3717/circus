@@ -549,6 +549,10 @@ def init_database(db_path: Optional[Path] = None) -> None:
     run_v36_migration(db_path)
     # Run v37 migration for memory claim embeddings (semantic search)
     run_v37_migration(db_path)
+    # Run v38 migration for docvault-system agent registration
+    run_v38_migration(db_path)
+    # Run v39 migration for dispute_votes table (Elder multi-sig)
+    run_v39_migration(db_path)
 
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
@@ -2498,6 +2502,102 @@ def run_v37_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v37 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v38_migration(db_path: Optional[Path] = None) -> None:
+    """Run v38 migration: Register docvault-system agent for DocVault webhook notifications."""
+    import logging
+    import json
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if docvault-system agent already exists
+        cursor.execute("SELECT id FROM agents WHERE id = 'docvault-system'")
+        if cursor.fetchone():
+            logger.debug("v38 migration: docvault-system agent already exists, skipping")
+            return
+
+        # Insert docvault-system agent
+        now = datetime.utcnow().isoformat()
+        cursor.execute("""
+            INSERT INTO agents (
+                id, name, role, capabilities, home_instance, passport_hash,
+                token_hash, trust_score, trust_tier, registered_at, last_seen, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "docvault-system",
+            "DocVault",
+            "system",
+            json.dumps(["doc-review"]),
+            "http://127.0.0.1:6300",
+            "docvault-system",
+            "docvault-system",
+            80.0,
+            "Trusted",
+            now,
+            now,
+            1
+        ))
+
+        conn.commit()
+        logger.info("v38 migration: registered docvault-system agent")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v38 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v39_migration(db_path: Optional[Path] = None) -> None:
+    """Run v39 migration: dispute_votes table (Elder multi-sig dispute resolution)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if dispute_votes table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dispute_votes'")
+        if cursor.fetchone():
+            logger.debug("v39 migration: dispute_votes table already exists, skipping")
+            return
+
+        # Create dispute_votes table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dispute_votes (
+                id TEXT PRIMARY KEY,
+                dispute_id INTEGER NOT NULL,
+                voter_id TEXT NOT NULL,
+                vote TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(dispute_id, voter_id),
+                FOREIGN KEY (dispute_id) REFERENCES fraud_reports(id),
+                FOREIGN KEY (voter_id) REFERENCES agents(id),
+                CHECK (vote IN ('confirmed', 'dismissed'))
+            )
+        """)
+
+        # Create index
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_dispute_votes_dispute ON dispute_votes(dispute_id)")
+
+        conn.commit()
+        logger.info("v39 migration: created dispute_votes table")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v39 migration failed: %s", e)
         raise
     finally:
         conn.close()

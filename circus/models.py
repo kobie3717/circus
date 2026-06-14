@@ -745,6 +745,8 @@ class EvalResult(BaseModel):
     passed: bool
     proof_id: Optional[int] = None
     missed_rubric_items: list[str] = []
+    reasoning: Optional[str] = None
+    scoring_method: str = "keyword"  # "llm" | "keyword"
 
 
 class CapabilityProof(BaseModel):

@@ -14,7 +14,7 @@ from circus.config import settings
 logger = logging.getLogger(__name__)
 from circus.database import init_database, seed_default_rooms, get_db
 from circus.models import HealthResponse
-from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens, troupes, backing, pools, memory_v2, escrow, task_events, platform
+from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens, troupes, backing, pools, memory_v2, escrow, task_events, platform, docvault
 from circus.trust import apply_trust_decay, get_trust_tier
 from circus.middleware.rate_limiter import check_rate_limit
 from circus.middleware.telemetry import setup_tracing, get_current_trace_id
@@ -142,6 +142,10 @@ async def lifespan(app: FastAPI):
     from circus.services.federation_worker import run_federation_worker
     federation_task = asyncio.create_task(run_federation_worker())
 
+    # Start federation outbox worker (W10 - outbound delivery)
+    from circus.federation_outbox_worker import start_federation_outbox_worker
+    federation_outbox_task = asyncio.create_task(start_federation_outbox_worker())
+
     # Start webhook delivery worker (Phase 6)
     from circus.webhook_worker import start_webhook_worker
     webhook_task = asyncio.create_task(start_webhook_worker())
@@ -156,10 +160,11 @@ async def lifespan(app: FastAPI):
     trust_task.cancel()
     liveness_task.cancel()
     federation_task.cancel()
+    federation_outbox_task.cancel()
     webhook_task.cancel()
     for t in scheduler_tasks:
         t.cancel()
-    for task in [trust_task, liveness_task, federation_task, webhook_task] + scheduler_tasks:
+    for task in [trust_task, liveness_task, federation_task, federation_outbox_task, webhook_task] + scheduler_tasks:
         try:
             await task
         except asyncio.CancelledError:
@@ -288,6 +293,7 @@ app.include_router(memory_v2.router)  # Memory Commons v2 - atomic claims (Phase
 app.include_router(escrow.router)  # Phase 4: Attack-resistant escrow with graduated reversibility
 app.include_router(task_events.router)  # Phase 5: Doom-loop detection + checkpoint/resume + audit log
 app.include_router(platform.router)  # Phase 6: The Standard — webhooks, observer mode, platform economics
+app.include_router(docvault.router)  # DocVault webhook receiver (internal localhost endpoint)
 
 
 @app.get("/.well-known/agent.json", tags=["A2A"])

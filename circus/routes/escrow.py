@@ -40,6 +40,13 @@ class ResolveDisputeRequest(BaseModel):
     resolution_note: Optional[str] = None
 
 
+class DisputeVoteRequest(BaseModel):
+    dispute_id: int
+    voter_id: str      # must be Elder
+    vote: str          # 'confirmed' | 'dismissed'
+    note: Optional[str] = None
+
+
 @router.post("/lock")
 def lock_escrow(req: LockEscrowRequest):
     """
@@ -213,21 +220,125 @@ def file_dispute(req: DisputeRequest):
         }
 
 
+def _execute_verdict(conn: sqlite3.Connection, dispute_id: int, escrow_id: int, task_id: str, verdict: str, resolved_by: str) -> str:
+    """
+    Execute fraud dispute verdict (called when quorum reached).
+    Returns verdict_result string.
+    """
+    now = datetime.utcnow().isoformat()
+
+    if verdict == 'confirmed':
+        # Get escrow details
+        escrow = conn.execute(
+            "SELECT agent_id, amount_staked, sponsor_1_id, sponsor_1_stake, sponsor_2_id, sponsor_2_stake FROM task_escrow WHERE id = ?",
+            (escrow_id,)
+        ).fetchone()
+        if escrow:
+            agent_id, amount_staked, sp1_id, sp1_stake, sp2_id, sp2_stake = escrow
+
+            # Forfeit escrow
+            conn.execute(
+                "UPDATE task_escrow SET status = 'forfeited', released_at = ? WHERE id = ?",
+                (now, escrow_id)
+            )
+
+            # Reset agent to Newcomer
+            conn.execute(
+                "UPDATE agents SET trust_tier = 'Newcomer', trust_score = 10.0 WHERE id = ?",
+                (agent_id,)
+            )
+
+            # Log trust event for agent
+            conn.execute(
+                """INSERT INTO trust_events (agent_id, event_type, delta, reason, created_at)
+                   VALUES (?,?,?,?,?)""",
+                (agent_id, 'fraud_confirmed', -90.0, f'Fraud confirmed on task {task_id}', now)
+            )
+
+            # Penalise sponsors
+            for sp_id, sp_stake in [(sp1_id, sp1_stake), (sp2_id, sp2_stake)]:
+                if sp_id:
+                    conn.execute(
+                        "UPDATE agents SET trust_score = MAX(10.0, trust_score - ?) WHERE id = ?",
+                        (FRAUD_REPUTATION_PENALTY, sp_id)
+                    )
+                    conn.execute(
+                        """INSERT INTO trust_events (agent_id, event_type, delta, reason, created_at)
+                           VALUES (?,?,?,?,?)""",
+                        (sp_id, 'sponsor_fraud_penalty', -FRAUD_REPUTATION_PENALTY,
+                         f'Sponsored fraudulent agent {agent_id} on task {task_id}', now)
+                    )
+
+            # Ban from trajectory pools - check if status column exists
+            try:
+                cursor = conn.execute("PRAGMA table_info(pool_contributions)")
+                columns = {row[1] for row in cursor.fetchall()}
+                if 'status' in columns:
+                    conn.execute(
+                        "UPDATE pool_contributions SET status = 'banned' WHERE contributor_agent_id = ?",
+                        (agent_id,)
+                    )
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(f"Could not ban agent from pool_contributions: {e}")
+
+        verdict_result = "escrow_forfeited_agent_reset"
+
+    else:  # dismissed
+        conn.execute(
+            "UPDATE task_escrow SET status = 'locked' WHERE id = ?",
+            (escrow_id,)
+        )
+        verdict_result = "dispute_dismissed_escrow_intact"
+
+    # Close the report
+    conn.execute(
+        """UPDATE fraud_reports
+           SET status = ?, resolved_at = ?, resolved_by = ?, penalty_applied = ?
+           WHERE id = ?""",
+        (verdict, now, resolved_by,
+         1 if verdict == 'confirmed' else 0,
+         dispute_id)
+    )
+
+    return verdict_result
+
+
 @router.post("/dispute/resolve")
 def resolve_dispute(req: ResolveDisputeRequest):
     """
+    DEPRECATED: Use /dispute/vote instead. This endpoint now casts a single vote and executes only if quorum reached.
+
     Resolve a fraud dispute. Only Elder-tier agents can resolve.
     confirmed: forfeit full escrow, reset agent to Newcomer, ban from pools
     dismissed: proceed to normal release
     """
+    # Delegate to vote endpoint with backward compatibility
+    vote_req = DisputeVoteRequest(
+        dispute_id=req.dispute_id,
+        voter_id=req.resolver_id,
+        vote=req.verdict,
+        note=req.resolution_note
+    )
+    return vote_dispute(vote_req)
+
+
+@router.post("/dispute/vote")
+def vote_dispute(req: DisputeVoteRequest):
+    """
+    Cast a vote on a fraud dispute. Requires Elder tier.
+    When 2/3 quorum is reached, verdict auto-executes.
+    """
+    import secrets
     with get_db() as conn:
-        # Check resolver is Elder
-        resolver = conn.execute(
+        # Check voter is Elder
+        voter = conn.execute(
             "SELECT id, trust_tier FROM agents WHERE id = ? AND is_active = 1",
-            (req.resolver_id,)
+            (req.voter_id,)
         ).fetchone()
-        if not resolver or resolver[1] != 'Elder':
-            raise HTTPException(403, "Only Elder-tier agents can resolve disputes")
+        if not voter or voter[1] != 'Elder':
+            raise HTTPException(403, "Only Elder-tier agents can vote on disputes")
 
         # Get dispute
         report = conn.execute(
@@ -241,94 +352,138 @@ def resolve_dispute(req: ResolveDisputeRequest):
         if report_status != 'open':
             raise HTTPException(400, f"Dispute already {report_status}")
 
+        # Check voter hasn't already voted
+        existing_vote = conn.execute(
+            "SELECT id FROM dispute_votes WHERE dispute_id = ? AND voter_id = ?",
+            (req.dispute_id, req.voter_id)
+        ).fetchone()
+        if existing_vote:
+            raise HTTPException(400, "You have already voted on this dispute")
+
+        # Validate vote
+        if req.vote not in ['confirmed', 'dismissed']:
+            raise HTTPException(400, "Vote must be 'confirmed' or 'dismissed'")
+
+        # Insert vote
         now = datetime.utcnow().isoformat()
-
-        if req.verdict == 'confirmed':
-            # Get escrow details
-            escrow = conn.execute(
-                "SELECT agent_id, amount_staked, sponsor_1_id, sponsor_1_stake, sponsor_2_id, sponsor_2_stake FROM task_escrow WHERE id = ?",
-                (escrow_id,)
-            ).fetchone()
-            if escrow:
-                agent_id, amount_staked, sp1_id, sp1_stake, sp2_id, sp2_stake = escrow
-
-                # Forfeit escrow
-                conn.execute(
-                    "UPDATE task_escrow SET status = 'forfeited', released_at = ? WHERE id = ?",
-                    (now, escrow_id)
-                )
-
-                # Reset agent to Newcomer
-                conn.execute(
-                    "UPDATE agents SET trust_tier = 'Newcomer', trust_score = 10.0 WHERE id = ?",
-                    (agent_id,)
-                )
-
-                # Log trust event for agent
-                conn.execute(
-                    """INSERT INTO trust_events (agent_id, event_type, delta, reason, created_at)
-                       VALUES (?,?,?,?,?)""",
-                    (agent_id, 'fraud_confirmed', -90.0, f'Fraud confirmed on task {task_id}', now)
-                )
-
-                # Penalise sponsors
-                for sp_id, sp_stake in [(sp1_id, sp1_stake), (sp2_id, sp2_stake)]:
-                    if sp_id:
-                        conn.execute(
-                            "UPDATE agents SET trust_score = MAX(10.0, trust_score - ?) WHERE id = ?",
-                            (FRAUD_REPUTATION_PENALTY, sp_id)
-                        )
-                        conn.execute(
-                            """INSERT INTO trust_events (agent_id, event_type, delta, reason, created_at)
-                               VALUES (?,?,?,?,?)""",
-                            (sp_id, 'sponsor_fraud_penalty', -FRAUD_REPUTATION_PENALTY,
-                             f'Sponsored fraudulent agent {agent_id} on task {task_id}', now)
-                        )
-
-                # Ban from trajectory pools - check if status column exists
-                # Note: pool_contributions table doesn't have status column in v26 migration
-                # Future enhancement: add status column and implement ban logic
-                try:
-                    # Check if status column exists
-                    cursor = conn.execute("PRAGMA table_info(pool_contributions)")
-                    columns = {row[1] for row in cursor.fetchall()}
-                    if 'status' in columns:
-                        conn.execute(
-                            "UPDATE pool_contributions SET status = 'banned' WHERE contributor_agent_id = ?",
-                            (agent_id,)
-                        )
-                except Exception as e:
-                    # Table might not exist or query failed, skip silently
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.debug(f"Could not ban agent from pool_contributions: {e}")
-
-            verdict_result = "escrow_forfeited_agent_reset"
-
-        else:  # dismissed
-            conn.execute(
-                "UPDATE task_escrow SET status = 'locked' WHERE id = ?",
-                (escrow_id,)
-            )
-            verdict_result = "dispute_dismissed_escrow_intact"
-
-        # Close the report
+        vote_id = f"dv-{secrets.token_hex(4)}"
         conn.execute(
-            """UPDATE fraud_reports
-               SET status = ?, resolved_at = ?, resolved_by = ?, penalty_applied = ?, resolution_note = ?
-               WHERE id = ?""",
-            (req.verdict, now, req.resolver_id,
-             1 if req.verdict == 'confirmed' else 0,
-             req.resolution_note, report_id)
+            """INSERT INTO dispute_votes (id, dispute_id, voter_id, vote, note, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (vote_id, req.dispute_id, req.voter_id, req.vote, req.note, now)
         )
+
+        # Count active Elders
+        active_elders = conn.execute(
+            "SELECT id FROM agents WHERE trust_tier = 'Elder' AND is_active = 1"
+        ).fetchall()
+        num_elders = len(active_elders)
+
+        # Calculate quorum (2/3 of active Elders, minimum 2, but if only 1 Elder exists, quorum = 1)
+        import math
+        quorum_needed = max(1, min(2, math.ceil(num_elders * 2.0 / 3.0)))
+
+        # Count votes by verdict
+        vote_counts = conn.execute(
+            """SELECT vote, COUNT(*) FROM dispute_votes WHERE dispute_id = ? GROUP BY vote""",
+            (req.dispute_id,)
+        ).fetchall()
+
+        tally = {vote: count for vote, count in vote_counts}
+        confirmed_votes = tally.get('confirmed', 0)
+        dismissed_votes = tally.get('dismissed', 0)
+        total_votes = confirmed_votes + dismissed_votes
+
+        # Check if quorum reached
+        quorum_reached = False
+        verdict_executed = None
+        verdict_result = None
+
+        if total_votes >= quorum_needed:
+            # Check if any verdict has quorum
+            if confirmed_votes >= quorum_needed:
+                quorum_reached = True
+                verdict_executed = 'confirmed'
+                verdict_result = _execute_verdict(conn, report_id, escrow_id, task_id, 'confirmed', req.voter_id)
+            elif dismissed_votes >= quorum_needed:
+                quorum_reached = True
+                verdict_executed = 'dismissed'
+                verdict_result = _execute_verdict(conn, report_id, escrow_id, task_id, 'dismissed', req.voter_id)
+
         conn.commit()
 
         return {
             "dispute_id": report_id,
-            "verdict": req.verdict,
+            "voter_id": req.voter_id,
+            "vote": req.vote,
+            "votes_cast": total_votes,
+            "quorum_needed": quorum_needed,
+            "active_elders": num_elders,
+            "quorum_reached": quorum_reached,
+            "verdict_executed": verdict_executed,
             "result": verdict_result,
-            "resolved_at": now,
-            "resolved_by": req.resolver_id,
+        }
+
+
+@router.get("/dispute/{dispute_id}/votes")
+def get_dispute_votes(dispute_id: int):
+    """Get current vote tally for a dispute."""
+    with get_db() as conn:
+        # Verify dispute exists
+        report = conn.execute(
+            "SELECT id, status FROM fraud_reports WHERE id = ?",
+            (dispute_id,)
+        ).fetchone()
+        if not report:
+            raise HTTPException(404, "Dispute not found")
+
+        # Get all votes
+        votes = conn.execute(
+            """SELECT voter_id, vote, note, created_at FROM dispute_votes WHERE dispute_id = ?
+               ORDER BY created_at ASC""",
+            (dispute_id,)
+        ).fetchall()
+
+        # Count votes
+        tally = {'confirmed': 0, 'dismissed': 0}
+        vote_list = []
+        for voter_id, vote, note, created_at in votes:
+            tally[vote] += 1
+            vote_list.append({
+                'voter_id': voter_id,
+                'vote': vote,
+                'note': note,
+                'created_at': created_at
+            })
+
+        # Calculate quorum
+        active_elders = conn.execute(
+            "SELECT id FROM agents WHERE trust_tier = 'Elder' AND is_active = 1"
+        ).fetchall()
+        num_elders = len(active_elders)
+
+        import math
+        quorum_needed = max(1, min(2, math.ceil(num_elders * 2.0 / 3.0)))
+
+        # Determine verdict
+        verdict = None
+        quorum_reached = False
+        if tally['confirmed'] >= quorum_needed:
+            verdict = 'confirmed'
+            quorum_reached = True
+        elif tally['dismissed'] >= quorum_needed:
+            verdict = 'dismissed'
+            quorum_reached = True
+
+        return {
+            "dispute_id": dispute_id,
+            "status": report[1],
+            "votes": vote_list,
+            "tally": tally,
+            "quorum_needed": quorum_needed,
+            "active_elders": num_elders,
+            "quorum_reached": quorum_reached,
+            "verdict": verdict,
         }
 
 

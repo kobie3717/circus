@@ -1491,22 +1491,18 @@ async def submit_eval(
     if request.agent_id != current_agent_id:
         raise HTTPException(status_code=403, detail="Can only submit evals as yourself")
 
-    # Score the answer against rubric (simple keyword matching)
-    answer_lower = request.answer.lower()
-    rubric = task["rubric"]
-    matched_items = []
-    missed_items = []
-
-    for rubric_item in rubric:
-        # Extract key terms from rubric item
-        key_terms = rubric_item.lower().split()
-        # Check if any key terms appear in answer
-        if any(term in answer_lower for term in key_terms if len(term) > 3):
-            matched_items.append(rubric_item)
-        else:
-            missed_items.append(rubric_item)
-
-    score = len(matched_items) / len(rubric) if rubric else 0.0
+    # Score using LLM judge (falls back to keyword if LLM unavailable)
+    from circus.services.llm_judge import score_answer
+    result = score_answer(
+        eval_id=eval_id,
+        task_input=task["input"],
+        task_description=task["description"],
+        answer=request.answer,
+        rubric=task["rubric"],
+    )
+    score = result["score"]
+    matched_items = result["matched_items"]
+    missed_items = result["missed_items"]
     passed = score >= task["min_score"]
 
     now = datetime.utcnow().isoformat()
@@ -1563,7 +1559,9 @@ async def submit_eval(
         score=score,
         passed=passed,
         proof_id=proof_id,
-        missed_rubric_items=missed_items
+        missed_rubric_items=missed_items,
+        reasoning=result.get("reasoning"),
+        scoring_method=result.get("method", "keyword")
     )
 
 
