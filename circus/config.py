@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     port: int = 6200
 
     # Database
-    database_path: Path = Path.home() / ".circus" / "circus.db"
+    database_path: Path = Path(os.environ.get("CIRCUS_DB_PATH", str(Path.home() / ".circus" / "circus.db")))
 
     # Security
     secret_key: str = os.getenv("CIRCUS_SECRET_KEY", "")

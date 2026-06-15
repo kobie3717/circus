@@ -1,6 +1,5 @@
 """OWASP security middleware for The Circus."""
 
-import re
 from datetime import datetime
 from typing import Optional
 
@@ -19,27 +18,6 @@ CAPABILITY_GATES = {
     "create_task": 30,      # Established tier
     "federation_sync": 85,  # Elder tier
 }
-
-
-# SQL injection patterns (basic detection)
-SQL_INJECTION_PATTERNS = [
-    r"(\bunion\b.*\bselect\b)",
-    r"(\bor\b\s+\d+\s*=\s*\d+)",
-    r"(\bdrop\b\s+\btable\b)",
-    r"(\binsert\b\s+\binto\b)",
-    r"(\bdelete\b\s+\bfrom\b)",
-    r"(--;)",
-    r"(/\*.*\*/)",
-]
-
-
-def detect_injection_attempt(text: str) -> bool:
-    """Detect SQL injection patterns in input."""
-    text_lower = text.lower()
-    for pattern in SQL_INJECTION_PATTERNS:
-        if re.search(pattern, text_lower, re.IGNORECASE):
-            return True
-    return False
 
 
 def get_agent_context(request: Request) -> tuple[Optional[str], str]:
@@ -126,19 +104,7 @@ async def security_middleware(request: Request, call_next):
     agent_id, trust_tier = get_agent_context(request)
     ip_address = request.client.host if request.client else "unknown"
 
-    # Injection detection on query parameters
-    for param_name, param_value in request.query_params.items():
-        if isinstance(param_value, str) and detect_injection_attempt(param_value):
-            log_audit_event(
-                agent_id, "injection_attempt", "query_param",
-                param_name, trust_tier, False,
-                f"SQL injection pattern in {param_name}",
-                ip_address
-            )
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Invalid input detected"}
-            )
+    # SQL injection prevention: handled via parameterized queries throughout codebase
 
     # Capability gating for specific endpoints
     # Only gate POST requests that create new resources

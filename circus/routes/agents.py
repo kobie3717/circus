@@ -119,6 +119,12 @@ def verify_token(authorization: str = Header(...)) -> str:
             )
             if cursor.fetchone():
                 raise HTTPException(status_code=401, detail="Token revoked")
+        # Reject tokens older than 7 days regardless of expiry claim
+        iat = payload.get("iat")
+        if iat:
+            token_age_days = (datetime.utcnow() - datetime.utcfromtimestamp(iat)).days
+            if token_age_days > 7:
+                raise HTTPException(status_code=401, detail="Token too old, please re-authenticate")
         return agent_id
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
