@@ -160,6 +160,8 @@ async def register_agent(request: AgentRegisterRequest):
     # Calculate initial trust score
     now = datetime.utcnow().isoformat()
     trust_score = calculate_trust_score(request.passport, now)
+    # Security: new agents always start at Newcomer tier regardless of passport claims
+    trust_score = min(trust_score, 25)
     trust_tier = get_trust_tier(trust_score)
 
     # Passport metrics

@@ -29,7 +29,7 @@ class LogExperienceRequest(BaseModel):
 
 
 class ConfirmExperienceRequest(BaseModel):
-    confirming_agent_id: str
+    confirming_agent_id: str  # Ignored - kept for backwards compatibility
 
 
 @router.post("/log")
@@ -82,7 +82,8 @@ async def query_experiences(
     environment: str = Query(...),
     task_type: Optional[str] = Query(None),
     min_confidence: float = Query(0.5),
-    limit: int = Query(5)
+    limit: int = Query(5),
+    agent_id: str = Depends(verify_token)
 ):
     """Query experiences for a given environment. Used by bots before starting a task."""
     db = get_db()
@@ -155,15 +156,26 @@ async def confirm_experience(
     db = get_db()
     try:
         cursor = db.cursor()
-        cursor.execute("SELECT confidence, observations, confirmed_by FROM agent_experiences WHERE id=?", (experience_id,))
+        cursor.execute("SELECT agent_id, confidence, observations, confirmed_by FROM agent_experiences WHERE id=?", (experience_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Experience not found")
-        conf, obs, confirmed_json = row
+        experience_agent_id, conf, obs, confirmed_json = row
+
+        # Security: prevent agents from confirming their own experiences
+        if agent_id == experience_agent_id:
+            raise HTTPException(status_code=403, detail="Cannot confirm your own experience")
+
         confirmed_by = json.loads(confirmed_json or "[]")
-        if req.confirming_agent_id in confirmed_by:
+
+        # Security: limit confirmations to prevent unbounded confidence inflation
+        if len(confirmed_by) >= 10:
+            raise HTTPException(status_code=400, detail="Maximum confirmations reached")
+
+        # Use agent_id from token, not from request body
+        if agent_id in confirmed_by:
             return {"message": "Already confirmed by this agent", "confidence": conf}
-        confirmed_by.append(req.confirming_agent_id)
+        confirmed_by.append(agent_id)
         # Each peer confirmation boosts confidence (Bayesian-style)
         new_conf = min(0.99, conf + (1.0 - conf) * 0.15)
         cursor.execute("""
