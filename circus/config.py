@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     # Security
     secret_key: str = os.getenv("CIRCUS_SECRET_KEY", "")
     algorithm: str = "HS256"
-    access_token_expire_days: int = 30
+    access_token_expire_days: int = 7
 
     def __post_init__(self):
         """Validate security settings on initialization."""

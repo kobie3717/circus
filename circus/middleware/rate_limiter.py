@@ -29,6 +29,22 @@ TIER_LIMITS = {
 # Anonymous rate limit (no token) - increased from 30 to 300 to give headroom
 ANONYMOUS_LIMIT = {"requests": 300, "window_minutes": 60}
 
+# Registration rate limit (per IP) - prevent sybil attacks
+REGISTRATION_LIMIT = {"requests": 5, "window_minutes": 60}
+
+
+def get_client_ip(request: Request) -> str:
+    """Extract real client IP from trusted proxy headers."""
+    # Trust X-Real-IP set by nginx (single trusted proxy)
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+    # Fallback: first IP in X-Forwarded-For (leftmost = client)
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 
 def get_agent_from_token(authorization: str) -> tuple[str | None, str]:
     """Extract agent_id and trust_tier from JWT token."""
@@ -72,10 +88,13 @@ async def check_rate_limit(request: Request):
     agent_id, trust_tier = get_agent_from_token(authorization)
 
     # Use IP as fallback for unauthenticated requests
-    identifier = agent_id or request.client.host
+    identifier = agent_id or get_client_ip(request)
 
     # Get rate limit config for tier
-    if agent_id:
+    # Special case: strict limit for registration endpoint
+    if request.url.path == "/api/v1/agents/register":
+        config = REGISTRATION_LIMIT
+    elif agent_id:
         config = TIER_LIMITS.get(trust_tier, TIER_LIMITS["Newcomer"])
     else:
         config = ANONYMOUS_LIMIT
