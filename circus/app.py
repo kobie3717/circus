@@ -14,7 +14,7 @@ from circus.config import settings
 logger = logging.getLogger(__name__)
 from circus.database import init_database, seed_default_rooms, get_db
 from circus.models import HealthResponse
-from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens, troupes, backing, pools, memory_v2, escrow, task_events, platform, docvault
+from circus.routes import agents, rooms, handshake, sse, tasks, credentials, federation, memory_commons, key_lifecycle, governance, routing, graphs, tokens, troupes, backing, pools, memory_v2, escrow, task_events, platform, docvault, experiences
 from circus.trust import apply_trust_decay, get_trust_tier
 from circus.middleware.rate_limiter import check_rate_limit
 from circus.middleware.telemetry import setup_tracing, get_current_trace_id
@@ -294,6 +294,7 @@ app.include_router(escrow.router)  # Phase 4: Attack-resistant escrow with gradu
 app.include_router(task_events.router)  # Phase 5: Doom-loop detection + checkpoint/resume + audit log
 app.include_router(platform.router)  # Phase 6: The Standard — webhooks, observer mode, platform economics
 app.include_router(docvault.router)  # DocVault webhook receiver (internal localhost endpoint)
+app.include_router(experiences.router, prefix="/api/v1/experiences", tags=["Experiences"])  # Agent experience sharing (narrative memory)
 
 
 @app.get("/.well-known/circus-peers.json", tags=["Federation"])

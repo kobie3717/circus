@@ -560,6 +560,9 @@ def init_database(db_path: Optional[Path] = None) -> None:
     # Run v41 migration for P2P task delegation chain tracking
     run_v41_migration(db_path)
 
+    # Run v42 migration for agent_experiences table (narrative memory)
+    run_v42_migration(db_path)
+
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
     seed_owner_key_from_env(conn)
@@ -2686,6 +2689,58 @@ def run_v41_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v41 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v42_migration(db_path: Optional[Path] = None) -> None:
+    """Run v42 migration: agent_experiences table for narrative experience sharing."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if agent_experiences table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='agent_experiences'")
+        if cursor.fetchone():
+            logger.debug("v42 migration: agent_experiences table already exists, skipping")
+            return
+
+        # Create agent_experiences table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_experiences (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                what_worked TEXT,
+                what_failed TEXT,
+                context_snapshot TEXT,
+                outcome REAL NOT NULL DEFAULT 0.5,
+                confidence REAL NOT NULL DEFAULT 0.5,
+                observations INTEGER NOT NULL DEFAULT 1,
+                confirmed_by TEXT DEFAULT '[]',
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+            )
+        """)
+
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_exp_env_task ON agent_experiences(environment, task_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_exp_agent ON agent_experiences(agent_id, outcome DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_exp_confidence ON agent_experiences(confidence DESC)")
+
+        conn.commit()
+        logger.info("v42 migration: created agent_experiences table")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v42 migration failed: %s", e)
         raise
     finally:
         conn.close()

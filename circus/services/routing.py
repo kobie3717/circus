@@ -6,8 +6,10 @@ Pure logic + DB I/O. No FastAPI dependencies.
 import hashlib
 import json
 import logging
+import math
 import secrets
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -19,6 +21,85 @@ logger = logging.getLogger(__name__)
 
 # Feature dimensionality (per spec)
 FEATURE_DIM = 32
+
+
+def _get_experience_boost(db_conn: sqlite3.Connection, environment: str, task_type: str, agent_id: str) -> float:
+    """Query agent_experiences and return a UCB boost for this agent.
+
+    Returns 0.0 if no relevant experience found.
+    Max boost: +0.25 (for confidence=1.0, trust=100, observations=10+)
+    """
+    try:
+        cursor = db_conn.cursor()
+        cursor.execute("""
+            SELECT e.confidence, e.observations, a.trust_score
+            FROM agent_experiences e
+            JOIN agents a ON e.agent_id = a.id
+            WHERE e.agent_id=? AND e.environment=? AND e.task_type=?
+            AND e.confidence >= 0.5
+            ORDER BY e.confidence DESC
+            LIMIT 1
+        """, (agent_id, environment, task_type))
+        row = cursor.fetchone()
+        if not row:
+            return 0.0
+        confidence, observations, trust_score = row
+        # Scale: max boost 0.25, weighted by confidence × trust × log(observations)
+        obs_factor = min(1.0, math.log1p(observations) / math.log1p(10))
+        trust_factor = (trust_score or 50) / 100.0
+        boost = 0.25 * confidence * trust_factor * obs_factor
+        return round(boost, 4)
+    except Exception as e:
+        logger.debug(f"Experience boost query failed (non-fatal): {e}")
+        return 0.0
+
+
+def _auto_log_experience(
+    db_conn: sqlite3.Connection,
+    agent_id: str,
+    environment: str,
+    task_type: str,
+    outcome: float,
+    reward_reason: Optional[str] = None
+) -> None:
+    """Auto-log experience after task completion.
+
+    Merges with existing auto-logged experiences (no what_worked/what_failed).
+    """
+    try:
+        cursor = db_conn.cursor()
+        # Check for existing auto-logged experience to merge
+        cursor.execute("""
+            SELECT id, observations, confidence FROM agent_experiences
+            WHERE agent_id=? AND environment=? AND task_type=?
+            AND what_worked IS NULL AND what_failed IS NULL
+        """, (agent_id, environment, task_type))
+        existing = cursor.fetchone()
+
+        if existing:
+            exp_id, obs, conf = existing
+            new_obs = obs + 1
+            # Bayesian update: move confidence toward observed outcome
+            new_conf = min(0.99, conf + (outcome - conf) / new_obs)
+            cursor.execute("""
+                UPDATE agent_experiences
+                SET observations=?, confidence=?, outcome=?, updated_at=datetime('now')
+                WHERE id=?
+            """, (new_obs, new_conf, outcome, exp_id))
+            logger.debug(f"Updated auto-experience {exp_id} for {agent_id} in {environment}/{task_type}: conf={new_conf:.3f}")
+        else:
+            exp_id = str(uuid.uuid4())
+            # Initial confidence based on outcome (at least 0.3)
+            initial_conf = max(0.3, outcome)
+            cursor.execute("""
+                INSERT INTO agent_experiences
+                    (id, agent_id, environment, task_type, what_worked, what_failed,
+                     context_snapshot, outcome, confidence, observations, confirmed_by)
+                VALUES (?, ?, ?, ?, NULL, NULL, '{}', ?, ?, 1, '[]')
+            """, (exp_id, agent_id, environment, task_type, outcome, initial_conf))
+            logger.debug(f"Created auto-experience {exp_id} for {agent_id} in {environment}/{task_type}: conf={initial_conf:.3f}")
+    except Exception as e:
+        logger.debug(f"Auto-log experience failed (non-fatal): {e}")
 
 # Global decision counter for alpha schedule
 _decision_counter = 0
@@ -325,17 +406,32 @@ def route_task(
     # Check cold start
     cold_start = is_cold_start(candidates, threshold=5)
 
+    # Extract environment from payload for experience boost
+    environment = payload.get("environment", "general")
+
     if cold_start:
         # Fallback to semantic similarity
         picked_agent_id = _semantic_fallback(task_type, payload, candidates, db_conn)
         fallback = "semantic"
         ucb_score = 0.0
     else:
-        # Use bandit
+        # Use bandit with experience boost
         idx, mean, ucb, all_ucbs = pick(candidates, x, alpha=alpha)
-        picked_agent_id = candidates[idx][0]
+
+        # Apply experience boost to all UCB scores and re-pick best
+        boosted_ucbs = []
+        for i, (agent_id, _) in enumerate(candidates):
+            exp_boost = _get_experience_boost(db_conn, environment, task_type, agent_id)
+            boosted_score = all_ucbs[i] + exp_boost
+            boosted_ucbs.append(boosted_score)
+            if exp_boost > 0:
+                logger.debug(f"Experience boost +{exp_boost:.4f} for agent {agent_id} in {environment}/{task_type}")
+
+        # Pick agent with highest boosted score
+        best_idx = int(np.argmax(boosted_ucbs))
+        picked_agent_id = candidates[best_idx][0]
         fallback = "bandit"
-        ucb_score = ucb
+        ucb_score = boosted_ucbs[best_idx]
 
     # Persist decision
     decision_id = f"decision-{secrets.token_hex(8)}"
@@ -507,6 +603,18 @@ def update_reward(
     """, (reward, reason, decision_id))
 
     logger.info(f"Updated arm ({agent_id}, {task_type}) with reward {reward:.3f} for task {task_id}")
+
+    # Auto-log experience for this completion
+    # Extract environment from task payload
+    cursor.execute("SELECT payload FROM tasks WHERE id = ?", (task_id,))
+    task_row = cursor.fetchone()
+    if task_row:
+        try:
+            payload = json.loads(task_row[0])
+            environment = payload.get("environment", "general")
+            _auto_log_experience(db_conn, agent_id, environment, task_type, reward, reason)
+        except Exception as e:
+            logger.debug(f"Failed to auto-log experience (non-fatal): {e}")
 
 
 def compute_default_reward(
