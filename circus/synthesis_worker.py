@@ -7,6 +7,7 @@ import json
 import sqlite3
 import os
 import hashlib
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -17,49 +18,55 @@ MIN_CLUSTER_SIZE = 3
 LOOKBACK_DAYS = 7
 
 
+@contextmanager
 def get_db():
-    """Get database connection (matches pattern in experiences.py)."""
+    """Get database connection (context manager for automatic cleanup)."""
     conn = sqlite3.connect(CIRCUS_DB)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
-def ensure_synthesis_agent(conn) -> str:
+def ensure_synthesis_agent() -> str:
     """Get or create the synthesis agent ID."""
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM agents WHERE name = ?", (SYNTHESIS_AGENT_NAME,))
-    row = cursor.fetchone()
-    if row:
-        return row['id']
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM agents WHERE name = ?", (SYNTHESIS_AGENT_NAME,))
+        row = cursor.fetchone()
+        if row:
+            return row['id']
 
-    # Create synthesis agent
-    agent_id = f"synth-{os.urandom(3).hex()}"
-    now = datetime.utcnow().isoformat()
-    cursor.execute("""
-        INSERT INTO agents (id, name, role, capabilities, home_instance, passport_hash, token_hash,
-                           trust_score, trust_tier, registered_at, last_seen, is_active)
-        VALUES (?, ?, 'synthesizer', '[]', 'circus-commons', ?, ?,
-                85.0, 'Trusted', ?, ?, 1)
-    """, (agent_id, SYNTHESIS_AGENT_NAME, f"hash-{agent_id}", f"token-{agent_id}", now, now))
-    conn.commit()
-    return agent_id
+        # Create synthesis agent
+        agent_id = f"synth-{os.urandom(3).hex()}"
+        now = datetime.utcnow().isoformat()
+        cursor.execute("""
+            INSERT INTO agents (id, name, role, capabilities, home_instance, passport_hash, token_hash,
+                               trust_score, trust_tier, registered_at, last_seen, is_active)
+            VALUES (?, ?, 'synthesizer', '[]', 'circus-commons', ?, ?,
+                    85.0, 'Trusted', ?, ?, 1)
+        """, (agent_id, SYNTHESIS_AGENT_NAME, f"hash-{agent_id}", f"token-{agent_id}", now, now))
+        conn.commit()
+        return agent_id
 
 
-def fetch_recent_experiences(conn, days: int = LOOKBACK_DAYS):
+def fetch_recent_experiences(days: int = LOOKBACK_DAYS):
     """Fetch non-synthesis experiences from last N days."""
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT e.id, e.agent_id, a.name as agent_name, e.environment, e.task_type,
-               e.what_worked, e.what_failed, e.outcome, e.confidence, e.observations,
-               e.created_at
-        FROM agent_experiences e
-        JOIN agents a ON a.id = e.agent_id
-        WHERE e.created_at > datetime('now', ?)
-          AND (e.is_synthesis IS NULL OR e.is_synthesis = 0)
-          AND (e.what_worked IS NOT NULL OR e.what_failed IS NOT NULL)
-        ORDER BY e.task_type, e.environment, e.created_at DESC
-    """, (f'-{days} days',))
-    return [dict(r) for r in cursor.fetchall()]
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT e.id, e.agent_id, a.name as agent_name, e.environment, e.task_type,
+                   e.what_worked, e.what_failed, e.outcome, e.confidence, e.observations,
+                   e.created_at
+            FROM agent_experiences e
+            JOIN agents a ON a.id = e.agent_id
+            WHERE e.created_at > datetime('now', ?)
+              AND (e.is_synthesis IS NULL OR e.is_synthesis = 0)
+              AND (e.what_worked IS NOT NULL OR e.what_failed IS NOT NULL)
+            ORDER BY e.task_type, e.environment, e.created_at DESC
+        """, (f'-{days} days',))
+        return [dict(r) for r in cursor.fetchall()]
 
 
 def cluster_experiences(experiences):
@@ -134,19 +141,20 @@ Be specific and actionable. No preamble. Write directly."""
         return None
 
 
-def already_synthesized_recently(conn, task_type: str, environment: str, days: int = 1) -> bool:
+def already_synthesized_recently(task_type: str, environment: str, days: int = 1) -> bool:
     """Avoid re-synthesizing same cluster within N days."""
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT COUNT(*) FROM agent_experiences
-        WHERE is_synthesis = 1
-          AND task_type = ? AND environment = ?
-          AND created_at > datetime('now', ?)
-    """, (task_type, environment, f'-{days} days'))
-    return cursor.fetchone()[0] > 0
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*) FROM agent_experiences
+            WHERE is_synthesis = 1
+              AND task_type = ? AND environment = ?
+              AND created_at > datetime('now', ?)
+        """, (task_type, environment, f'-{days} days'))
+        return cursor.fetchone()[0] > 0
 
 
-def write_meta_experience(conn, synthesis_agent_id: str, task_type: str, environment: str,
+def write_meta_experience(synthesis_agent_id: str, task_type: str, environment: str,
                            synthesis: str, source_ids: list, avg_outcome: float, avg_confidence: float):
     """Write the synthesized meta-experience to DB."""
     exp_id = f"synth-{hashlib.md5(f'{task_type}{environment}{synthesis[:50]}'.encode()).hexdigest()[:12]}"
@@ -154,62 +162,58 @@ def write_meta_experience(conn, synthesis_agent_id: str, task_type: str, environ
     end_date = datetime.utcnow().strftime('%Y-%m-%d')
     period = f"{start_date}/{end_date}"
 
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT OR REPLACE INTO agent_experiences
-        (id, agent_id, environment, task_type, what_worked, outcome, confidence,
-         observations, confirmed_by, is_synthesis, source_experience_ids, synthesis_period, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', 1, ?, ?, datetime('now'))
-    """, (
-        exp_id, synthesis_agent_id, environment, task_type,
-        synthesis, round(avg_outcome, 3), round(min(avg_confidence * 0.9, 0.95), 3),
-        len(source_ids), json.dumps(source_ids), period
-    ))
-    conn.commit()
-    return exp_id
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO agent_experiences
+            (id, agent_id, environment, task_type, what_worked, outcome, confidence,
+             observations, confirmed_by, is_synthesis, source_experience_ids, synthesis_period, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', 1, ?, ?, datetime('now'))
+        """, (
+            exp_id, synthesis_agent_id, environment, task_type,
+            synthesis, round(avg_outcome, 3), round(min(avg_confidence * 0.9, 0.95), 3),
+            len(source_ids), json.dumps(source_ids), period
+        ))
+        conn.commit()
+        return exp_id
 
 
 def run_synthesis(lookback_days: int = LOOKBACK_DAYS) -> dict:
     """Main synthesis run. Returns stats."""
-    conn = get_db()
     stats = {'clusters_found': 0, 'synthesized': 0, 'skipped': 0, 'errors': 0}
 
-    try:
-        synthesis_agent_id = ensure_synthesis_agent(conn)
-        experiences = fetch_recent_experiences(conn, lookback_days)
+    synthesis_agent_id = ensure_synthesis_agent()
+    experiences = fetch_recent_experiences(lookback_days)
 
-        if not experiences:
-            print("[synthesis] No experiences to synthesize")
-            return stats
+    if not experiences:
+        print("[synthesis] No experiences to synthesize")
+        return stats
 
-        clusters = cluster_experiences(experiences)
-        stats['clusters_found'] = len(clusters)
-        print(f"[synthesis] Found {len(clusters)} clusters from {len(experiences)} experiences")
+    clusters = cluster_experiences(experiences)
+    stats['clusters_found'] = len(clusters)
+    print(f"[synthesis] Found {len(clusters)} clusters from {len(experiences)} experiences")
 
-        for (task_type, environment), cluster_exps in clusters.items():
-            if already_synthesized_recently(conn, task_type, environment):
-                print(f"[synthesis] Skip {task_type}/{environment} — synthesized recently")
-                stats['skipped'] += 1
-                continue
+    for (task_type, environment), cluster_exps in clusters.items():
+        if already_synthesized_recently(task_type, environment):
+            print(f"[synthesis] Skip {task_type}/{environment} — synthesized recently")
+            stats['skipped'] += 1
+            continue
 
-            synthesis = synthesize_cluster(task_type, environment, cluster_exps)
-            if not synthesis:
-                stats['errors'] += 1
-                continue
+        synthesis = synthesize_cluster(task_type, environment, cluster_exps)
+        if not synthesis:
+            stats['errors'] += 1
+            continue
 
-            avg_outcome = sum(e.get('outcome', 0.5) for e in cluster_exps) / len(cluster_exps)
-            avg_confidence = sum(e.get('confidence', 0.7) for e in cluster_exps) / len(cluster_exps)
-            source_ids = [e['id'] for e in cluster_exps]
+        avg_outcome = sum(e.get('outcome', 0.5) for e in cluster_exps) / len(cluster_exps)
+        avg_confidence = sum(e.get('confidence', 0.7) for e in cluster_exps) / len(cluster_exps)
+        source_ids = [e['id'] for e in cluster_exps]
 
-            exp_id = write_meta_experience(
-                conn, synthesis_agent_id, task_type, environment,
-                synthesis, source_ids, avg_outcome, avg_confidence
-            )
-            print(f"[synthesis] ✅ {task_type}/{environment} → {exp_id}: {synthesis[:80]}...")
-            stats['synthesized'] += 1
-
-    finally:
-        conn.close()
+        exp_id = write_meta_experience(
+            synthesis_agent_id, task_type, environment,
+            synthesis, source_ids, avg_outcome, avg_confidence
+        )
+        print(f"[synthesis] ✅ {task_type}/{environment} → {exp_id}: {synthesis[:80]}...")
+        stats['synthesized'] += 1
 
     return stats
 

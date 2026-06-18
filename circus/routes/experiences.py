@@ -9,13 +9,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from circus.config import settings
+from circus.database import get_db
 from circus.routes.agents import verify_token
 
 router = APIRouter()
-
-
-def get_db():
-    return sqlite3.connect(str(settings.database_path))
 
 
 class LogExperienceRequest(BaseModel):
@@ -76,17 +73,11 @@ def _log_single_experience(cursor, agent_id: str, req: LogExperienceRequest) -> 
 @router.post("/log")
 async def log_experience(req: LogExperienceRequest, agent_id: str = Depends(verify_token)):
     """Log an experience after completing a task."""
-    db = get_db()
-    try:
+    with get_db() as db:
         cursor = db.cursor()
         result = _log_single_experience(cursor, agent_id, req)
         db.commit()
         return result
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
 
 
 @router.post("/batch")
@@ -96,8 +87,7 @@ async def log_experience_batch(req: BatchLogRequest, agent_id: str = Depends(ver
         raise HTTPException(status_code=400, detail="Max 10 experiences per batch")
 
     results = {"accepted": 0, "rejected": 0, "ids": [], "reasons": []}
-    db = get_db()
-    try:
+    with get_db() as db:
         cursor = db.cursor()
         for exp in req.experiences:
             try:
@@ -109,11 +99,6 @@ async def log_experience_batch(req: BatchLogRequest, agent_id: str = Depends(ver
                 results["reasons"].append(str(e))
         db.commit()
         return results
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
 
 
 @router.get("/query")
@@ -125,8 +110,7 @@ async def query_experiences(
     agent_id: str = Depends(verify_token)
 ):
     """Query experiences for a given environment. Used by bots before starting a task."""
-    db = get_db()
-    try:
+    with get_db() as db:
         cursor = db.cursor()
 
         # Build WHERE clause dynamically based on provided filters
@@ -184,8 +168,6 @@ async def query_experiences(
             "count": len(experiences),
             "queried_at": datetime.utcnow().isoformat() + "Z"
         }
-    finally:
-        db.close()
 
 
 @router.post("/{experience_id}/confirm")
@@ -195,8 +177,7 @@ async def confirm_experience(
     agent_id: str = Depends(verify_token)
 ):
     """Confirm another agent's experience (peer validation raises confidence)."""
-    db = get_db()
-    try:
+    with get_db() as db:
         cursor = db.cursor()
         cursor.execute("SELECT agent_id, confidence, observations, confirmed_by FROM agent_experiences WHERE id=?", (experience_id,))
         row = cursor.fetchone()
@@ -227,18 +208,12 @@ async def confirm_experience(
         """, (json.dumps(confirmed_by), new_conf, experience_id))
         db.commit()
         return {"confirmed": True, "confidence": round(new_conf, 3), "confirmed_by_count": len(confirmed_by)}
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
 
 
 @router.get("/agent/{agent_id}")
 async def get_agent_experiences(agent_id: str, limit: int = Query(20)):
     """Get all experiences logged by a specific agent (TRQP endpoint)."""
-    db = get_db()
-    try:
+    with get_db() as db:
         cursor = db.cursor()
         cursor.execute("""
             SELECT id, environment, task_type, what_worked, what_failed,
@@ -262,8 +237,6 @@ async def get_agent_experiences(agent_id: str, limit: int = Query(20)):
             ],
             "count": len(rows)
         }
-    finally:
-        db.close()
 
 
 @router.get("/synthesis")
@@ -274,8 +247,7 @@ async def get_synthesis_experiences(
     agent_id: str = Depends(verify_token)
 ):
     """Query only meta-synthesized experiences."""
-    db = get_db()
-    try:
+    with get_db() as db:
         cursor = db.cursor()
         where = ["e.is_synthesis = 1"]
         params = []
@@ -314,8 +286,6 @@ async def get_synthesis_experiences(
                 "agent_name": row[10]
             })
         return {"syntheses": syntheses, "count": len(syntheses)}
-    finally:
-        db.close()
 
 
 @router.post("/synthesize")
