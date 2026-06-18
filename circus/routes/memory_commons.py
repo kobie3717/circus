@@ -79,6 +79,7 @@ from circus.services.goal_router import goal_router
 from circus.services.provenance import decay_confidence
 from circus.services.belief_merge import apply_belief_merge_pipeline, ConflictResolution
 from circus.services.domain_validation import validate_domain, InvalidDomainError
+from circus.services.gist_verification import verify_gist_against_evidence
 
 import asyncio
 import json
@@ -487,6 +488,27 @@ async def publish_memory(
         compressed = await compress_to_gist(mem_req.content, mem_req.category)
         gist_content = compressed['gist']
         is_gist = 1 if compressed['gist'] != mem_req.content else 0
+
+        # DeLM Phase 2: verify gist is grounded in evidence
+        verification = verify_gist_against_evidence(
+            gist=compressed['gist'],
+            raw=compressed['raw'],
+            category=mem_req.category,
+            summary=compressed.get('summary'),
+        )
+
+        if not verification.valid:
+            # Low confidence + unverifiable → reject
+            if effective_conf < 0.7:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Gist verification failed: {verification.reason}"
+                )
+            # High confidence but gist drifted → store quarantine flag in provenance
+            # Don't block publish, but mark it
+            prov_dict = dict(provenance_data)  # Make a copy
+            prov_dict['gist_verification_warning'] = verification.reason
+            provenance_data = prov_dict
 
         # Insert into shared_memories (use memory-commons room)
         # Retry on ID collision (max 3 attempts)
