@@ -37,11 +37,11 @@ async def compress_to_gist(
     """
     raw = content
 
-    # Short content — no compression
-    if _approx_tokens(content) <= 100:
+    # Short content — no compression (threshold: 50 tokens ~200 chars)
+    if _approx_tokens(content) <= 50:
         return {"gist": content, "summary": None, "raw": raw, "source_type": source_type}
 
-    # Medium content (100-500 tokens) — compress to gist only
+    # Medium content (50-500 tokens) — compress to gist only
     if _approx_tokens(content) <= 500:
         gist = _compress_medium(content, category)
         return {"gist": gist, "summary": None, "raw": raw, "source_type": source_type}
