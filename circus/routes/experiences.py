@@ -32,47 +32,80 @@ class ConfirmExperienceRequest(BaseModel):
     confirming_agent_id: str  # Ignored - kept for backwards compatibility
 
 
+class BatchLogRequest(BaseModel):
+    experiences: list[LogExperienceRequest]  # max 10
+
+
+def _log_single_experience(cursor, agent_id: str, req: LogExperienceRequest) -> dict:
+    """Shared logic for logging a single experience (used by /log and /batch)."""
+    # Check for existing similar experience (merge duplicates)
+    cursor.execute("""
+        SELECT id, observations, confidence, confirmed_by
+        FROM agent_experiences
+        WHERE agent_id=? AND environment=? AND task_type=? AND what_worked=?
+    """, (agent_id, req.environment, req.task_type, req.what_worked))
+    existing = cursor.fetchone()
+
+    if existing:
+        exp_id, obs, conf, confirmed_by_json = existing
+        # Update: increment observations, Bayesian update confidence
+        new_obs = obs + 1
+        new_conf = min(0.99, conf + (req.outcome - conf) / new_obs)
+        cursor.execute("""
+            UPDATE agent_experiences
+            SET observations=?, confidence=?, outcome=?, updated_at=datetime('now')
+            WHERE id=?
+        """, (new_obs, new_conf, req.outcome, exp_id))
+        return {"id": exp_id, "merged": True, "observations": new_obs, "confidence": round(new_conf, 3)}
+
+    exp_id = str(uuid.uuid4())
+    cursor.execute("""
+        INSERT INTO agent_experiences
+            (id, agent_id, environment, task_type, what_worked, what_failed,
+             context_snapshot, outcome, confidence, observations, confirmed_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, '[]')
+    """, (
+        exp_id, agent_id, req.environment, req.task_type,
+        req.what_worked, req.what_failed,
+        json.dumps(req.context_snapshot or {}),
+        req.outcome, req.confidence
+    ))
+    return {"id": exp_id, "merged": False, "observations": 1, "confidence": req.confidence}
+
+
 @router.post("/log")
 async def log_experience(req: LogExperienceRequest, agent_id: str = Depends(verify_token)):
     """Log an experience after completing a task."""
     db = get_db()
     try:
         cursor = db.cursor()
-        # Check for existing similar experience (merge duplicates)
-        cursor.execute("""
-            SELECT id, observations, confidence, confirmed_by
-            FROM agent_experiences
-            WHERE agent_id=? AND environment=? AND task_type=? AND what_worked=?
-        """, (agent_id, req.environment, req.task_type, req.what_worked))
-        existing = cursor.fetchone()
-
-        if existing:
-            exp_id, obs, conf, confirmed_by_json = existing
-            # Update: increment observations, Bayesian update confidence
-            new_obs = obs + 1
-            new_conf = min(0.99, conf + (req.outcome - conf) / new_obs)
-            cursor.execute("""
-                UPDATE agent_experiences
-                SET observations=?, confidence=?, outcome=?, updated_at=datetime('now')
-                WHERE id=?
-            """, (new_obs, new_conf, req.outcome, exp_id))
-            db.commit()
-            return {"id": exp_id, "merged": True, "observations": new_obs, "confidence": round(new_conf, 3)}
-
-        exp_id = str(uuid.uuid4())
-        cursor.execute("""
-            INSERT INTO agent_experiences
-                (id, agent_id, environment, task_type, what_worked, what_failed,
-                 context_snapshot, outcome, confidence, observations, confirmed_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, '[]')
-        """, (
-            exp_id, agent_id, req.environment, req.task_type,
-            req.what_worked, req.what_failed,
-            json.dumps(req.context_snapshot or {}),
-            req.outcome, req.confidence
-        ))
+        result = _log_single_experience(cursor, agent_id, req)
         db.commit()
-        return {"id": exp_id, "merged": False, "observations": 1, "confidence": req.confidence}
+        return result
+    finally:
+        db.close()
+
+
+@router.post("/batch")
+async def log_experience_batch(req: BatchLogRequest, agent_id: str = Depends(verify_token)):
+    """Batch log experiences (up to 10). Returns accepted/rejected counts."""
+    if len(req.experiences) > 10:
+        raise HTTPException(status_code=400, detail="Max 10 experiences per batch")
+
+    results = {"accepted": 0, "rejected": 0, "ids": [], "reasons": []}
+    db = get_db()
+    try:
+        cursor = db.cursor()
+        for exp in req.experiences:
+            try:
+                result = _log_single_experience(cursor, agent_id, exp)
+                results["accepted"] += 1
+                results["ids"].append(result["id"])
+            except Exception as e:
+                results["rejected"] += 1
+                results["reasons"].append(str(e))
+        db.commit()
+        return results
     finally:
         db.close()
 
