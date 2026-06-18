@@ -118,7 +118,7 @@ async def log_experience_batch(req: BatchLogRequest, agent_id: str = Depends(ver
 
 @router.get("/query")
 async def query_experiences(
-    environment: str = Query(...),
+    environment: Optional[str] = Query(None),
     task_type: Optional[str] = Query(None),
     min_confidence: float = Query(0.5),
     limit: int = Query(5),
@@ -128,30 +128,33 @@ async def query_experiences(
     db = get_db()
     try:
         cursor = db.cursor()
+
+        # Build WHERE clause dynamically based on provided filters
+        conditions = ["e.confidence >= ?"]
+        params = [min_confidence]
+
+        if environment:
+            conditions.append("e.environment=?")
+            params.append(environment)
+
         if task_type:
-            cursor.execute("""
-                SELECT e.id, e.agent_id, e.environment, e.task_type,
-                       e.what_worked, e.what_failed, e.outcome, e.confidence,
-                       e.observations, e.confirmed_by, e.created_at,
-                       a.name as agent_name, a.trust_score
-                FROM agent_experiences e
-                JOIN agents a ON e.agent_id = a.id
-                WHERE e.environment=? AND e.task_type=? AND e.confidence >= ?
-                ORDER BY (e.confidence * (a.trust_score / 100.0)) DESC
-                LIMIT ?
-            """, (environment, task_type, min_confidence, limit))
-        else:
-            cursor.execute("""
-                SELECT e.id, e.agent_id, e.environment, e.task_type,
-                       e.what_worked, e.what_failed, e.outcome, e.confidence,
-                       e.observations, e.confirmed_by, e.created_at,
-                       a.name as agent_name, a.trust_score
-                FROM agent_experiences e
-                JOIN agents a ON e.agent_id = a.id
-                WHERE e.environment=? AND e.confidence >= ?
-                ORDER BY (e.confidence * (a.trust_score / 100.0)) DESC
-                LIMIT ?
-            """, (environment, min_confidence, limit))
+            conditions.append("e.task_type=?")
+            params.append(task_type)
+
+        where_clause = " AND ".join(conditions)
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT e.id, e.agent_id, e.environment, e.task_type,
+                   e.what_worked, e.what_failed, e.outcome, e.confidence,
+                   e.observations, e.confirmed_by, e.created_at,
+                   a.name as agent_name, a.trust_score
+            FROM agent_experiences e
+            JOIN agents a ON e.agent_id = a.id
+            WHERE {where_clause}
+            ORDER BY (e.confidence * (a.trust_score / 100.0)) DESC
+            LIMIT ?
+        """, params)
         rows = cursor.fetchall()
         experiences = []
         for row in rows:
