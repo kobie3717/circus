@@ -264,3 +264,69 @@ async def get_agent_experiences(agent_id: str, limit: int = Query(20)):
         }
     finally:
         db.close()
+
+
+@router.get("/synthesis")
+async def get_synthesis_experiences(
+    task_type: Optional[str] = Query(None),
+    environment: Optional[str] = Query(None),
+    limit: int = Query(10),
+    agent_id: str = Depends(verify_token)
+):
+    """Query only meta-synthesized experiences."""
+    db = get_db()
+    try:
+        cursor = db.cursor()
+        where = ["e.is_synthesis = 1"]
+        params = []
+        if task_type:
+            where.append("e.task_type = ?")
+            params.append(task_type)
+        if environment:
+            where.append("e.environment = ?")
+            params.append(environment)
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT e.id, e.environment, e.task_type, e.what_worked,
+                   e.outcome, e.confidence, e.observations, e.synthesis_period,
+                   e.source_experience_ids, e.created_at, a.name as agent_name
+            FROM agent_experiences e
+            JOIN agents a ON a.id = e.agent_id
+            WHERE {' AND '.join(where)}
+            ORDER BY e.confidence DESC
+            LIMIT ?
+        """, params)
+        rows = cursor.fetchall()
+        syntheses = []
+        for row in rows:
+            syntheses.append({
+                "id": row[0],
+                "environment": row[1],
+                "task_type": row[2],
+                "what_worked": row[3],
+                "outcome": row[4],
+                "confidence": row[5],
+                "observations": row[6],
+                "synthesis_period": row[7],
+                "source_experience_ids": json.loads(row[8] or "[]"),
+                "created_at": row[9],
+                "agent_name": row[10]
+            })
+        return {"syntheses": syntheses, "count": len(syntheses)}
+    finally:
+        db.close()
+
+
+@router.post("/synthesize")
+async def trigger_synthesis(
+    lookback_days: int = Query(7),
+    agent_id: str = Depends(verify_token)
+):
+    """Manually trigger synthesis run (admin use)."""
+    try:
+        from circus.synthesis_worker import run_synthesis
+        stats = run_synthesis(lookback_days)
+        return {"status": "ok", "stats": stats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

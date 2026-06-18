@@ -566,6 +566,9 @@ def init_database(db_path: Optional[Path] = None) -> None:
     # Run v43 migration for Phase 1 gist/unfold hierarchy (DeLM-inspired)
     run_v43_migration(db_path)
 
+    # Run v44 migration for experience synthesis
+    run_v44_migration(db_path)
+
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
     seed_owner_key_from_env(conn)
@@ -2807,6 +2810,55 @@ def run_v43_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v43 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v44_migration(db_path: Optional[Path] = None) -> None:
+    """Run v44 migration: Experience synthesis columns (is_synthesis, source_experience_ids, synthesis_period)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if is_synthesis column already exists
+        cursor.execute("PRAGMA table_info(agent_experiences)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        columns_added = []
+
+        # Add is_synthesis column if it doesn't exist
+        if 'is_synthesis' not in existing_columns:
+            cursor.execute("ALTER TABLE agent_experiences ADD COLUMN is_synthesis INTEGER DEFAULT 0")
+            columns_added.append('is_synthesis')
+
+        # Add source_experience_ids column if it doesn't exist
+        if 'source_experience_ids' not in existing_columns:
+            cursor.execute("ALTER TABLE agent_experiences ADD COLUMN source_experience_ids TEXT DEFAULT '[]'")
+            columns_added.append('source_experience_ids')
+
+        # Add synthesis_period column if it doesn't exist
+        if 'synthesis_period' not in existing_columns:
+            cursor.execute("ALTER TABLE agent_experiences ADD COLUMN synthesis_period TEXT")
+            columns_added.append('synthesis_period')
+
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_exp_synthesis ON agent_experiences(is_synthesis, task_type, environment)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_exp_synthesis_period ON agent_experiences(synthesis_period) WHERE synthesis_period IS NOT NULL")
+
+        conn.commit()
+        if columns_added:
+            logger.info(f"v44 migration: added synthesis columns {columns_added} to agent_experiences table")
+        else:
+            logger.debug("v44 migration: synthesis columns already exist, skipping")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v44 migration failed: %s", e)
         raise
     finally:
         conn.close()
