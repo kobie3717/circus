@@ -82,6 +82,9 @@ async def log_experience(req: LogExperienceRequest, agent_id: str = Depends(veri
         result = _log_single_experience(cursor, agent_id, req)
         db.commit()
         return result
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -106,6 +109,9 @@ async def log_experience_batch(req: BatchLogRequest, agent_id: str = Depends(ver
                 results["reasons"].append(str(e))
         db.commit()
         return results
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -218,6 +224,9 @@ async def confirm_experience(
         """, (json.dumps(confirmed_by), new_conf, experience_id))
         db.commit()
         return {"confirmed": True, "confidence": round(new_conf, 3), "confirmed_by_count": len(confirmed_by)}
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
