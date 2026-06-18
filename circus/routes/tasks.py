@@ -605,8 +605,8 @@ async def get_inbox(
                 updated_at=row["updated_at"],
                 deadline=row["deadline"],
                 output_schema=safe_json_loads(row["output_schema"], f"output_schema for task {row['id']}") if row["output_schema"] else None,
-                reversibility_class=row.get("reversibility_class"),
-                required_capabilities=safe_json_loads(row["required_capabilities"], f"required_capabilities for task {row['id']}") if row.get("required_capabilities") else None
+                reversibility_class=row["reversibility_class"] if "reversibility_class" in row.keys() else None,
+                required_capabilities=safe_json_loads(row["required_capabilities"], f"required_capabilities for task {row['id']}") if "required_capabilities" in row.keys() and row["required_capabilities"] else None
             ))
 
         return tasks
@@ -652,8 +652,8 @@ async def get_outbox(
                 updated_at=row["updated_at"],
                 deadline=row["deadline"],
                 output_schema=safe_json_loads(row["output_schema"], f"output_schema for task {row['id']}") if row["output_schema"] else None,
-                reversibility_class=row.get("reversibility_class"),
-                required_capabilities=safe_json_loads(row["required_capabilities"], f"required_capabilities for task {row['id']}") if row.get("required_capabilities") else None
+                reversibility_class=row["reversibility_class"] if "reversibility_class" in row.keys() else None,
+                required_capabilities=safe_json_loads(row["required_capabilities"], f"required_capabilities for task {row['id']}") if "required_capabilities" in row.keys() and row["required_capabilities"] else None
             ))
 
         return tasks

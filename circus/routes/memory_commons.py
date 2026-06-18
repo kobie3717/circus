@@ -482,6 +482,12 @@ async def publish_memory(
         # E.g., "engineering.code" -> "engineering", "medical" -> "medical"
         domain_tag = normalized_domain.split('.')[0] if '.' in normalized_domain else normalized_domain
 
+        # DeLM Phase 1: compress content to gist
+        from circus.services.gist_compression import compress_to_gist
+        compressed = await compress_to_gist(mem_req.content, mem_req.category)
+        gist_content = compressed['gist']
+        is_gist = 1 if compressed['gist'] != mem_req.content else 0
+
         # Insert into shared_memories (use memory-commons room)
         # Retry on ID collision (max 3 attempts)
         for attempt in range(3):
@@ -491,12 +497,12 @@ async def publish_memory(
                         id, room_id, from_agent_id, content, category, domain, tags, provenance,
                         privacy_tier, hop_count, original_author, confidence,
                         age_days, effective_confidence, shared_at, trust_verified, troupe_id,
-                        expires_at, contradiction_count, custody_chain, stake_escrowed
-                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0, ?, ?, 0, ?, 0.0)
+                        expires_at, contradiction_count, custody_chain, stake_escrowed, gist_only
+                    ) VALUES (?, 'room-memory-commons', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, 0, ?, ?, 0, ?, 0.0, ?)
                 """, (
                     memory_id,
                     agent_id,
-                    mem_req.content,
+                    gist_content,
                     mem_req.category,
                     normalized_domain,
                     json.dumps(mem_req.tags or []),
@@ -508,8 +514,20 @@ async def publish_memory(
                     now.isoformat(),
                     troupe_id,
                     expires_at,
-                    custody_chain
+                    custody_chain,
+                    is_gist
                 ))
+                # Store raw evidence (always)
+                cursor.execute(
+                    "INSERT OR IGNORE INTO memory_evidence (id, memory_id, raw_content, source_type, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (f"raw-{memory_id}", memory_id, mem_req.content, "text", now.isoformat())
+                )
+                # Store summary if present
+                if compressed['summary']:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO memory_summaries (id, memory_id, summary_text, created_at) VALUES (?, ?, ?, ?)",
+                        (f"sum-{memory_id}", memory_id, compressed['summary'], now.isoformat())
+                    )
                 conn.commit()
                 break
             except sqlite3.IntegrityError:
@@ -726,6 +744,53 @@ async def publish_memory(
         enqueue_for_federation(memory_id, federation_payload)
 
         return PublishResponseWithConflict(**response_data)
+
+
+@router.get("/unfold")
+async def unfold_memory(
+    memory_id: str,
+    level: str = "summary",
+    agent_id: str = Depends(verify_token)
+):
+    """
+    Unfold a memory to get more detail (DeLM Phase 1).
+
+    Levels:
+    - summary: Get ~300-500 token summary (if available, else raw)
+    - raw: Get full original content
+
+    Returns the requested level of detail with metadata.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT content, gist_only FROM shared_memories WHERE id = ?", (memory_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        content = row[0]
+        gist_only = row[1] if len(row) > 1 else 0
+
+        # Old format memory (pre-gist) - return content directly
+        if not gist_only:
+            return {"content": content, "level": "raw", "note": "pre-gist memory, showing full content"}
+
+        if level == "raw":
+            cursor.execute("SELECT raw_content, source_type FROM memory_evidence WHERE memory_id = ?", (memory_id,))
+            ev = cursor.fetchone()
+            if not ev:
+                return {"content": content, "level": "gist", "note": "raw evidence not found"}
+            return {"raw_content": ev[0], "source_type": ev[1], "level": "raw"}
+
+        else:  # summary
+            cursor.execute("SELECT summary_text FROM memory_summaries WHERE memory_id = ?", (memory_id,))
+            sm = cursor.fetchone()
+            if not sm:
+                # No summary - return raw
+                cursor.execute("SELECT raw_content FROM memory_evidence WHERE memory_id = ?", (memory_id,))
+                ev = cursor.fetchone()
+                return {"content": ev[0] if ev else content, "level": "raw", "note": "no summary available"}
+            return {"summary": sm[0], "level": "summary"}
 
 
 @router.get("/stream")

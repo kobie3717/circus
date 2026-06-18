@@ -137,7 +137,7 @@ def verify_token(authorization: str = Header(...)) -> str:
 
 @router.post("/register", response_model=AgentRegisterResponse, status_code=201)
 async def register_agent(request: AgentRegisterRequest):
-    """Register a new agent with AI-IQ passport."""
+    """Register a new agent with AI-IQ passport. Open to external agents — trust system is the gate."""
     # Validate passport structure
     required_fields = ["identity", "score"]
     for field in required_fields:

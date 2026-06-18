@@ -563,6 +563,9 @@ def init_database(db_path: Optional[Path] = None) -> None:
     # Run v42 migration for agent_experiences table (narrative memory)
     run_v42_migration(db_path)
 
+    # Run v43 migration for Phase 1 gist/unfold hierarchy (DeLM-inspired)
+    run_v43_migration(db_path)
+
     # Auto-seed owner key if configured
     conn = sqlite3.connect(str(db_path))
     seed_owner_key_from_env(conn)
@@ -2741,6 +2744,69 @@ def run_v42_migration(db_path: Optional[Path] = None) -> None:
     except Exception as e:
         conn.rollback()
         logger.error("v42 migration failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def run_v43_migration(db_path: Optional[Path] = None) -> None:
+    """Run v43 migration: Phase 1 gist/unfold hierarchy (DeLM-inspired)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    db_path = db_path or settings.database_path
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+
+        # Check if gist_only column already exists
+        cursor.execute("PRAGMA table_info(shared_memories)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        if 'gist_only' not in existing_columns:
+            # Add gist_only column to shared_memories
+            try:
+                cursor.execute("ALTER TABLE shared_memories ADD COLUMN gist_only INTEGER DEFAULT 0")
+            except Exception as e:
+                logger.warning(f"v43: gist_only column add failed (may already exist): {e}")
+
+        # Check if memory_summaries table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_summaries'")
+        if not cursor.fetchone():
+            # Create memory_summaries table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS memory_summaries (
+                    id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL,
+                    summary_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (memory_id) REFERENCES shared_memories(id) ON DELETE CASCADE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_summaries_memory ON memory_summaries(memory_id)")
+
+        # Check if memory_evidence table already exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_evidence'")
+        if not cursor.fetchone():
+            # Create memory_evidence table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS memory_evidence (
+                    id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL,
+                    raw_content TEXT NOT NULL,
+                    source_type TEXT DEFAULT 'text',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (memory_id) REFERENCES shared_memories(id) ON DELETE CASCADE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_evidence_memory ON memory_evidence(memory_id)")
+
+        conn.commit()
+        logger.info("v43 migration: Phase 1 gist/unfold hierarchy (memory_summaries + memory_evidence tables + gist_only column)")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error("v43 migration failed: %s", e)
         raise
     finally:
         conn.close()
