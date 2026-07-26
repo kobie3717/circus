@@ -2,6 +2,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { Orchestrator } from '../orchestrator.mjs';
+import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const orchestratorPath = fileURLToPath(new URL('../orchestrator.mjs', import.meta.url));
 
 test('G5 negative: new file flipping check FAIL→PASS is flagged', async () => {
   // Test the detectStubCapitulation method directly
@@ -49,18 +56,14 @@ test('G5 positive: editing existing files without flipping checks passes', async
   assert.strictEqual(newFiles.length, 0, 'Should have no new files');
 });
 
-test('G5 BUILD 2: handleStubDetectionFlags causes HALT with exit code 42', async () => {
-  // Test that handleStubDetectionFlags actually halts the process
-  const { spawn } = await import('node:child_process');
-  const { existsSync, unlinkSync } = await import('node:fs');
+test('G5 BUILD 2: handleStubDetectionFlags causes HALT with exit code 42', async (t) => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'circus-test-g5-build2-'));
+  const resumeHashPath = join(tempDir, 'resume-hash');
 
-  const resumeHashPath = '.loop/resume-hash-test-g5-build2';
-  if (existsSync(resumeHashPath)) {
-    unlinkSync(resumeHashPath);
-  }
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
 
   const childProcess = spawn('node', ['-e', `
-    import { Orchestrator } from '/root/circus/loop/orchestrator.mjs';
+    import { Orchestrator } from '${orchestratorPath}';
 
     const adapter = {
       async plan() { return { artifact: '# plan' }; },
@@ -89,11 +92,6 @@ test('G5 BUILD 2: handleStubDetectionFlags causes HALT with exit code 42', async
     childProcess.on('exit', (code) => {
       assert.strictEqual(code, 42, 'Should exit with code 42 when stub flags are handled');
       assert.ok(existsSync(resumeHashPath), 'Should write resume hash on G5 HALT');
-
-      // Clean up
-      if (existsSync(resumeHashPath)) {
-        unlinkSync(resumeHashPath);
-      }
       resolve();
     });
   });

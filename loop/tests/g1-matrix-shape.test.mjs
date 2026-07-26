@@ -3,9 +3,10 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { Orchestrator, StubAdapter } from '../orchestrator.mjs';
 import { readFileSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 test('G1 negative: verdict with wrong check names is rejected', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   // Create a custom adapter that returns bad verdict
   const badAdapter = {
@@ -33,7 +34,7 @@ test('G1 negative: verdict with wrong check names is rejected', async () => {
 });
 
 test('G1 positive: verdict with correct check names passes', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
   const adapter = new StubAdapter(fixtureDir);
   const orchestrator = new Orchestrator(adapter, { fixtureDir });
 
@@ -47,7 +48,7 @@ test('G1 positive: verdict with correct check names passes', async () => {
 });
 
 test('G1 BUILD 2: plan missing mandatory check is rejected', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const adapter = {
     async plan() {
@@ -77,7 +78,7 @@ test('G1 BUILD 2: plan missing mandatory check is rejected', async () => {
 });
 
 test('G1 BUILD 2: plan with superset of mandatory checks passes', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
   const adapter = new StubAdapter(fixtureDir);
   const orchestrator = new Orchestrator(adapter, {
     fixtureDir,

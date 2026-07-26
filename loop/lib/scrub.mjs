@@ -1,6 +1,6 @@
 // scrub.mjs — Vendored egress scrubber for secret detection
-// Provenance: /root/bot-circus/lib/experience-bridge.mjs @ commit 0e8e4ee3763aa9b20983bddfa6b22132b2bf5115
-// Function: scrubEgress (lines 66-79)
+// Provenance: bot-circus lib/experience-bridge.mjs::scrubEgress (non-durable branch v3-landing)
+// Content hash (SHA-256): 825342315d5188e630a306601f4012868fd5a444c7f1f957699ace57582ac5b1
 // Vendored for BUILD 2 to remove cross-repo filesystem dependency
 
 // Egress scrub — for artifacts/output. Redacts secrets and returns { action, hits, text }.

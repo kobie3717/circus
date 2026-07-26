@@ -2,9 +2,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { Orchestrator } from '../orchestrator.mjs';
+import { fileURLToPath } from 'node:url';
 
 test('G6 negative: role receiving disallowed artifacts fails', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   // Create orchestrator that will try to pass verdict to coder
   const orchestrator = new Orchestrator({
@@ -34,7 +35,7 @@ test('G6 negative: role receiving disallowed artifacts fails', async () => {
 });
 
 test('G6 positive: roles receive only allowed artifacts', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const seenArtifacts = {
     coder: null,
