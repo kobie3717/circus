@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // orchestrator.mjs — Circus Loop state machine with guards
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -135,6 +135,25 @@ export class Orchestrator {
     if (storedHash !== suppliedHash) {
       throw new Error('Resume token mismatch — invalid token');
     }
+  }
+
+  // ─── G2: resume gate — entry check ─────────────────────────────────────────
+  // A prior STOP left a resume-hash on disk. A fresh run() must not silently
+  // proceed past that: no token supplied, or a token that doesn't match, both
+  // refuse to start. Only a correct token clears the hash and allows entry.
+  // This is what makes G2's STOP terminal rather than merely loud.
+  checkResumeGate(resumeToken) {
+    if (!existsSync(this.resumeHashPath)) {
+      return; // no prior STOP pending — normal start
+    }
+    if (!resumeToken) {
+      throw new Error('G2 violation: resume hash present at ' + this.resumeHashPath +
+        ' but no resume token supplied — refusing to start. Prior run STOPped and was never resumed.');
+    }
+    // Throws 'Resume token mismatch' on wrong token — propagates as refusal.
+    this.verifyResumeToken(resumeToken);
+    // Correct token: the STOP is resolved — clear the hash so it can't gate again.
+    unlinkSync(this.resumeHashPath);
   }
 
   // ─── G1: matrix-shape ─────────────────────────────────────────────────────
@@ -323,7 +342,10 @@ export class Orchestrator {
   }
 
   // ─── Main Run Loop ────────────────────────────────────────────────────────
-  async run(task) {
+  async run(task, resumeToken = null) {
+    // G2: refuse to start if a prior STOP's resume hash is still pending
+    this.checkResumeGate(resumeToken);
+
     this.state = STATES.PLANNING;
 
     // PLANNING
