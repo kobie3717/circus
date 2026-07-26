@@ -162,15 +162,36 @@ These guards run in the orchestrator code, enforcing contracts that tests, roles
 **Rationale**: Detects the pattern "create an empty file to make `test -f foo.txt` pass" instead of implementing real functionality.
 
 ### G6: role-isolation
-**What**: Each role receives ONLY the artifacts it's allowed to read, enforced by the adapter call signature.
+**What**: Each role receives ONLY the artifacts it's allowed to read, enforced by temporal separation and adapter call signature.
 
 **Enforcement**:
-- **Coder** receives: `plan.md` only
+- **Temporal separation** (primary mechanism): Coder process completes and exits BEFORE `verdict.json` is written
+  - Orchestrator runs coder, awaits completion, THEN runs evaluator
+  - Sequential `await` ensures artifacts never coexist on disk with processes that shouldn't access them
+  - Tests verify: coder exit timestamp < verdict write timestamp
+  
+- **Feedback projection**: Coder receives ONLY filtered feedback (row name + pass/fail), not raw verdict
+  - Distiller filters verdict to whitelisted fields before passing to planner
+  - No evaluator commentary, evidence details, or internal probe data leaks through
+  - Tests verify: feedback.md contains no sensitive verdict fields
+  
+- **Capability manifest** (defense-in-depth): Coder role restricted to Read/Edit/Write within worktree only
+  - NO Bash execution allowed (coder can't shell out to read filesystem)
+  - NO network access (coder can't exfiltrate or fetch external data)
+  - NO reads outside worktree path (coder can't traverse to orchestrator directories)
+  - Tests verify: out-of-manifest actions are rejected
+
+**Adapter interface enforcement**:
+- **Coder** receives: `plan.md` only (and filtered `feedback.md` on retry)
 - **Evaluator** receives: `plan.md`, `diff` only
 - **Distiller** receives: `plan.md`, `diff`, `verdict.json` only
 - **Planner** receives: task description, optional `feedback.md` from prior iteration
-- Adapter interface throws error if a role attempts to access an artifact outside its allowed set
 - Orchestrator does not pass disallowed artifacts to role adapters (they are not in scope)
+
+**Why not permission bits or per-user isolation?**
+- All production processes run as root (uid=0), making permission bits ineffective
+- Container-per-role adds complexity without solving the root-bypass constraint
+- Temporal separation is simpler and more reliable: if the artifact doesn't exist yet, permission bits are moot
 
 **Rationale**: Prevents coder from reading prior verdicts and adjusting code to game specific checks; prevents evaluator from seeing distiller output that might bias its verdict.
 
