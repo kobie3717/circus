@@ -129,7 +129,14 @@ for GUARD_NAME in "${!MUTATIONS[@]}"; do
   TEST_OUTPUT=$(npm test 2>&1 || true)
 
   # Actual red set: every "not ok N - <name>" line, name extracted, sorted+deduped.
-  ACTUAL_RED=$(echo "$TEST_OUTPUT" | grep -E "^not ok [0-9]+ - " | sed -E 's/^not ok [0-9]+ - //' | sort -u)
+  # Whole-file failures print as an absolute path locally vs on CI (e.g.
+  # /home/runner/work/circus/circus/loop/tests/x.test.mjs vs a relative path
+  # when run from the repo root) — normalize to the repo-relative form so
+  # the comparison isn't environment-dependent.
+  ACTUAL_RED=$(echo "$TEST_OUTPUT" | grep -E "^not ok [0-9]+ - " \
+    | sed -E 's/^not ok [0-9]+ - //' \
+    | sed -E 's#^.*(loop/tests/[A-Za-z0-9_./-]+\.test\.mjs)$#\1#' \
+    | sort -u)
 
   if [ -z "$ACTUAL_RED" ]; then
     echo "❌ MUTATION INEFFECTIVE: Tests still pass with $GUARD_NAME disabled!"
