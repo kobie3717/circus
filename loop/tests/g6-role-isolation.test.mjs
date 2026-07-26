@@ -74,47 +74,59 @@ test('G6 positive: roles receive only allowed artifacts', async () => {
   assert.deepStrictEqual(seenArtifacts.distiller.sort(), ['diff', 'plan', 'verdict'], 'Distiller should receive plan, diff, and verdict');
 });
 
-test('G6 BUILD 3: real subprocess with filesystem isolation', async (t) => {
-  // Create separate temp dirs: one for orchestrator, one for coder subprocess
-  const orchTempDir = mkdtempSync(join(tmpdir(), 'circus-test-g6-orch-'));
-  const coderTempDir = mkdtempSync(join(tmpdir(), 'circus-test-g6-coder-'));
+test('G6 BUILD 4: real permission-based isolation (EACCES, not ENOENT)', async (t) => {
+  const { chmodSync } = await import('node:fs');
+
+  // Create temp dirs in /tmp (not tmpdir()) to avoid permission issues with /tmp/claude-0
+  // Make them world-traversable (mode 0755) so 'nobody' user can access files
+  const orchTempDir = mkdtempSync('/tmp/circus-test-g6-build4-');
+  const coderTempDir = mkdtempSync('/tmp/circus-test-g6-coder-');
+  chmodSync(orchTempDir, 0o755);
+  chmodSync(coderTempDir, 0o755);
 
   t.after(() => {
-    rmSync(orchTempDir, { recursive: true, force: true });
-    rmSync(coderTempDir, { recursive: true, force: true });
+    // Restore permissions before cleanup
+    try { chmodSync(join(orchTempDir, 'verdict.json'), 0o644); } catch {}
+    try { rmSync(orchTempDir, { recursive: true, force: true }); } catch {}
+    try { rmSync(coderTempDir, { recursive: true, force: true }); } catch {}
   });
 
-  // Write plan in coder's accessible directory
-  writeFileSync(join(coderTempDir, 'plan.md'), '# Test Plan');
+  // Write plan readable by everyone
+  const planPath = join(coderTempDir, 'plan.md');
+  writeFileSync(planPath, '# Test Plan');
+  chmodSync(planPath, 0o644);
 
-  // Write verdict OUTSIDE coder's directory (in orchestrator's dir)
-  writeFileSync(join(orchTempDir, 'verdict.json'), JSON.stringify({ secret: 'should-not-be-accessible' }));
+  // Write verdict with root-only permissions (mode 0600)
+  const verdictPath = join(orchTempDir, 'verdict.json');
+  writeFileSync(verdictPath, JSON.stringify({ secret: 'should-not-be-accessible' }));
+  chmodSync(verdictPath, 0o600); // Owner (root) read/write, nobody else
 
-  // Spawn coder as a real subprocess with restricted cwd
-  // Coder only knows relative paths - it gets "plan.md" but verdict.json is not in its cwd
-  const coderScript = `
-    import { readFileSync } from 'node:fs';
+  // Write test script to a file to avoid shell escaping issues
+  const scriptPath = join(coderTempDir, 'test-script.js');
+  writeFileSync(scriptPath, `
+    const { readFileSync } = require('fs');
 
     try {
-      // Try to read plan (should succeed - it's in our cwd as plan.md)
-      readFileSync('plan.md', 'utf8');
+      // Try to read plan with absolute path (should succeed - world-readable)
+      readFileSync('${planPath}', 'utf8');
       console.log('PLAN_READ_OK');
 
-      // Try to read verdict.json (should fail - not in our cwd)
-      readFileSync('verdict.json', 'utf8');
+      // Try to read verdict with absolute path (should fail with EACCES - permission denied)
+      readFileSync('${verdictPath}', 'utf8');
       console.log('VERDICT_READ_OK');
-      process.exit(1); // Should not reach here
+      process.exit(1); // Should NOT reach here
     } catch (err) {
-      if (err.code === 'ENOENT' || err.code === 'EACCES') {
-        console.log('VERDICT_READ_FAILED:' + err.code);
-        process.exit(0);
+      console.log('VERDICT_READ_FAILED:' + err.code);
+      if (err.code === 'EACCES') {
+        process.exit(0); // Success - got permission denied
       }
-      throw err;
+      process.exit(2); // Unexpected error code
     }
-  `;
+  `);
+  chmodSync(scriptPath, 0o755);
 
-  const childProcess = spawn('node', ['--input-type=module', '-e', coderScript], {
-    cwd: coderTempDir,
+  // Spawn as 'nobody' user to prove permission enforcement
+  const childProcess = spawn('su', ['nobody', '-s', '/bin/sh', '-c', `node ${scriptPath}`], {
     stdio: ['pipe', 'pipe', 'pipe']
   });
 
@@ -129,13 +141,9 @@ test('G6 BUILD 3: real subprocess with filesystem isolation', async (t) => {
         console.error('Coder subprocess stdout:', stdout);
         console.error('Coder subprocess stderr:', stderr);
       }
-      assert.strictEqual(code, 0, 'Coder subprocess should exit 0 after failing to read verdict');
-      assert.ok(stdout.includes('PLAN_READ_OK'), 'Coder should successfully read plan from its cwd');
-      assert.ok(stdout.includes('VERDICT_READ_FAILED'), 'Coder should fail to read verdict outside its cwd');
-      assert.ok(
-        stdout.includes('ENOENT') || stdout.includes('EACCES'),
-        'Isolation enforced by ENOENT (path not in cwd) or EACCES (permission denied)'
-      );
+      assert.strictEqual(code, 0, 'Coder subprocess should exit 0 after getting EACCES');
+      assert.ok(stdout.includes('PLAN_READ_OK'), 'Coder should read plan (world-readable)');
+      assert.ok(stdout.includes('VERDICT_READ_FAILED:EACCES'), 'Coder should get EACCES (not ENOENT) on verdict');
       resolve();
     });
   });
