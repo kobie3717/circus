@@ -69,13 +69,36 @@ export class Orchestrator {
     // test below, which asserts no test resolves this to the project root.
     this.loopDir = options.loopDir || '.loop';
     this.resumeHashPath = options.resumeHashPath || join(this.loopDir, 'resume-hash');
-    // Injectable git repo root for worktree/push operations. Defaults to the
-    // real repo (production) — the codebase we're running in is the codebase
-    // we're changing. But every test must inject an isolated tmp git repo
-    // (see tempGitRepo() in loop/tests/helpers/git-repo.mjs) or it will
-    // create real branches/worktrees in /root/circus itself. Same rationale
-    // as loopDir above — default is correct for prod, wrong for every test.
-    this.repoRoot = options.repoRoot || process.cwd();
+    // Git repo root for worktree/push operations. REQUIRED — no default to
+    // process.cwd(). A silent default here is exactly how `node
+    // loop/orchestrator.mjs` from the repo root created a real worktree and
+    // branch in /root/circus with nothing to stop it (survey finding,
+    // 2026-07-26). Every caller — production or test — must say explicitly
+    // which repo it's about to run git operations against.
+    if (!options.repoRoot) {
+      throw new Error(
+        'repoRoot is required — there is no default. Pass the git repo this ' +
+        'orchestrator should create worktrees/branches/pushes in, explicitly. ' +
+        'Tests: use tempGitRepo() from loop/tests/helpers/git-repo.mjs.'
+      );
+    }
+    this.repoRoot = options.repoRoot;
+
+    // Refuse to operate on a repo that looks like this codebase itself
+    // (contains loop/orchestrator.mjs) unless explicitly overridden. This is
+    // the second half of the same footgun: even with repoRoot required,
+    // someone can still pass process.cwd() by hand from /root/circus. That
+    // should still refuse, not silently proceed.
+    if (existsSync(resolve(this.repoRoot, 'loop', 'orchestrator.mjs')) && !options.allowSelf) {
+      throw new Error(
+        `Refusing to operate on repoRoot (${this.repoRoot}) — it contains ` +
+        `loop/orchestrator.mjs, which means it looks like the Circus repo ` +
+        `itself. Running worktree/commit/push/PR operations against the live ` +
+        `codebase by accident is the exact failure this check exists to stop. ` +
+        `Pass options.allowSelf: true to override if this is genuinely intended.`
+      );
+    }
+
     this.options = options; // store for baseBranch access in resolveBaseBranch()
     this.fixtureDir = options.fixtureDir || fileURLToPath(new URL('./fixtures/', import.meta.url));
     this.artifacts = {};

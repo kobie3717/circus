@@ -44,6 +44,8 @@ MUTATIONS["g5-stub-detection"]="s/flags.length > 0/false \/* MUTATION: g5-stub-d
 MUTATIONS["g6-role-isolation"]="s/feedback = this.filterVerdictToFeedback(verdictJson);/\/* MUTATION: g6-role-isolation disabled *\//"
 MUTATIONS["g2-resume-gate"]="s/this.checkResumeGate(resumeToken);/\/* MUTATION: g2-resume-gate disabled *\//"
 MUTATIONS["applying-worktree-cwd"]="s/stdio: 'pipe', timeout: 30000, cwd: worktreePath/stdio: 'pipe', timeout: 30000 \/* MUTATION: applying-worktree-cwd disabled *\//"
+MUTATIONS["footgun-reporoot-required"]="s/if (!options.repoRoot) {/if (false \&\& !options.repoRoot) {\/* MUTATION: footgun-reporoot-required disabled *\//"
+MUTATIONS["footgun-self-repo-refused"]="s/!options.allowSelf) {/false \&\& !options.allowSelf) {\/* MUTATION: footgun-self-repo-refused disabled *\//"
 
 # Expected red set per mutation — the fix for the g7-shape gap: a gate that
 # only checks "did something go red" proves nothing about WHICH guard it's
@@ -74,14 +76,17 @@ EXPECTED_RED["g5-stub-detection"]="G5 BUILD 3: end-to-end orchestrator run with 
 EXPECTED_RED["g6-role-isolation"]="G6 BUILD 4-B: feedback projection - only whitelisted fields leak to coder"
 EXPECTED_RED["g2-resume-gate"]="loop/tests/g2-stop-terminal.test.mjs"
 EXPECTED_RED["applying-worktree-cwd"]="APPLYING: checks run against worktree, not orchestrator directory"
+EXPECTED_RED["footgun-reporoot-required"]="footgun guard: constructor throws when repoRoot is not provided"
+EXPECTED_RED["footgun-self-repo-refused"]="footgun guard: constructor throws when repoRoot looks like the Circus repo itself, without allowSelf"
 
 MUTATION_COUNT=${#MUTATIONS[@]}
-EXPECTED_GUARDS=8  # 6 original guards + g2-resume-gate + applying-worktree-cwd
-                   # applying-worktree-cwd: disabling the cwd parameter in executeChecksAndCaptureExitCodes
-                   # should turn the "checks run against worktree" test red, proving checks would
-                   # run against the orchestrator's own directory instead of the coder's actual changes.
-                   # Any future change to this number must arrive with the new mutation's
-                   # red-run proof AND its declared expected-red-set attached.
+EXPECTED_GUARDS=10  # 6 original guards + g2-resume-gate + applying-worktree-cwd
+                    # + footgun-reporoot-required + footgun-self-repo-refused (2026-07-26:
+                    # `node loop/orchestrator.mjs` from the repo root defaulted repoRoot to
+                    # process.cwd() and created a real worktree/branch in /root/circus with
+                    # nothing to stop it — both refusals close that).
+                    # Any future change to this number must arrive with the new mutation's
+                    # red-run proof AND its declared expected-red-set attached.
 
 if [ $MUTATION_COUNT -ne $EXPECTED_GUARDS ]; then
   echo "ERROR: Expected $EXPECTED_GUARDS mutations (G1-G6), found $MUTATION_COUNT"
