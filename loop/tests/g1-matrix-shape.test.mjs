@@ -4,8 +4,9 @@ import assert from 'node:assert';
 import { Orchestrator, StubAdapter } from '../orchestrator.mjs';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { tempLoopDir } from './helpers/loop-dir.mjs';
 
-test('G1 negative: verdict with wrong check names is rejected', async () => {
+test('G1 negative: verdict with wrong check names is rejected', async (t) => {
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   // Create a custom adapter that returns bad verdict
@@ -24,7 +25,7 @@ test('G1 negative: verdict with wrong check names is rejected', async () => {
     }
   };
 
-  const orchestrator = new Orchestrator(badAdapter, { fixtureDir });
+  const orchestrator = new Orchestrator(badAdapter, { fixtureDir, loopDir: tempLoopDir(t) });
 
   await assert.rejects(
     async () => await orchestrator.run('test task'),
@@ -33,10 +34,10 @@ test('G1 negative: verdict with wrong check names is rejected', async () => {
   );
 });
 
-test('G1 positive: verdict with correct check names passes', async () => {
+test('G1 positive: verdict with correct check names passes', async (t) => {
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
   const adapter = new StubAdapter(fixtureDir);
-  const orchestrator = new Orchestrator(adapter, { fixtureDir });
+  const orchestrator = new Orchestrator(adapter, { fixtureDir, loopDir: tempLoopDir(t) });
 
   const result = await orchestrator.run('test task');
 
@@ -47,7 +48,7 @@ test('G1 positive: verdict with correct check names passes', async () => {
   assert.strictEqual(verdict.rows.length, 3, 'Should have 3 check rows');
 });
 
-test('G1 BUILD 2: plan missing mandatory check is rejected', async () => {
+test('G1 BUILD 2: plan missing mandatory check is rejected', async (t) => {
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const adapter = {
@@ -67,6 +68,7 @@ test('G1 BUILD 2: plan missing mandatory check is rejected', async () => {
 
   const orchestrator = new Orchestrator(adapter, {
     fixtureDir,
+    loopDir: tempLoopDir(t),
     mandatoryChecks: ['test-greeting', 'lint-check']
   });
 
@@ -77,11 +79,12 @@ test('G1 BUILD 2: plan missing mandatory check is rejected', async () => {
   );
 });
 
-test('G1 BUILD 2: plan with superset of mandatory checks passes', async () => {
+test('G1 BUILD 2: plan with superset of mandatory checks passes', async (t) => {
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
   const adapter = new StubAdapter(fixtureDir);
   const orchestrator = new Orchestrator(adapter, {
     fixtureDir,
+    loopDir: tempLoopDir(t),
     mandatoryChecks: ['test-greeting', 'lint-check']
   });
 

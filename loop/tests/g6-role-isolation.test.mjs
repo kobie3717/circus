@@ -2,8 +2,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { Orchestrator } from '../orchestrator.mjs';
+import { tempLoopDir } from './helpers/loop-dir.mjs';
 
-test('G6 negative: role receiving disallowed artifacts fails', async () => {
+test('G6 negative: role receiving disallowed artifacts fails', async (t) => {
   // Test that coder cannot receive verdict even if we try to inject it
   const adapter = {
     async plan({ task, feedback }) {
@@ -24,7 +25,7 @@ test('G6 negative: role receiving disallowed artifacts fails', async () => {
     }
   };
 
-  const orchestrator = new Orchestrator(adapter);
+  const orchestrator = new Orchestrator(adapter, { loopDir: tempLoopDir(t) });
 
   // Manually inject verdict into artifacts before coder runs (simulating leak attempt)
   orchestrator.artifacts.verdict = 'leaked verdict';
@@ -36,7 +37,7 @@ test('G6 negative: role receiving disallowed artifacts fails', async () => {
   assert.ok(result.diff, 'Should complete without coder receiving verdict');
 });
 
-test('G6 positive: roles receive only allowed artifacts', async () => {
+test('G6 positive: roles receive only allowed artifacts', async (t) => {
   const seenArtifacts = {
     coder: null,
     evaluator: null,
@@ -61,7 +62,7 @@ test('G6 positive: roles receive only allowed artifacts', async () => {
     }
   };
 
-  const orchestrator = new Orchestrator(adapter);
+  const orchestrator = new Orchestrator(adapter, { loopDir: tempLoopDir(t) });
   await orchestrator.run('test task');
 
   // Verify each role received only allowed artifacts (adapter interface enforcement)
@@ -70,7 +71,7 @@ test('G6 positive: roles receive only allowed artifacts', async () => {
   assert.deepStrictEqual(seenArtifacts.distiller.sort(), ['diff', 'plan', 'verdict'], 'Distiller should receive plan, diff, and verdict');
 });
 
-test('G6 BUILD 4-A: temporal separation - coder exits before verdict written', async () => {
+test('G6 BUILD 4-A: temporal separation - coder exits before verdict written', async (t) => {
   // Drive REAL orchestrator and inspect its runState timestamps
   const adapter = {
     async plan({ task, feedback }) {
@@ -89,7 +90,7 @@ test('G6 BUILD 4-A: temporal separation - coder exits before verdict written', a
     }
   };
 
-  const orchestrator = new Orchestrator(adapter);
+  const orchestrator = new Orchestrator(adapter, { loopDir: tempLoopDir(t) });
   await orchestrator.run('test task');
 
   // Verify orchestrator recorded real timestamps in runState
@@ -103,7 +104,7 @@ test('G6 BUILD 4-A: temporal separation - coder exits before verdict written', a
   );
 });
 
-test('G6 BUILD 4-B: feedback projection - only whitelisted fields leak to coder', async () => {
+test('G6 BUILD 4-B: feedback projection - only whitelisted fields leak to coder', async (t) => {
   // Feed REAL orchestrator a verdict with sensitive fields, inspect REAL feedback output
   const sensitiveVerdict = {
     rows: [
@@ -144,7 +145,7 @@ test('G6 BUILD 4-B: feedback projection - only whitelisted fields leak to coder'
     }
   };
 
-  const orchestrator = new Orchestrator(adapter);
+  const orchestrator = new Orchestrator(adapter, { loopDir: tempLoopDir(t) });
   await orchestrator.run('test task');
 
   // Inspect REAL feedback that orchestrator produced
@@ -166,7 +167,7 @@ test('G6 BUILD 4-B: feedback projection - only whitelisted fields leak to coder'
   assert.ok(!feedback.includes('Distiller output'), 'Feedback must be orchestrator-filtered, not raw distiller output');
 });
 
-test('G6 BUILD 4-C: manifest enforcement - coder invoked without manifest fails', async () => {
+test('G6 BUILD 4-C: manifest enforcement - coder invoked without manifest fails', async (t) => {
   // Test that REAL orchestrator enforces manifest presence/shape
   const adapter = {
     async plan({ task, feedback }) {
@@ -202,7 +203,7 @@ test('G6 BUILD 4-C: manifest enforcement - coder invoked without manifest fails'
   );
 });
 
-test('G6 BUILD 4-D: manifest enforcement - Bash and network must be denied', async () => {
+test('G6 BUILD 4-D: manifest enforcement - Bash and network must be denied', async (t) => {
   // Test that REAL orchestrator enforces Bash/network denial in manifest
   const adapter = {
     async plan({ task, feedback }) {
@@ -221,6 +222,7 @@ test('G6 BUILD 4-D: manifest enforcement - Bash and network must be denied', asy
 
   // Attempt to construct with Bash allowed (should fail when coder is invoked)
   const orchestratorWithBash = new Orchestrator(adapter, {
+    loopDir: tempLoopDir(t),
     coderManifest: {
       allowedTools: ['read', 'edit', 'write'],
       allowedPaths: ['/worktree/**'],
@@ -239,6 +241,7 @@ test('G6 BUILD 4-D: manifest enforcement - Bash and network must be denied', asy
 
   // Attempt to construct with network allowed (should fail when coder is invoked)
   const orchestratorWithNetwork = new Orchestrator(adapter, {
+    loopDir: tempLoopDir(t),
     coderManifest: {
       allowedTools: ['read', 'edit', 'write'],
       allowedPaths: ['/worktree/**'],

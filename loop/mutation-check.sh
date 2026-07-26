@@ -19,15 +19,29 @@ function cleanup {
 }
 trap cleanup EXIT
 
-# Define mutations as sed commands that disable each guard
+# Define mutations as sed commands that disable each guard.
+#
+# Anchored to CONTENT, not line numbers. Line-numbered mutations went stale
+# on the very first PR that touched orchestrator.mjs after they were written
+# (see PR history: g6-role-isolation's target silently moved 405 -> 427).
+# A no-op sed is caught by the apply-diagnostic below either way, but a
+# content anchor means most edits to this file don't require re-anchoring
+# every mutation as a routine chore — and routine chores are where a gamed
+# mutation hides next time.
+#
+# Each pattern must be a UNIQUE substring in orchestrator.mjs (verified when
+# written; re-verify with `grep -c` if a future edit could introduce a
+# duplicate). Each mutation neutralizes one guard's condition/call to
+# `false` or a comment, rather than commenting out a line range — this stays
+# valid JS regardless of what's above/below the anchor.
 declare -A MUTATIONS
-MUTATIONS["g1-matrix-shape"]="175,181s/^/\/\/ MUTATION: /"
-MUTATIONS["g2-stop-is-terminal"]="135,137s/^/\/\/ MUTATION: /"
-MUTATIONS["g3-artifact-scrub"]="94,96s/^/\/\/ MUTATION: /"
-MUTATIONS["g4-harness-integrity"]="213,223s/^/\/\/ MUTATION: /"
-MUTATIONS["g5-stub-detection"]="264,268s/^/\/\/ MUTATION: /"
-MUTATIONS["g6-role-isolation"]="427s/feedback = this.filterVerdictToFeedback(verdictJson);/\/\/ MUTATION: feedback = this.filterVerdictToFeedback(verdictJson);/"
-MUTATIONS["g2-resume-gate"]="347s/this.checkResumeGate(resumeToken);/\/\/ MUTATION: this.checkResumeGate(resumeToken);/"
+MUTATIONS["g1-matrix-shape"]="s/JSON.stringify(actual) !== JSON.stringify(expectedSorted)/false \/* MUTATION: g1-matrix-shape disabled *\//"
+MUTATIONS["g2-stop-is-terminal"]="s/process.exit(42);/\/* MUTATION: g2-stop-is-terminal disabled *\//"
+MUTATIONS["g3-artifact-scrub"]="s/result.hits > 0/false \/* MUTATION: g3-artifact-scrub disabled *\//"
+MUTATIONS["g4-harness-integrity"]="s/row.evidence.includes('SUBSTITUTED:')/false \/* MUTATION: g4-harness-integrity disabled *\//"
+MUTATIONS["g5-stub-detection"]="s/flags.length > 0/false \/* MUTATION: g5-stub-detection disabled *\//"
+MUTATIONS["g6-role-isolation"]="s/feedback = this.filterVerdictToFeedback(verdictJson);/\/* MUTATION: g6-role-isolation disabled *\//"
+MUTATIONS["g2-resume-gate"]="s/this.checkResumeGate(resumeToken);/\/* MUTATION: g2-resume-gate disabled *\//"
 
 MUTATION_COUNT=${#MUTATIONS[@]}
 EXPECTED_GUARDS=7  # 6 original guards + g2-resume-gate (first legitimate increment —

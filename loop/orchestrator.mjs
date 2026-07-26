@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from '
 import { createHash } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { scrubEgress } from './lib/scrub.mjs';
 
 const STATES = {
@@ -59,7 +60,14 @@ export class Orchestrator {
   constructor(adapter, options = {}) {
     this.adapter = adapter;
     this.state = STATES.IDLE;
-    this.resumeHashPath = options.resumeHashPath || '.loop/resume-hash';
+    // Injectable base for all .loop/ state (resume-hash today, worktrees/
+    // checkpoints later). Defaults to the repo-root '.loop' — production
+    // behavior — but every test that calls run() must inject its own
+    // mkdtemp-based loopDir (or resumeHashPath directly), or it silently
+    // reads/writes the real repo's .loop/ state. See the harness-isolation
+    // test below, which asserts no test resolves this to the project root.
+    this.loopDir = options.loopDir || '.loop';
+    this.resumeHashPath = options.resumeHashPath || join(this.loopDir, 'resume-hash');
     this.fixtureDir = options.fixtureDir || fileURLToPath(new URL('./fixtures/', import.meta.url));
     this.artifacts = {};
     this.checkResults = {}; // for G5 stub-detection
@@ -111,7 +119,7 @@ export class Orchestrator {
 
   // ─── G2: stop-is-terminal (BUILD 2: hash-only storage) ───────────────────
   handleStop(roleName, reason) {
-    mkdirSync('.loop', { recursive: true });
+    mkdirSync(dirname(this.resumeHashPath), { recursive: true });
     // Generate raw token (returned to caller, never persisted)
     const rawToken = createHash('sha256')
       .update(`${roleName}:${reason}:${Date.now()}`)

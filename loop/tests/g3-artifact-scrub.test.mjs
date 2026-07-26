@@ -4,8 +4,9 @@ import assert from 'node:assert';
 import { Orchestrator } from '../orchestrator.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { tempLoopDir } from './helpers/loop-dir.mjs';
 
-test('G3 negative: artifact with secret is rejected', async () => {
+test('G3 negative: artifact with secret is rejected', async (t) => {
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   // Adapter that returns artifact with secret
@@ -24,7 +25,7 @@ test('G3 negative: artifact with secret is rejected', async () => {
     }
   };
 
-  const orchestrator = new Orchestrator(secretAdapter, { fixtureDir });
+  const orchestrator = new Orchestrator(secretAdapter, { fixtureDir, loopDir: tempLoopDir(t) });
 
   await assert.rejects(
     async () => await orchestrator.run('test task'),
@@ -33,7 +34,7 @@ test('G3 negative: artifact with secret is rejected', async () => {
   );
 });
 
-test('G3 positive: clean artifact passes scrub', async () => {
+test('G3 positive: clean artifact passes scrub', async (t) => {
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const cleanAdapter = {
@@ -51,7 +52,7 @@ test('G3 positive: clean artifact passes scrub', async () => {
     }
   };
 
-  const orchestrator = new Orchestrator(cleanAdapter, { fixtureDir });
+  const orchestrator = new Orchestrator(cleanAdapter, { fixtureDir, loopDir: tempLoopDir(t) });
   const result = await orchestrator.run('test task');
 
   assert.ok(result.plan, 'Should have plan artifact after scrub');

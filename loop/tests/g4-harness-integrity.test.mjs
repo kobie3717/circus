@@ -4,8 +4,9 @@ import assert from 'node:assert';
 import { Orchestrator } from '../orchestrator.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { tempLoopDir } from './helpers/loop-dir.mjs';
 
-test('G4 negative: substituted command in verdict is rejected', async () => {
+test('G4 negative: substituted command in verdict is rejected', async (t) => {
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const substitutedAdapter = {
@@ -23,7 +24,7 @@ test('G4 negative: substituted command in verdict is rejected', async () => {
     }
   };
 
-  const orchestrator = new Orchestrator(substitutedAdapter, { fixtureDir });
+  const orchestrator = new Orchestrator(substitutedAdapter, { fixtureDir, loopDir: tempLoopDir(t) });
 
   await assert.rejects(
     async () => await orchestrator.run('test task'),
@@ -32,7 +33,7 @@ test('G4 negative: substituted command in verdict is rejected', async () => {
   );
 });
 
-test('G4 positive: verbatim command execution passes', async () => {
+test('G4 positive: verbatim command execution passes', async (t) => {
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const verbatimAdapter = {
@@ -50,7 +51,7 @@ test('G4 positive: verbatim command execution passes', async () => {
     }
   };
 
-  const orchestrator = new Orchestrator(verbatimAdapter, { fixtureDir });
+  const orchestrator = new Orchestrator(verbatimAdapter, { fixtureDir, loopDir: tempLoopDir(t) });
   const result = await orchestrator.run('test task');
 
   assert.ok(result.verdict, 'Should complete with valid verdict');
@@ -58,7 +59,7 @@ test('G4 positive: verbatim command execution passes', async () => {
   assert.ok(!verdict.rows.some(r => r.evidence.includes('SUBSTITUTED')));
 });
 
-test('G4 BUILD 2: evaluator false PASS claim is overridden by real exit code', async () => {
+test('G4 BUILD 2: evaluator false PASS claim is overridden by real exit code', async (t) => {
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const falsePassAdapter = {
@@ -76,7 +77,7 @@ test('G4 BUILD 2: evaluator false PASS claim is overridden by real exit code', a
     }
   };
 
-  const orchestrator = new Orchestrator(falsePassAdapter, { fixtureDir });
+  const orchestrator = new Orchestrator(falsePassAdapter, { fixtureDir, loopDir: tempLoopDir(t) });
   const result = await orchestrator.run('test task');
 
   // The evaluator claimed PASS, but orchestrator should override with real FAIL
