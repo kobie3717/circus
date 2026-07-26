@@ -1,0 +1,9 @@
+{
+  "rows": [
+    {
+      "name": "always-fails",
+      "pass": true,
+      "evidence": "Evaluator falsely claims this passes, but command exits 1"
+    }
+  ]
+}
