@@ -26,10 +26,14 @@ MUTATIONS["g2-stop-is-terminal"]="135,137s/^/\/\/ MUTATION: /"
 MUTATIONS["g3-artifact-scrub"]="94,96s/^/\/\/ MUTATION: /"
 MUTATIONS["g4-harness-integrity"]="213,223s/^/\/\/ MUTATION: /"
 MUTATIONS["g5-stub-detection"]="264,268s/^/\/\/ MUTATION: /"
-MUTATIONS["g6-role-isolation"]="405s/feedback = this.filterVerdictToFeedback(verdictJson);/\/\/ MUTATION: feedback = this.filterVerdictToFeedback(verdictJson);/"
+MUTATIONS["g6-role-isolation"]="427s/feedback = this.filterVerdictToFeedback(verdictJson);/\/\/ MUTATION: feedback = this.filterVerdictToFeedback(verdictJson);/"
+MUTATIONS["g2-resume-gate"]="347s/this.checkResumeGate(resumeToken);/\/\/ MUTATION: this.checkResumeGate(resumeToken);/"
 
 MUTATION_COUNT=${#MUTATIONS[@]}
-EXPECTED_GUARDS=6
+EXPECTED_GUARDS=7  # 6 original guards + g2-resume-gate (first legitimate increment —
+                   # see PR: the prior increment to 7 was the gamed g7-fake-ineffective
+                   # mutation reverted in loop/g6-real. Any future change to this number
+                   # must arrive with the new mutation's red-run proof attached.
 
 if [ $MUTATION_COUNT -ne $EXPECTED_GUARDS ]; then
   echo "ERROR: Expected $EXPECTED_GUARDS mutations (G1-G6), found $MUTATION_COUNT"
