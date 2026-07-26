@@ -3,9 +3,10 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { Orchestrator } from '../orchestrator.mjs';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 test('G4 negative: substituted command in verdict is rejected', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const substitutedAdapter = {
     async plan() {
@@ -32,7 +33,7 @@ test('G4 negative: substituted command in verdict is rejected', async () => {
 });
 
 test('G4 positive: verbatim command execution passes', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const verbatimAdapter = {
     async plan() {
@@ -58,7 +59,7 @@ test('G4 positive: verbatim command execution passes', async () => {
 });
 
 test('G4 BUILD 2: evaluator false PASS claim is overridden by real exit code', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const falsePassAdapter = {
     async plan() {

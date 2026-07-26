@@ -125,7 +125,7 @@ These guards run in the orchestrator code, enforcing contracts that tests, roles
 **Rationale**: Prevents automatic retry loops when a role explicitly requests human review or intervention.
 
 ### G3: artifact-scrub
-**What**: All artifacts pass through `scrubEgress` (from `/root/bot-circus/lib/experience-bridge.mjs`) before being written or passed to next role.
+**What**: All artifacts pass through `scrubEgress` (from `loop/lib/scrub.mjs`) before being written or passed to next role.
 
 **Enforcement**:
 - Every artifact (plan.md, diff, verdict.json, feedback.md) is scrubbed via `scrubEgress(text)`
@@ -145,6 +145,10 @@ These guards run in the orchestrator code, enforcing contracts that tests, roles
 - In BUILD 1 (stub mode), this is tested via fixture: a plan specifies `npm test`, evaluator tries to substitute `npm test -- --grep easy`, orchestrator rejects it
 
 **Rationale**: Prevents gaming the eval by running a subset of tests or a looser command.
+
+### Harness Independence Principle
+
+**The evaluator's harness/acceptance-check infrastructure must be verified independently of the evaluator's own verdict.** Twice in this project's history the defect was in the thing measuring (a same-host clone that couldn't detect non-portability; a diff-scanner that only checked added lines and missed a secret in deleted lines) rather than in the thing being measured (the scrubEgress detector itself was fine both times). A harness cannot certify its own soundness—something outside the loop must.
 
 ### G5: stub-detection
 **What**: Flag if a file created within the same run flips a previously-failing check from fail to pass.

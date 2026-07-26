@@ -3,6 +3,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { scrubEgress } from './lib/scrub.mjs';
 
 const STATES = {
@@ -16,7 +17,7 @@ const STATES = {
 
 // ─── Stub Adapter (BUILD 1) ─────────────────────────────────────────────────
 class StubAdapter {
-  constructor(fixtureDir = '/root/circus/loop/fixtures') {
+  constructor(fixtureDir = fileURLToPath(new URL('./fixtures/', import.meta.url))) {
     this.fixtureDir = fixtureDir;
   }
 
@@ -59,7 +60,7 @@ export class Orchestrator {
     this.adapter = adapter;
     this.state = STATES.IDLE;
     this.resumeHashPath = options.resumeHashPath || '.loop/resume-hash';
-    this.fixtureDir = options.fixtureDir || '/root/circus/loop/fixtures';
+    this.fixtureDir = options.fixtureDir || fileURLToPath(new URL('./fixtures/', import.meta.url));
     this.artifacts = {};
     this.checkResults = {}; // for G5 stub-detection
     this.mandatoryChecks = options.mandatoryChecks || [];
@@ -357,7 +358,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const args = process.argv.slice(2);
   const fixtureDir = args.includes('--fixture-dir')
     ? args[args.indexOf('--fixture-dir') + 1]
-    : '/root/circus/loop/fixtures';
+    : fileURLToPath(new URL('./fixtures/', import.meta.url));
 
   const adapter = new StubAdapter(fixtureDir);
   const orchestrator = new Orchestrator(adapter, { fixtureDir });

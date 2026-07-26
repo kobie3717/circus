@@ -3,9 +3,10 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { Orchestrator } from '../orchestrator.mjs';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 test('G3 negative: artifact with secret is rejected', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   // Adapter that returns artifact with secret
   const secretAdapter = {
@@ -33,7 +34,7 @@ test('G3 negative: artifact with secret is rejected', async () => {
 });
 
 test('G3 positive: clean artifact passes scrub', async () => {
-  const fixtureDir = '/root/circus/loop/fixtures';
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
   const cleanAdapter = {
     async plan() {
@@ -57,7 +58,7 @@ test('G3 positive: clean artifact passes scrub', async () => {
   assert.strictEqual(result.plan, 'Clean plan with no secrets, just regular text');
 });
 
-test('G3 BUILD 2: scrubber works without /root/bot-circus dependency', async () => {
+test('G3 BUILD 2: scrubber works as vendored copy without external dependency', async () => {
   // Import the vendored scrubber directly to prove it's self-contained
   const { scrubEgress } = await import('../lib/scrub.mjs');
 
@@ -69,11 +70,12 @@ test('G3 BUILD 2: scrubber works without /root/bot-circus dependency', async () 
   assert.ok(result.text.includes('[REDACTED]'), 'Should redact the secret');
   assert.ok(!result.text.includes('sk-1234567890abcdef'), 'Should not contain raw secret');
 
-  // Verify the module doesn't import from /root/bot-circus
+  // Verify the vendored module doesn't import from external bot-circus path
   const { readFileSync } = await import('node:fs');
-  const scrubSource = readFileSync('/root/circus/loop/lib/scrub.mjs', 'utf8');
-  // Check there's no import statement with /root/bot-circus path
-  const hasImportFromBotCircus = /import\s+.*from\s+['"]\/root\/bot-circus/.test(scrubSource);
+  const scrubPath = fileURLToPath(new URL('../lib/scrub.mjs', import.meta.url));
+  const scrubSource = readFileSync(scrubPath, 'utf8');
+  // Check there's no import statement with bot-circus path
+  const hasImportFromBotCircus = /import\s+.*from\s+['"].*bot-circus/.test(scrubSource);
   assert.ok(!hasImportFromBotCircus,
-    'Vendored scrub.mjs must not import from /root/bot-circus (provenance comments OK)');
+    'Vendored scrub.mjs must not import from bot-circus (provenance comments OK)');
 });
