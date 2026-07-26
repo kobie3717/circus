@@ -64,6 +64,29 @@ export class Orchestrator {
     this.artifacts = {};
     this.checkResults = {}; // for G5 stub-detection
     this.mandatoryChecks = options.mandatoryChecks || [];
+    this.runState = {}; // G6: temporal separation timestamps
+
+    // G6: capability manifest for coder role
+    if (options.coderManifest === undefined) {
+      // Default manifest if not provided
+      this.coderManifest = {
+        allowedTools: ['read', 'edit', 'write'],
+        allowedPaths: ['/worktree/**'],
+        allowBash: false,
+        allowNetwork: false
+      };
+    } else {
+      // Use provided manifest but validate it
+      this.coderManifest = options.coderManifest;
+    }
+
+    // G6: enforce manifest is present and well-formed
+    if (this.coderManifest === null || typeof this.coderManifest !== 'object' || Array.isArray(this.coderManifest)) {
+      throw new Error('G6 violation: coder manifest missing or malformed');
+    }
+    if (!Array.isArray(this.coderManifest.allowedTools)) {
+      throw new Error('G6 violation: coder manifest.allowedTools must be an array');
+    }
   }
 
   // ─── G3: artifact-scrub ───────────────────────────────────────────────────
@@ -73,6 +96,17 @@ export class Orchestrator {
       throw new Error(`G3 violation: artifact ${artifactName} contains secrets (${result.hits} hits) — aborting`);
     }
     return result.text;
+  }
+
+  // ─── G6: feedback-projection ──────────────────────────────────────────────
+  // Filter verdict to ONLY {row name, pass/fail} — no evidence, no commentary
+  filterVerdictToFeedback(verdictJson) {
+    const verdict = JSON.parse(verdictJson);
+    if (!verdict.rows || !Array.isArray(verdict.rows)) {
+      return '# Feedback\n\nNo verdict rows found.';
+    }
+    const filtered = verdict.rows.map(r => `- ${r.name}: ${r.pass ? 'PASS' : 'FAIL'}`).join('\n');
+    return `# Feedback\n\n${filtered}`;
   }
 
   // ─── G2: stop-is-terminal (BUILD 2: hash-only storage) ───────────────────
@@ -255,6 +289,19 @@ export class Orchestrator {
 
   // ─── G6: role-isolation ───────────────────────────────────────────────────
   async callRole(roleName, allowedArtifacts, roleMethod) {
+    // G6: capability manifest enforcement for coder role
+    if (roleName === 'coder') {
+      if (!this.coderManifest) {
+        throw new Error('G6 violation: coder invoked without manifest');
+      }
+      if (this.coderManifest.allowBash === true) {
+        throw new Error('G6 violation: coder manifest must not allow Bash execution');
+      }
+      if (this.coderManifest.allowNetwork === true) {
+        throw new Error('G6 violation: coder manifest must not allow network access');
+      }
+    }
+
     const context = {};
     allowedArtifacts.forEach(name => {
       if (this.artifacts[name] !== undefined) {
@@ -295,6 +342,9 @@ export class Orchestrator {
     const codeResult = await this.callRole('coder', ['plan'],
       (ctx) => this.adapter.code({ plan: ctx.plan }));
 
+    // G6: temporal separation — record coder exit timestamp
+    this.runState.coderExitedAt = Date.now();
+
     if (codeResult.signal === 'STOP') {
       this.handleStop('coder', codeResult.reason);
     }
@@ -325,6 +375,9 @@ export class Orchestrator {
     verdictJson = JSON.stringify(correctedVerdict, null, 2);
     this.artifacts.verdict = verdictJson;
 
+    // G6: temporal separation — record verdict write timestamp
+    this.runState.verdictWrittenAt = Date.now();
+
     // G5: stub-detection (BUILD 2: HALT on detection)
     const verdict = correctedVerdict;
     const stubFlags = this.detectStubCapitulation(diff, {},
@@ -345,7 +398,11 @@ export class Orchestrator {
       this.handleStop('distiller', distillResult.reason);
     }
 
-    const feedback = this.scrubArtifact('feedback.md', distillResult.artifact);
+    let feedback = this.scrubArtifact('feedback.md', distillResult.artifact);
+
+    // G6: feedback projection — filter to ONLY {row name, pass/fail}
+    // Override distiller output with filtered version
+    feedback = this.filterVerdictToFeedback(verdictJson);
     this.artifacts.feedback = feedback;
 
     this.state = STATES.IDLE;

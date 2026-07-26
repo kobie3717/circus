@@ -162,31 +162,38 @@ These guards run in the orchestrator code, enforcing contracts that tests, roles
 **Rationale**: Detects the pattern "create an empty file to make `test -f foo.txt` pass" instead of implementing real functionality.
 
 ### G6: role-isolation
-**What**: Each role receives ONLY the artifacts it's allowed to read, enforced by temporal separation and adapter call signature.
+**What**: Each role receives ONLY the artifacts it's allowed to read, enforced by adapter call signature.
 
-**Enforcement**:
-- **Temporal separation** (primary mechanism): Coder process completes and exits BEFORE `verdict.json` is written
-  - Orchestrator runs coder, awaits completion, THEN runs evaluator
-  - Sequential `await` ensures artifacts never coexist on disk with processes that shouldn't access them
-  - Tests verify: coder exit timestamp < verdict write timestamp
-  
-- **Feedback projection**: Coder receives ONLY filtered feedback (row name + pass/fail), not raw verdict
-  - Distiller filters verdict to whitelisted fields before passing to planner
-  - No evaluator commentary, evidence details, or internal probe data leaks through
-  - Tests verify: feedback.md contains no sensitive verdict fields
-  
-- **Capability manifest** (defense-in-depth): Coder role restricted to Read/Edit/Write within worktree only
-  - NO Bash execution allowed (coder can't shell out to read filesystem)
-  - NO network access (coder can't exfiltrate or fetch external data)
-  - NO reads outside worktree path (coder can't traverse to orchestrator directories)
-  - Tests verify: out-of-manifest actions are rejected
-
-**Adapter interface enforcement**:
-- **Coder** receives: `plan.md` only (and filtered `feedback.md` on retry)
+**Currently implemented (adapter interface enforcement)**:
+- **Coder** receives: `plan.md` only (and `feedback.md` on retry, if present)
 - **Evaluator** receives: `plan.md`, `diff` only
 - **Distiller** receives: `plan.md`, `diff`, `verdict.json` only
 - **Planner** receives: task description, optional `feedback.md` from prior iteration
 - Orchestrator does not pass disallowed artifacts to role adapters (they are not in scope)
+- Tests verify: adapter functions are called with correct arguments (negative test: coder throws if verdict passed; positive test: each role receives only allowed artifacts)
+
+**SPECIFIED — NOT IMPLEMENTED (see follow-up PR)**:
+
+The following three mechanisms are documented in SPEC.md and have passing tests in `loop/tests/g6-role-isolation.test.mjs`, but those tests mock their own behavior rather than exercising the real `Orchestrator` class. The orchestrator itself was never modified to implement these mechanisms. A planner reading this spec should NOT assume these constraints exist in production:
+
+- **Temporal separation** (SPECIFIED, NOT ENFORCED): Coder process should complete and exit BEFORE `verdict.json` is written
+  - Design: Orchestrator runs coder, awaits completion, THEN runs evaluator
+  - Design: Sequential `await` ensures artifacts never coexist on disk with processes that shouldn't access them
+  - Current test (BUILD 4-A): Mocks adapters that set timestamps and flags internally, then asserts those flags — does NOT drive real orchestrator to prove temporal ordering
+  - Real implementation would require: no changes (orchestrator already uses sequential await), but test must verify against orchestrator's actual control flow, not mock adapters
+  
+- **Feedback projection** (SPECIFIED, NOT ENFORCED): Coder should receive ONLY filtered feedback (row name + pass/fail), not raw verdict
+  - Design: Distiller filters verdict to whitelisted fields before passing to planner
+  - Design: No evaluator commentary, evidence details, or internal probe data leaks through
+  - Current test (BUILD 4-B): Mocks distiller that performs filtering inline, then asserts the filtered string doesn't contain sensitive fields — does NOT verify orchestrator scrubs feedback before passing it to coder
+  - Real implementation would require: orchestrator scrubbing logic (possibly in `scrubArtifact` or a dedicated filter) + test proving orchestrator's actual feedback output is filtered
+  
+- **Capability manifest** (SPECIFIED, NOT ENFORCED): Coder role should be restricted to Read/Edit/Write within worktree only
+  - Design: NO Bash execution allowed (coder can't shell out to read filesystem)
+  - Design: NO network access (coder can't exfiltrate or fetch external data)
+  - Design: NO reads outside worktree path (coder can't traverse to orchestrator directories)
+  - Current test (BUILD 4-C): Defines manifest as inline object, calls stub `enforceManifest` function that throws on violations, then asserts violations were caught — does NOT verify orchestrator enforces a real manifest when calling coder adapter
+  - Real implementation would require: orchestrator manifest enforcement in `callRole` + test proving orchestrator rejects out-of-manifest tool calls from coder
 
 **Why not permission bits or per-user isolation?**
 - All production processes run as root (uid=0), making permission bits ineffective
