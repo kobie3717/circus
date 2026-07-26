@@ -72,5 +72,21 @@ jobs:
     - name: Install dependencies
       run: npm install
 
-    - name: Run Node tests
-      run: npm test
+    - name: Run Node tests with count assertion
+      run: |
+        set -e
+        EXPECTED_TEST_COUNT=18
+        npm test > test-output.txt 2>&1 || true
+        cat test-output.txt
+        ACTUAL_COUNT=$(grep "^# tests " test-output.txt | awk '{print $3}')
+        echo "Expected: $EXPECTED_TEST_COUNT tests"
+        echo "Actual: $ACTUAL_COUNT tests"
+        if [ "$ACTUAL_COUNT" != "$EXPECTED_TEST_COUNT" ]; then
+          echo "ERROR: Test count mismatch! Expected $EXPECTED_TEST_COUNT but found $ACTUAL_COUNT"
+          exit 1
+        fi
+        if grep -q "^# fail [1-9]" test-output.txt; then
+          echo "ERROR: Some tests failed"
+          exit 1
+        fi
+        echo "All $ACTUAL_COUNT tests passed"
