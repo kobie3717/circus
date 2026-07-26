@@ -1,0 +1,13 @@
+--- a/loop/orchestrator.mjs
++++ b/loop/orchestrator.mjs
+@@ -380,9 +380,9 @@ export class Orchestrator {
+     let feedback = this.scrubArtifact('feedback.md', distillResult.artifact);
+
+     // G6: feedback projection — filter to ONLY {row name, pass/fail}
+     // Override distiller output with filtered version
+-    feedback = this.filterVerdictToFeedback(verdictJson);
++    // G6 MUTATION: disabled feedback filtering (allows sensitive data through)
++    // feedback = this.filterVerdictToFeedback(verdictJson);
+     this.artifacts.feedback = feedback;
+
+     this.state = STATES.IDLE;
