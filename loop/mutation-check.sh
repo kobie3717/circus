@@ -51,6 +51,16 @@ for GUARD_NAME in "${!MUTATIONS[@]}"; do
   # Apply mutation via sed
   sed -i "$SED_COMMAND" "$ORCHESTRATOR"
 
+  # Verify the sed actually changed the file — a no-op sed (stale line numbers,
+  # non-matching pattern) must be distinguishable from "guard unenforced"
+  if diff -q "$ORCHESTRATOR_BACKUP" "$ORCHESTRATOR" > /dev/null 2>&1; then
+    echo "⚠️  MUTATION DID NOT APPLY: sed command for $GUARD_NAME made no change to $ORCHESTRATOR"
+    echo "   Target lines/pattern are stale — this proves nothing about $GUARD_NAME's enforcement."
+    FAILED_MUTATIONS+=("$GUARD_NAME (DID NOT APPLY)")
+    echo
+    continue
+  fi
+
   echo "Applied mutation: $GUARD_NAME"
 
   # Run tests (should FAIL with mutation applied)
