@@ -75,7 +75,7 @@ jobs:
     - name: Run Node tests with count assertion
       run: |
         set -e
-        EXPECTED_TEST_COUNT=21
+        EXPECTED_TEST_COUNT=22
         npm test > test-output.txt 2>&1 || true
         cat test-output.txt
         ACTUAL_COUNT=$(grep "^# tests " test-output.txt | awk '{print $3}')
@@ -90,3 +90,21 @@ jobs:
           exit 1
         fi
         echo "All $ACTUAL_COUNT tests passed"
+
+  mutation-check:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install dependencies
+      run: npm install
+
+    - name: Run mutation check
+      run: |
+        npm run mutation-check

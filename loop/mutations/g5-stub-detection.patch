@@ -1,0 +1,18 @@
+--- a/loop/orchestrator.mjs
++++ b/loop/orchestrator.mjs
+@@ -247,10 +247,10 @@ export class Orchestrator {
+   }
+
+   handleStubDetectionFlags(flags) {
+-    if (flags.length > 0) {
+-      const reasons = flags.map(f => f.message).join('\n');
+-      console.error('G5 stub-detection violation:', reasons);
+-      this.handleStop('orchestrator-G5', `Stub capitulation detected:\n${reasons}`);
+-    }
++    // G5 MUTATION: disabled HALT on stub detection
++    // if (flags.length > 0) {
++    //   const reasons = flags.map(f => f.message).join('\n');
++    //   console.error('G5 stub-detection violation:', reasons);
++    //   this.handleStop('orchestrator-G5', `Stub capitulation detected:\n${reasons}`);
++    // }
+   }
