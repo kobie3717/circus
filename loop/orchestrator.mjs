@@ -2,7 +2,8 @@
 // orchestrator.mjs — Circus Loop state machine with guards
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { scrubEgress } from '/root/bot-circus/lib/experience-bridge.mjs';
+import { execSync } from 'node:child_process';
+import { scrubEgress } from './lib/scrub.mjs';
 
 const STATES = {
   IDLE: 'IDLE',
@@ -57,10 +58,11 @@ export class Orchestrator {
   constructor(adapter, options = {}) {
     this.adapter = adapter;
     this.state = STATES.IDLE;
-    this.resumeTokenPath = options.resumeTokenPath || '.loop/resume-token';
+    this.resumeHashPath = options.resumeHashPath || '.loop/resume-hash';
     this.fixtureDir = options.fixtureDir || '/root/circus/loop/fixtures';
     this.artifacts = {};
     this.checkResults = {}; // for G5 stub-detection
+    this.mandatoryChecks = options.mandatoryChecks || [];
   }
 
   // ─── G3: artifact-scrub ───────────────────────────────────────────────────
@@ -72,16 +74,32 @@ export class Orchestrator {
     return result.text;
   }
 
-  // ─── G2: stop-is-terminal ─────────────────────────────────────────────────
+  // ─── G2: stop-is-terminal (BUILD 2: hash-only storage) ───────────────────
   handleStop(roleName, reason) {
     mkdirSync('.loop', { recursive: true });
-    const token = createHash('sha256')
+    // Generate raw token (returned to caller, never persisted)
+    const rawToken = createHash('sha256')
       .update(`${roleName}:${reason}:${Date.now()}`)
       .digest('hex');
-    writeFileSync(this.resumeTokenPath, token);
+    // Store only the hash of the token
+    const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+    writeFileSync(this.resumeHashPath, tokenHash);
     console.error(`STOP signaled by ${roleName}: ${reason}`);
-    console.error(`Resume token: ${token}`);
+    console.error(`Resume token: ${rawToken}`);
+    console.error(`(Token hash stored in ${this.resumeHashPath})`);
     process.exit(42);
+  }
+
+  // Verify resume token matches stored hash
+  verifyResumeToken(suppliedToken) {
+    if (!existsSync(this.resumeHashPath)) {
+      throw new Error('No resume hash found — cannot resume');
+    }
+    const storedHash = readFileSync(this.resumeHashPath, 'utf8').trim();
+    const suppliedHash = createHash('sha256').update(suppliedToken).digest('hex');
+    if (storedHash !== suppliedHash) {
+      throw new Error('Resume token mismatch — invalid token');
+    }
   }
 
   // ─── G1: matrix-shape ─────────────────────────────────────────────────────
@@ -102,6 +120,16 @@ export class Orchestrator {
     const expected = this.extractExpectedChecks(planMd);
     const verdict = JSON.parse(verdictJson);
 
+    // BUILD 2: G1 two-sided — plan must be superset of mandatory_checks
+    if (this.mandatoryChecks.length > 0) {
+      const missing = this.mandatoryChecks.filter(m => !expected.includes(m));
+      if (missing.length > 0) {
+        throw new Error(
+          `G1 violation: plan missing mandatory checks: ${JSON.stringify(missing)}`
+        );
+      }
+    }
+
     if (!verdict.rows || !Array.isArray(verdict.rows)) {
       throw new Error('G1 violation: verdict.json missing or invalid rows array');
     }
@@ -118,11 +146,10 @@ export class Orchestrator {
     }
   }
 
-  // ─── G4: harness-integrity ────────────────────────────────────────────────
-  validateHarnessIntegrity(planMd, verdictJson) {
-    // Extract commands from plan
+  // ─── G4: harness-integrity (BUILD 2: orchestrator executes checks) ───────
+  extractCheckCommands(planMd) {
     const checksMatch = planMd.match(/^## Checks\s*\n((?:^[-*] .+$\n?)+)/m);
-    if (!checksMatch) return;
+    if (!checksMatch) return {};
 
     const lines = checksMatch[1].trim().split('\n');
     const commands = {};
@@ -132,17 +159,56 @@ export class Orchestrator {
         commands[match[1].trim()] = match[2].trim();
       }
     });
+    return commands;
+  }
 
+  executeChecksAndCaptureExitCodes(planMd) {
+    const commands = this.extractCheckCommands(planMd);
+    const results = {};
+
+    for (const [checkName, command] of Object.entries(commands)) {
+      try {
+        // Execute command and capture exit code
+        execSync(command, { stdio: 'pipe', timeout: 30000 });
+        results[checkName] = { pass: true, exitCode: 0 };
+      } catch (err) {
+        // Non-zero exit = fail
+        results[checkName] = { pass: false, exitCode: err.status || 1 };
+      }
+    }
+    return results;
+  }
+
+  validateHarnessIntegrity(planMd, verdictJson, executedResults) {
     const verdict = JSON.parse(verdictJson);
-    // Check for command substitution markers in evidence (for BUILD 1 fixture testing)
+
+    // BUILD 2: For mandatory checks, orchestrator's real exit codes OVERWRITE evaluator's claims
+    for (const row of verdict.rows) {
+      if (executedResults[row.name] !== undefined) {
+        // This is a mandatory check - use orchestrator's real execution result
+        const realResult = executedResults[row.name];
+        if (row.pass !== realResult.pass) {
+          console.warn(
+            `G4: Evaluator claimed ${row.pass ? 'PASS' : 'FAIL'} for ${row.name}, ` +
+            `but real exit code was ${realResult.exitCode} (${realResult.pass ? 'PASS' : 'FAIL'}). ` +
+            `Overwriting with real result.`
+          );
+          row.pass = realResult.pass;
+        }
+      }
+    }
+
+    // Also check for command substitution markers (BUILD 1 compatibility)
     verdict.rows.forEach(row => {
       if (row.evidence && row.evidence.includes('SUBSTITUTED:')) {
         throw new Error(`G4 violation: check ${row.name} used substituted command instead of plan's command`);
       }
     });
+
+    return verdict;
   }
 
-  // ─── G5: stub-detection ───────────────────────────────────────────────────
+  // ─── G5: stub-detection (BUILD 2: HALT on detection) ─────────────────────
   detectStubCapitulation(diff, beforeResults, afterResults) {
     const newFiles = this.extractNewFiles(diff);
     if (newFiles.length === 0) return [];
@@ -152,10 +218,22 @@ export class Orchestrator {
       const before = beforeResults[checkName];
       const after = afterResults[checkName];
       if (before === false && after === true) {
-        flags.push(`Check ${checkName} flipped FAIL→PASS via new file(s): ${newFiles.join(', ')} — possible stub`);
+        flags.push({
+          check: checkName,
+          files: newFiles,
+          message: `Check ${checkName} flipped FAIL→PASS via new file(s): ${newFiles.join(', ')} — possible stub`
+        });
       }
     });
     return flags;
+  }
+
+  handleStubDetectionFlags(flags) {
+    if (flags.length > 0) {
+      const reasons = flags.map(f => f.message).join('\n');
+      console.error('G5 stub-detection violation:', reasons);
+      this.handleStop('orchestrator-G5', `Stub capitulation detected:\n${reasons}`);
+    }
   }
 
   extractNewFiles(diff) {
@@ -225,6 +303,10 @@ export class Orchestrator {
 
     // EVALUATING
     this.state = STATES.EVALUATING;
+
+    // BUILD 2: G4 inversion — execute check commands ourselves
+    const executedResults = this.executeChecksAndCaptureExitCodes(planMd);
+
     const evalResult = await this.callRole('evaluator', ['plan', 'diff'],
       (ctx) => this.adapter.evaluate({ plan: ctx.plan, diff: ctx.diff }));
 
@@ -232,23 +314,22 @@ export class Orchestrator {
       this.handleStop('evaluator', evalResult.reason);
     }
 
-    const verdictJson = this.scrubArtifact('verdict.json', evalResult.artifact);
-    this.artifacts.verdict = verdictJson;
+    let verdictJson = this.scrubArtifact('verdict.json', evalResult.artifact);
 
-    // G1: matrix-shape
+    // G1: matrix-shape (BUILD 2: also checks mandatory_checks superset)
     this.validateVerdictMatrix(planMd, verdictJson);
 
-    // G4: harness-integrity
-    this.validateHarnessIntegrity(planMd, verdictJson);
+    // G4: harness-integrity (BUILD 2: overwrite with real exit codes)
+    const correctedVerdict = this.validateHarnessIntegrity(planMd, verdictJson, executedResults);
+    verdictJson = JSON.stringify(correctedVerdict, null, 2);
+    this.artifacts.verdict = verdictJson;
 
-    // G5: stub-detection (mock before/after for BUILD 1)
-    const verdict = JSON.parse(verdictJson);
+    // G5: stub-detection (BUILD 2: HALT on detection)
+    const verdict = correctedVerdict;
     const stubFlags = this.detectStubCapitulation(diff, {},
       verdict.rows.reduce((acc, r) => ({ ...acc, [r.name]: r.pass }), {}));
 
-    if (stubFlags.length > 0) {
-      console.warn('G5 stub-detection flags:', stubFlags);
-    }
+    this.handleStubDetectionFlags(stubFlags);
 
     // DISTILLING
     this.state = STATES.DISTILLING;

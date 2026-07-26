@@ -45,3 +45,49 @@ test('G1 positive: verdict with correct check names passes', async () => {
   const verdict = JSON.parse(result.verdict);
   assert.strictEqual(verdict.rows.length, 3, 'Should have 3 check rows');
 });
+
+test('G1 BUILD 2: plan missing mandatory check is rejected', async () => {
+  const fixtureDir = '/root/circus/loop/fixtures';
+
+  const adapter = {
+    async plan() {
+      return { artifact: readFileSync(`${fixtureDir}/plan-missing-mandatory.md`, 'utf8') };
+    },
+    async code() {
+      return { artifact: readFileSync(`${fixtureDir}/diff`, 'utf8') };
+    },
+    async evaluate() {
+      return { artifact: readFileSync(`${fixtureDir}/verdict.json`, 'utf8') };
+    },
+    async distill() {
+      return { artifact: readFileSync(`${fixtureDir}/feedback.md`, 'utf8') };
+    }
+  };
+
+  const orchestrator = new Orchestrator(adapter, {
+    fixtureDir,
+    mandatoryChecks: ['test-greeting', 'lint-check']
+  });
+
+  await assert.rejects(
+    async () => await orchestrator.run('test task'),
+    /G1 violation.*plan missing mandatory checks.*test-greeting/,
+    'Should reject plan that omits mandatory check'
+  );
+});
+
+test('G1 BUILD 2: plan with superset of mandatory checks passes', async () => {
+  const fixtureDir = '/root/circus/loop/fixtures';
+  const adapter = new StubAdapter(fixtureDir);
+  const orchestrator = new Orchestrator(adapter, {
+    fixtureDir,
+    mandatoryChecks: ['test-greeting', 'lint-check']
+  });
+
+  const result = await orchestrator.run('test task');
+
+  assert.ok(result.plan, 'Should accept plan with superset of mandatory checks');
+  const plan = result.plan;
+  assert.ok(plan.includes('test-greeting'), 'Plan should include test-greeting');
+  assert.ok(plan.includes('type-check'), 'Plan can include extra checks beyond mandatory');
+});

@@ -56,3 +56,24 @@ test('G3 positive: clean artifact passes scrub', async () => {
   assert.ok(result.plan, 'Should have plan artifact after scrub');
   assert.strictEqual(result.plan, 'Clean plan with no secrets, just regular text');
 });
+
+test('G3 BUILD 2: scrubber works without /root/bot-circus dependency', async () => {
+  // Import the vendored scrubber directly to prove it's self-contained
+  const { scrubEgress } = await import('../lib/scrub.mjs');
+
+  // Test that it detects secrets correctly
+  const textWithSecret = 'api_key: sk-1234567890abcdef';
+  const result = scrubEgress(textWithSecret);
+
+  assert.strictEqual(result.hits, 1, 'Should detect 1 secret');
+  assert.ok(result.text.includes('[REDACTED]'), 'Should redact the secret');
+  assert.ok(!result.text.includes('sk-1234567890abcdef'), 'Should not contain raw secret');
+
+  // Verify the module doesn't import from /root/bot-circus
+  const { readFileSync } = await import('node:fs');
+  const scrubSource = readFileSync('/root/circus/loop/lib/scrub.mjs', 'utf8');
+  // Check there's no import statement with /root/bot-circus path
+  const hasImportFromBotCircus = /import\s+.*from\s+['"]\/root\/bot-circus/.test(scrubSource);
+  assert.ok(!hasImportFromBotCircus,
+    'Vendored scrub.mjs must not import from /root/bot-circus (provenance comments OK)');
+});

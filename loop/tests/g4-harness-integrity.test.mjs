@@ -56,3 +56,33 @@ test('G4 positive: verbatim command execution passes', async () => {
   const verdict = JSON.parse(result.verdict);
   assert.ok(!verdict.rows.some(r => r.evidence.includes('SUBSTITUTED')));
 });
+
+test('G4 BUILD 2: evaluator false PASS claim is overridden by real exit code', async () => {
+  const fixtureDir = '/root/circus/loop/fixtures';
+
+  const falsePassAdapter = {
+    async plan() {
+      return { artifact: readFileSync(`${fixtureDir}/plan-always-fails.md`, 'utf8') };
+    },
+    async code() {
+      return { artifact: readFileSync(`${fixtureDir}/diff`, 'utf8') };
+    },
+    async evaluate() {
+      return { artifact: readFileSync(`${fixtureDir}/verdict-false-pass.json`, 'utf8') };
+    },
+    async distill() {
+      return { artifact: 'feedback' };
+    }
+  };
+
+  const orchestrator = new Orchestrator(falsePassAdapter, { fixtureDir });
+  const result = await orchestrator.run('test task');
+
+  // The evaluator claimed PASS, but orchestrator should override with real FAIL
+  const verdict = JSON.parse(result.verdict);
+  const alwaysFailsRow = verdict.rows.find(r => r.name === 'always-fails');
+
+  assert.ok(alwaysFailsRow, 'Should have always-fails check');
+  assert.strictEqual(alwaysFailsRow.pass, false,
+    'Orchestrator should override evaluator false PASS with real FAIL from exit code 1');
+});

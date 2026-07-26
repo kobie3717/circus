@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Circus Loop Task Schema",
+  "description": "Schema for task files defining mandatory acceptance checks",
+  "type": "object",
+  "properties": {
+    "task": {
+      "type": "string",
+      "description": "Task description"
+    },
+    "mandatory_checks": {
+      "type": "array",
+      "description": "List of check names that MUST appear in the plan",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 0
+    }
+  },
+  "required": ["task", "mandatory_checks"]
+}
