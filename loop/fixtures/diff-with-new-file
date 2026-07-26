@@ -1,0 +1,11 @@
+--- /dev/null
++++ b/stub.txt
+@@ -0,0 +1 @@
++This is a stub file created to make a check pass
+--- /dev/null
++++ b/another-stub.js
+@@ -0,0 +1,3 @@
++// Minimal stub
++export function stub() {
++  return true;
++}

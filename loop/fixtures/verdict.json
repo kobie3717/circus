@@ -1,0 +1,19 @@
+{
+  "rows": [
+    {
+      "name": "test-greeting",
+      "pass": true,
+      "evidence": "✓ greeting.test.js (3 tests) passed"
+    },
+    {
+      "name": "lint-check",
+      "pass": true,
+      "evidence": "No linting errors found"
+    },
+    {
+      "name": "type-check",
+      "pass": true,
+      "evidence": "Type checking complete, no errors"
+    }
+  ]
+}
