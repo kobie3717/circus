@@ -2,17 +2,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { Orchestrator } from '../orchestrator.mjs';
-import { readFileSync, existsSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { tempGitRepo } from './helpers/git-repo.mjs';
+import { TestOrchestrator } from './helpers/mock-network.mjs';
 
 const orchestratorPath = fileURLToPath(new URL('../orchestrator.mjs', import.meta.url));
 
 test('G2 negative: STOP signal exits with code 42 and writes resume token', async (t) => {
   const tempDir = mkdtempSync(join(tmpdir(), 'circus-test-g2-neg-'));
   const resumeHashPath = join(tempDir, 'resume-hash');
+  const { repoRoot } = tempGitRepo(t);
 
   t.after(() => rmSync(tempDir, { recursive: true, force: true }));
 
@@ -21,12 +24,12 @@ test('G2 negative: STOP signal exits with code 42 and writes resume token', asyn
     import { Orchestrator } from '${orchestratorPath}';
     const adapter = {
       async plan() { return { artifact: '# plan' }; },
-      async code() { return { artifact: 'diff' }; },
+      async code({ worktreePath }) { return { artifact: null }; },
       async evaluate() { return { signal: 'STOP', reason: 'test' }; },
       async distill() { throw new Error('unreachable'); }
     };
-    const orch = new Orchestrator(adapter, { resumeHashPath: '${resumeHashPath}' });
-    await orch.run('test');
+    const orch = new Orchestrator(adapter, { resumeHashPath: '${resumeHashPath}', loopDir: '${tempDir}', baseBranch: 'main', repoRoot: '${repoRoot}' });
+    await orch.run({ id: 'TEST-001', task: 'test', mandatory_checks: [] });
   `]);
 
   await new Promise((resolve) => {
@@ -44,13 +47,17 @@ test('G2 positive: normal flow completes without STOP', async (t) => {
   t.after(() => rmSync(tempDir, { recursive: true, force: true }));
 
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
+  const { repoRoot, baseBranch } = tempGitRepo(t);
 
   const normalAdapter = {
     async plan() {
       return { artifact: readFileSync(`${fixtureDir}/plan.md`, 'utf8') };
     },
-    async code() {
-      return { artifact: readFileSync(`${fixtureDir}/diff`, 'utf8') };
+    async code({ worktreePath }) {
+      // Write real content into the worktree — the orchestrator derives the
+      // diff via `git diff`, it never reads a diff string off this return value.
+      writeFileSync(join(worktreePath, 'greeting.js'), 'export function greet(name) { return `Hello, ${name}!`; }\n');
+      return { artifact: null };
     },
     async evaluate() {
       return { artifact: readFileSync(`${fixtureDir}/verdict.json`, 'utf8') };
@@ -62,8 +69,9 @@ test('G2 positive: normal flow completes without STOP', async (t) => {
 
   // Isolated resumeHashPath — a stray .loop/resume-hash in the real repo
   // (left by a prior real STOP) must not gate an unrelated hermetic test.
-  const orchestrator = new Orchestrator(normalAdapter, { fixtureDir, resumeHashPath });
-  const result = await orchestrator.run('test task');
+  // Isolated repoRoot — worktree/push/PR operations must not touch /root/circus.
+  const orchestrator = new TestOrchestrator(normalAdapter, { fixtureDir, resumeHashPath, loopDir: tempDir, baseBranch, repoRoot });
+  const result = await orchestrator.run({ id: 'TEST-001', task: 'test task', mandatory_checks: [] });
 
   assert.ok(result.feedback, 'Should complete and return feedback');
 });
@@ -71,6 +79,7 @@ test('G2 positive: normal flow completes without STOP', async (t) => {
 test('G2 BUILD 2: resume with hash stored on disk fails', async (t) => {
   const tempDir = mkdtempSync(join(tmpdir(), 'circus-test-g2-build2-'));
   const resumeHashPath = join(tempDir, 'resume-hash');
+  const { repoRoot } = tempGitRepo(t);
 
   t.after(() => rmSync(tempDir, { recursive: true, force: true }));
 
@@ -96,12 +105,12 @@ test('G2 BUILD 2: resume with hash stored on disk fails', async (t) => {
     import { Orchestrator } from '${orchestratorPath}';
     const adapter = {
       async plan() { return { artifact: '# plan' }; },
-      async code() { return { artifact: 'diff' }; },
+      async code({ worktreePath }) { return { artifact: null }; },
       async evaluate() { return { signal: 'STOP', reason: 'test' }; },
       async distill() { throw new Error('unreachable'); }
     };
-    const orch = new Orchestrator(adapter, { resumeHashPath: '${resumeHashPath}' });
-    await orch.run('test');
+    const orch = new Orchestrator(adapter, { resumeHashPath: '${resumeHashPath}', loopDir: '${tempDir}', baseBranch: 'main', repoRoot: '${repoRoot}' });
+    await orch.run({ id: 'TEST-001', task: 'test', mandatory_checks: [] });
   `]);
 
   await new Promise((resolve) => {
@@ -113,7 +122,7 @@ test('G2 BUILD 2: resume with hash stored on disk fails', async (t) => {
       const storedHash = readFileSync(resumeHashPath, 'utf8').trim();
 
       // Try to resume using the hash itself (not the raw token) - should FAIL
-      const resumeOrch = new Orchestrator(stopAdapter, { resumeHashPath });
+      const resumeOrch = new Orchestrator(stopAdapter, { resumeHashPath, loopDir: tempDir, baseBranch: 'main', repoRoot });
       assert.throws(
         () => resumeOrch.verifyResumeToken(storedHash),
         /Resume token mismatch/,
@@ -130,18 +139,18 @@ test('G2 BUILD 2: resume with hash stored on disk fails', async (t) => {
 // capture the raw resume token it prints to stderr, and confirm the hash file
 // it left behind. All three follow-on assertions then drive the real
 // Orchestrator.run() in-process (no process.exit on these paths — they throw).
-function runToStop(resumeHashPath) {
+function runToStop(resumeHashPath, repoRoot, loopDir) {
   return new Promise((resolve) => {
     const childProcess = spawn('node', ['-e', `
       import { Orchestrator } from '${orchestratorPath}';
       const adapter = {
         async plan() { return { artifact: '# plan' }; },
-        async code() { return { artifact: 'diff' }; },
+        async code({ worktreePath }) { return { artifact: null }; },
         async evaluate() { return { signal: 'STOP', reason: 'resume-gate test' }; },
         async distill() { throw new Error('unreachable'); }
       };
-      const orch = new Orchestrator(adapter, { resumeHashPath: '${resumeHashPath}' });
-      await orch.run('test');
+      const orch = new Orchestrator(adapter, { resumeHashPath: '${resumeHashPath}', loopDir: '${loopDir}', baseBranch: 'main', repoRoot: '${repoRoot}' });
+      await orch.run({ id: 'TEST-001', task: 'test', mandatory_checks: [] });
     `]);
 
     let stderr = '';
@@ -158,8 +167,9 @@ test('G2 resume gate: fresh run refuses to start when hash is present and no tok
   const tempDir = mkdtempSync(join(tmpdir(), 'circus-test-g2-gate-notoken-'));
   const resumeHashPath = join(tempDir, 'resume-hash');
   t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const { repoRoot } = tempGitRepo(t);
 
-  const { code } = await runToStop(resumeHashPath);
+  const { code } = await runToStop(resumeHashPath, repoRoot, tempDir);
   assert.strictEqual(code, 42, 'setup: prior run should STOP and leave a hash');
   assert.ok(existsSync(resumeHashPath), 'setup: resume hash should exist');
 
@@ -171,9 +181,11 @@ test('G2 resume gate: fresh run refuses to start when hash is present and no tok
     async distill() { return { artifact: readFileSync(`${fixtureDir}/feedback.md`, 'utf8') }; }
   };
 
-  const orchestrator = new Orchestrator(normalAdapter, { fixtureDir, resumeHashPath });
+  // Gate check happens before task validation, so this refusal must trip
+  // before any git operation — repoRoot is injected anyway for defense-in-depth.
+  const orchestrator = new Orchestrator(normalAdapter, { fixtureDir, resumeHashPath, loopDir: tempDir, baseBranch: 'main', repoRoot });
   await assert.rejects(
-    () => orchestrator.run('test task'),
+    () => orchestrator.run({ id: 'TEST-001', task: 'test task', mandatory_checks: [] }),
     /G2 violation.*resume hash present.*no resume token supplied/s,
     'Fresh run() must refuse to start while a STOP resume hash is pending and no token is given'
   );
@@ -184,8 +196,9 @@ test('G2 resume gate: fresh run refuses to start when the supplied token does no
   const tempDir = mkdtempSync(join(tmpdir(), 'circus-test-g2-gate-wrongtoken-'));
   const resumeHashPath = join(tempDir, 'resume-hash');
   t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const { repoRoot } = tempGitRepo(t);
 
-  const { code } = await runToStop(resumeHashPath);
+  const { code } = await runToStop(resumeHashPath, repoRoot, tempDir);
   assert.strictEqual(code, 42);
   assert.ok(existsSync(resumeHashPath));
 
@@ -197,9 +210,9 @@ test('G2 resume gate: fresh run refuses to start when the supplied token does no
     async distill() { return { artifact: readFileSync(`${fixtureDir}/feedback.md`, 'utf8') }; }
   };
 
-  const orchestrator = new Orchestrator(normalAdapter, { fixtureDir, resumeHashPath });
+  const orchestrator = new Orchestrator(normalAdapter, { fixtureDir, resumeHashPath, loopDir: tempDir, baseBranch: 'main', repoRoot });
   await assert.rejects(
-    () => orchestrator.run('test task', 'definitely-the-wrong-token'),
+    () => orchestrator.run({ id: 'TEST-001', task: 'test task', mandatory_checks: [] }, 'definitely-the-wrong-token'),
     /Resume token mismatch/,
     'Fresh run() must refuse to start when the supplied token does not hash to the stored value'
   );
@@ -210,8 +223,9 @@ test('G2 resume gate: correct token clears the hash and lets run() proceed', asy
   const tempDir = mkdtempSync(join(tmpdir(), 'circus-test-g2-gate-goodtoken-'));
   const resumeHashPath = join(tempDir, 'resume-hash');
   t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const { repoRoot, baseBranch } = tempGitRepo(t);
 
-  const { code, rawToken } = await runToStop(resumeHashPath);
+  const { code, rawToken } = await runToStop(resumeHashPath, repoRoot, tempDir);
   assert.strictEqual(code, 42);
   assert.ok(rawToken, 'setup: STOP must print a raw resume token to stderr');
   assert.ok(existsSync(resumeHashPath));
@@ -219,33 +233,45 @@ test('G2 resume gate: correct token clears the hash and lets run() proceed', asy
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
   const normalAdapter = {
     async plan() { return { artifact: readFileSync(`${fixtureDir}/plan.md`, 'utf8') }; },
-    async code() { return { artifact: readFileSync(`${fixtureDir}/diff`, 'utf8') }; },
+    async code({ worktreePath }) {
+      writeFileSync(join(worktreePath, 'greeting.js'), 'export function greet(name) { return `Hello, ${name}!`; }\n');
+      return { artifact: null };
+    },
     async evaluate() { return { artifact: readFileSync(`${fixtureDir}/verdict.json`, 'utf8') }; },
     async distill() { return { artifact: readFileSync(`${fixtureDir}/feedback.md`, 'utf8') }; }
   };
 
-  const orchestrator = new Orchestrator(normalAdapter, { fixtureDir, resumeHashPath });
-  const result = await orchestrator.run('test task', rawToken);
+  const orchestrator = new TestOrchestrator(normalAdapter, { fixtureDir, resumeHashPath, loopDir: tempDir, baseBranch, repoRoot });
+  // Distinct task id — the resume gate only clears the hash and lets a new
+  // run start; it does not resume execution into the STOPped run's own
+  // worktree/branch (that's checkpoint/resume-state work, out of scope
+  // here). Reusing 'TEST-001' would collide with the branch the STOPped
+  // subprocess already created and left in place by design.
+  const result = await orchestrator.run({ id: 'TEST-002', task: 'test task', mandatory_checks: [] }, rawToken);
 
   assert.ok(result.feedback, 'run() should proceed and complete with the correct resume token');
   assert.ok(!existsSync(resumeHashPath), 'Resume hash must be cleared after a successful resume — it cannot gate a second time');
 });
 
-test('G2 resume gate: no hash on disk means normal start, token or not', async () => {
+test('G2 resume gate: no hash on disk means normal start, token or not', async (t) => {
   const tempDir = mkdtempSync(join(tmpdir(), 'circus-test-g2-gate-nohash-'));
   const resumeHashPath = join(tempDir, 'resume-hash');
+  const { repoRoot, baseBranch } = tempGitRepo(t);
 
   const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
   const normalAdapter = {
     async plan() { return { artifact: readFileSync(`${fixtureDir}/plan.md`, 'utf8') }; },
-    async code() { return { artifact: readFileSync(`${fixtureDir}/diff`, 'utf8') }; },
+    async code({ worktreePath }) {
+      writeFileSync(join(worktreePath, 'greeting.js'), 'export function greet(name) { return `Hello, ${name}!`; }\n');
+      return { artifact: null };
+    },
     async evaluate() { return { artifact: readFileSync(`${fixtureDir}/verdict.json`, 'utf8') }; },
     async distill() { return { artifact: readFileSync(`${fixtureDir}/feedback.md`, 'utf8') }; }
   };
 
   assert.ok(!existsSync(resumeHashPath), 'setup: no prior STOP, no hash file');
-  const orchestrator = new Orchestrator(normalAdapter, { fixtureDir, resumeHashPath });
-  const result = await orchestrator.run('test task');
+  const orchestrator = new TestOrchestrator(normalAdapter, { fixtureDir, resumeHashPath, loopDir: tempDir, baseBranch, repoRoot });
+  const result = await orchestrator.run({ id: 'TEST-001', task: 'test task', mandatory_checks: [] });
   assert.ok(result.feedback, 'run() should proceed normally when there is no pending resume hash');
 
   rmSync(tempDir, { recursive: true, force: true });

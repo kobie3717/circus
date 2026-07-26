@@ -66,26 +66,54 @@ Schema:
 ### feedback.md
 Free-form markdown. Synthesizes verdict results, extracts lessons, recommends iteration or completion.
 
+## APPLYING Stage
+
+After DISTILLING completes, the orchestrator commits changes to the worktree, pushes the branch, and creates a PR. This is the final stage where the loop's output becomes a real PR rather than just in-memory artifacts.
+
+### Worktree Flow
+
+**Worktree creation happens BEFORE coding, not after.** The sequence:
+
+1. **PLANNING** produces `plan.md`
+2. **Worktree creation** (`orchestrator.mjs:createWorktree`) creates a git worktree at `.loop/worktrees/<task-id>` branched from the base branch (usually `main` or `master`, resolved via `origin/HEAD` or passed explicitly as `options.baseBranch`)
+3. **CODING** receives `worktreePath` as an artifact and works inside it. The coder adapter writes files directly into the worktree. The adapter's return value (`artifact` field) is **ignored** — the orchestrator never trusts a diff string from the coder.
+4. **Diff extraction** (`orchestrator.mjs:extractDiffFromWorktree`) runs `git add -A` and `git diff --cached` in the worktree to derive the real diff. This is the **only** way a diff enters `artifacts.diff`.
+5. **EVALUATING** runs check commands with `cwd: worktreePath` (`orchestrator.mjs:executeChecksAndCaptureExitCodes`). This ensures checks validate what will actually be PR'd, not the orchestrator's own directory.
+6. **DISTILLING** produces feedback.
+7. **APPLYING** commits (`git commit` with message containing `Ticket: <task.id>` and `Co-Authored-By: Circus Loop Factory` trailer), pushes (`git push origin <branch>`), creates a PR (`gh pr create --base <baseBranch> --head <branchName>`), and cleans up the worktree (`git worktree remove --force`).
+
+### Failure Handling
+
+- **Worktree creation fails** (e.g., invalid base branch): STOP, exit 42, resume hash written. No worktree to preserve.
+- **APPLYING fails** (commit, push, or gh auth/pr-create fails): STOP, exit 42, resume hash written, **worktree is NOT cleaned up** — it remains on disk at `.loop/worktrees/<task-id>` for manual recovery. The STOP message includes the exact commands to finish the PR manually.
+
+### Network Operations (Mocked in Tests)
+
+Tests mock `pushBranch`, `createPR`, and `checkGhAuth` via a `TestOrchestrator` subclass. All git operations (worktree creation, commit, diff extraction) run against a real (but isolated, test-injected) git repo. This boundary is tested explicitly in `loop/tests/applying-stage.test.mjs`.
+
 ## State Machine
 
 ### States
 1. **IDLE** — no active loop, awaiting task
 2. **PLANNING** — planner role active
-3. **CODING** — coder role active
-4. **EVALUATING** — evaluator role active
+3. **CODING** — coder role active (now runs inside a git worktree)
+4. **EVALUATING** — evaluator role active (checks run with cwd set to worktree)
 5. **DISTILLING** — distiller role active
-6. **STOPPED** — terminal state, requires resume token to continue
+6. **APPLYING** — commit, push, PR creation
+7. **STOPPED** — terminal state, requires resume token to continue
 
 ### Transitions
 
 ```
 IDLE → PLANNING (on task receipt)
-PLANNING → CODING (plan.md complete)
-CODING → EVALUATING (diff complete)
+PLANNING → [create worktree] → CODING (plan.md complete, worktree ready)
+CODING → [extract diff from worktree via git] → EVALUATING (diff extracted)
 EVALUATING → STOPPED (if verdict signals STOP)
 EVALUATING → DISTILLING (if all checks pass)
 EVALUATING → STOPPED (if checks fail and max iterations reached)
-DISTILLING → IDLE (feedback.md complete, ready for next task)
+DISTILLING → APPLYING (feedback complete, ready to commit/push/PR)
+APPLYING → IDLE (PR created, worktree cleaned up)
+APPLYING → STOPPED (if commit/push/PR creation fails; worktree preserved for manual recovery)
 STOPPED → (no transition without resume token)
 ```
 

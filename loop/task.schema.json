@@ -4,6 +4,11 @@
   "description": "Schema for task files defining mandatory acceptance checks",
   "type": "object",
   "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable task identifier. Required by the PR stage — derives the worktree/branch name and appears in the commit and PR body. A task without one is malformed; the orchestrator refuses to run it rather than generating a fallback ID.",
+      "minLength": 1
+    },
     "task": {
       "type": "string",
       "description": "Task description"
@@ -17,5 +22,5 @@
       "minItems": 0
     }
   },
-  "required": ["task", "mandatory_checks"]
+  "required": ["id", "task", "mandatory_checks"]
 }
