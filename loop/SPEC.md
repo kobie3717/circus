@@ -70,6 +70,14 @@ Free-form markdown. Synthesizes verdict results, extracts lessons, recommends it
 
 After DISTILLING completes, the orchestrator commits changes to the worktree, pushes the branch, and creates a PR. This is the final stage where the loop's output becomes a real PR rather than just in-memory artifacts.
 
+### Footgun Guard
+
+`repoRoot` (the git repo all worktree/commit/push/PR operations run against) is a **required** constructor option — there is no default to `process.cwd()`. A bare `node loop/orchestrator.mjs` invocation used to default `repoRoot` to whatever directory it was run from; from the repo root, that created a real worktree and branch in `/root/circus` itself, with nothing to stop it. Two refusals close this:
+- Missing `repoRoot` → constructor throws immediately.
+- `repoRoot` pointing at a directory containing `loop/orchestrator.mjs` (i.e. looks like this codebase) → constructor throws unless `options.allowSelf: true` is explicitly passed.
+
+Both are enforced at construction — before any git command runs — and both are mutation-tested (`footgun-reporoot-required`, `footgun-self-repo-refused`).
+
 ### Worktree Flow
 
 **Worktree creation happens BEFORE coding, not after.** The sequence:

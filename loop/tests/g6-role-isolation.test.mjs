@@ -202,7 +202,7 @@ test('G6 BUILD 4-C: manifest enforcement - coder invoked without manifest fails'
   // Attempt to construct orchestrator without manifest (should fail)
   assert.throws(
     () => {
-      new Orchestrator(adapter, { coderManifest: null });
+      new Orchestrator(adapter, { repoRoot: '/tmp/circus-g6-placeholder-repo', coderManifest: null });
     },
     /G6 violation: coder manifest missing or malformed/,
     'Orchestrator should refuse to construct without coder manifest'
@@ -211,7 +211,7 @@ test('G6 BUILD 4-C: manifest enforcement - coder invoked without manifest fails'
   // Attempt to construct with malformed manifest (should fail)
   assert.throws(
     () => {
-      new Orchestrator(adapter, { coderManifest: { allowedTools: 'not-an-array' } });
+      new Orchestrator(adapter, { repoRoot: '/tmp/circus-g6-placeholder-repo', coderManifest: { allowedTools: 'not-an-array' } });
     },
     /G6 violation: coder manifest.allowedTools must be an array/,
     'Orchestrator should refuse malformed manifest'

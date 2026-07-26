@@ -75,7 +75,7 @@ jobs:
     - name: Run Node tests with count assertion
       run: |
         set -e
-        EXPECTED_TEST_COUNT=38
+        EXPECTED_TEST_COUNT=42
         npm test > test-output.txt 2>&1 || true
         cat test-output.txt
         ACTUAL_COUNT=$(grep "^# tests " test-output.txt | awk '{print $3}')

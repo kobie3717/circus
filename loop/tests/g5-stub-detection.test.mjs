@@ -18,7 +18,7 @@ test('G5 negative: new file flipping check FAIL→PASS is flagged', async () => 
     async code() { return { artifact: 'diff' }; },
     async evaluate() { return { artifact: '{}' }; },
     async distill() { return { artifact: 'feedback' }; }
-  });
+  }, { repoRoot: '/tmp/circus-g5-placeholder-repo' });
 
   const diff = '--- /dev/null\n+++ b/required.txt\n@@ -0,0 +1 @@\n+stub';
   const beforeResults = { 'file-exists': false };
@@ -41,7 +41,7 @@ test('G5 positive: editing existing files without flipping checks passes', async
     async code() { return { artifact: 'diff' }; },
     async evaluate() { return { artifact: '{}' }; },
     async distill() { return { artifact: 'feedback' }; }
-  });
+  }, { repoRoot: '/tmp/circus-g5-placeholder-repo' });
 
   // Diff only edits existing file, no new files
   const diff = '--- a/existing.js\n+++ b/existing.js\n@@ -1,1 +1,2 @@\n code\n+more code';
