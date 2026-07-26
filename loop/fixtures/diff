@@ -1,0 +1,15 @@
+--- /dev/null
++++ b/greeting.js
+@@ -0,0 +1,3 @@
++export function greet(name) {
++  return `Hello, ${name}!`;
++}
+--- a/package.json
++++ b/package.json
+@@ -1,5 +1,6 @@
+ {
+   "name": "test-project",
++  "type": "module",
+   "version": "1.0.0",
+   "scripts": {
+     "test": "node --test"

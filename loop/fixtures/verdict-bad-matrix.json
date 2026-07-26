@@ -1,0 +1,14 @@
+{
+  "rows": [
+    {
+      "name": "test-greeting",
+      "pass": true,
+      "evidence": "Tests passed"
+    },
+    {
+      "name": "wrong-check-name",
+      "pass": true,
+      "evidence": "This check name doesn't match plan.md"
+    }
+  ]
+}
