@@ -27,10 +27,9 @@ MUTATIONS["g3-artifact-scrub"]="94,96s/^/\/\/ MUTATION: /"
 MUTATIONS["g4-harness-integrity"]="213,223s/^/\/\/ MUTATION: /"
 MUTATIONS["g5-stub-detection"]="264,268s/^/\/\/ MUTATION: /"
 MUTATIONS["g6-role-isolation"]="405s/feedback = this.filterVerdictToFeedback(verdictJson);/\/\/ MUTATION: feedback = this.filterVerdictToFeedback(verdictJson);/"
-MUTATIONS["g7-fake-ineffective"]="1s/^/\/\/ MUTATION: /" # Deliberately ineffective: comments line 1 which doesn't affect any tests
 
 MUTATION_COUNT=${#MUTATIONS[@]}
-EXPECTED_GUARDS=7  # Temporarily 7 for ineffective mutation proof
+EXPECTED_GUARDS=6
 
 if [ $MUTATION_COUNT -ne $EXPECTED_GUARDS ]; then
   echo "ERROR: Expected $EXPECTED_GUARDS mutations (G1-G6), found $MUTATION_COUNT"
@@ -51,6 +50,16 @@ for GUARD_NAME in "${!MUTATIONS[@]}"; do
 
   # Apply mutation via sed
   sed -i "$SED_COMMAND" "$ORCHESTRATOR"
+
+  # Verify the sed actually changed the file — a no-op sed (stale line numbers,
+  # non-matching pattern) must be distinguishable from "guard unenforced"
+  if diff -q "$ORCHESTRATOR_BACKUP" "$ORCHESTRATOR" > /dev/null 2>&1; then
+    echo "⚠️  MUTATION DID NOT APPLY: sed command for $GUARD_NAME made no change to $ORCHESTRATOR"
+    echo "   Target lines/pattern are stale — this proves nothing about $GUARD_NAME's enforcement."
+    FAILED_MUTATIONS+=("$GUARD_NAME (DID NOT APPLY)")
+    echo
+    continue
+  fi
 
   echo "Applied mutation: $GUARD_NAME"
 

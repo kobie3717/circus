@@ -94,9 +94,9 @@ Any role can signal STOP by returning an object with `{ signal: 'STOP', reason: 
 
 When STOP is signaled:
 1. Orchestrator exits with nonzero process exit code (exit code 42)
-2. A resume token (SHA-256 hash of current state) is written to `.loop/resume-token`
+2. A resume token hash (SHA-256) is written to `.loop/resume-hash`
 3. No further state transitions occur
-4. Next invocation must supply matching resume token via `--resume <token>` to continue
+4. **Not yet enforced**: `run()` does not check `.loop/resume-hash` on entry, so nothing currently requires a resume token before the next invocation proceeds — see G2 below.
 
 ## Guards
 
@@ -116,11 +116,11 @@ These guards run in the orchestrator code, enforcing contracts that tests, roles
 ### G2: stop-is-terminal
 **What**: When any role signals STOP, the orchestrator must halt immediately and require a resume token to continue.
 
-**Enforcement**:
+**Enforcement — PARTIAL. The halt is real; the block on resuming is not.**
 - STOP signal shape: `{ signal: 'STOP', reason: string }`
-- On STOP: orchestrator exits with code 42, writes resume token to `.loop/resume-token`, proceeds no further
-- Resume token = SHA-256 hash of: role name + reason + timestamp
-- Next run must supply `--resume <token>` matching the token in `.loop/resume-token` to continue
+- On STOP: `handleStop()` (`orchestrator.mjs:113-126`) writes a resume-token hash to `.loop/resume-hash` and calls `process.exit(42)` — this part is real and tested.
+- `verifyResumeToken()` (`orchestrator.mjs:129-137`) exists and correctly checks a supplied token against the stored hash — but **`run()` never calls it and never checks `resumeHashPath` on entry.** Nothing stops a fresh `orchestrator.run()` from simply starting again after a STOP; the hash file is written and then never read by the orchestrator itself. Tests cover "exits 42 and writes a hash," not "resume is blocked without the token" — which is the half that makes STOP *terminal* rather than just *loud*.
+- Until `run()` gates on this, treat G2 as: halts reliably, does not yet prevent re-entry.
 
 **Rationale**: Prevents automatic retry loops when a role explicitly requests human review or intervention.
 
@@ -172,28 +172,13 @@ These guards run in the orchestrator code, enforcing contracts that tests, roles
 - Orchestrator does not pass disallowed artifacts to role adapters (they are not in scope)
 - Tests verify: adapter functions are called with correct arguments (negative test: coder throws if verdict passed; positive test: each role receives only allowed artifacts)
 
-**SPECIFIED — NOT IMPLEMENTED (see follow-up PR)**:
+**Status as of BUILD 4 PHASE 1 (this PR)** — two of three implemented against the real `Orchestrator`, one observed-not-enforced:
 
-The following three mechanisms are documented in SPEC.md and have passing tests in `loop/tests/g6-role-isolation.test.mjs`, but those tests mock their own behavior rather than exercising the real `Orchestrator` class. The orchestrator itself was never modified to implement these mechanisms. A planner reading this spec should NOT assume these constraints exist in production:
+- **Temporal separation — OBSERVED, NOT ENFORCED.** `orchestrator.mjs:346` records `runState.coderExitedAt = Date.now()` after the coder adapter's promise resolves; `:379` records `runState.verdictWrittenAt` after the verdict is captured. `loop/tests/g6-role-isolation.test.mjs` (BUILD 4-A) drives the real `Orchestrator`, calls `.run()`, and asserts `coderExitedAt < verdictWrittenAt` off the live instance — that part is real. But there is no comparison or gate anywhere in `orchestrator.mjs` itself; the two timestamps are recorded and never checked against each other by the orchestrator. The ordering the test observes is guaranteed by the surrounding `await` sequencing, not by this mechanism. `coderExitedAt` is also misnamed: it marks when the adapter's promise resolved, not when a coder *process* exited — for a stub adapter those are identical, but a real spawned coder process can resolve its promise (e.g. stdout closes) before the OS process has actually exited, and this mechanism cannot tell the difference. **Real process-exit confirmation (not promise-resolution timestamping) is required before this can gate a real coder.**
 
-- **Temporal separation** (SPECIFIED, NOT ENFORCED): Coder process should complete and exit BEFORE `verdict.json` is written
-  - Design: Orchestrator runs coder, awaits completion, THEN runs evaluator
-  - Design: Sequential `await` ensures artifacts never coexist on disk with processes that shouldn't access them
-  - Current test (BUILD 4-A): Mocks adapters that set timestamps and flags internally, then asserts those flags — does NOT drive real orchestrator to prove temporal ordering
-  - Real implementation would require: no changes (orchestrator already uses sequential await), but test must verify against orchestrator's actual control flow, not mock adapters
-  
-- **Feedback projection** (SPECIFIED, NOT ENFORCED): Coder should receive ONLY filtered feedback (row name + pass/fail), not raw verdict
-  - Design: Distiller filters verdict to whitelisted fields before passing to planner
-  - Design: No evaluator commentary, evidence details, or internal probe data leaks through
-  - Current test (BUILD 4-B): Mocks distiller that performs filtering inline, then asserts the filtered string doesn't contain sensitive fields — does NOT verify orchestrator scrubs feedback before passing it to coder
-  - Real implementation would require: orchestrator scrubbing logic (possibly in `scrubArtifact` or a dedicated filter) + test proving orchestrator's actual feedback output is filtered
-  
-- **Capability manifest** (SPECIFIED, NOT ENFORCED): Coder role should be restricted to Read/Edit/Write within worktree only
-  - Design: NO Bash execution allowed (coder can't shell out to read filesystem)
-  - Design: NO network access (coder can't exfiltrate or fetch external data)
-  - Design: NO reads outside worktree path (coder can't traverse to orchestrator directories)
-  - Current test (BUILD 4-C): Defines manifest as inline object, calls stub `enforceManifest` function that throws on violations, then asserts violations were caught — does NOT verify orchestrator enforces a real manifest when calling coder adapter
-  - Real implementation would require: orchestrator manifest enforcement in `callRole` + test proving orchestrator rejects out-of-manifest tool calls from coder
+- **Feedback projection — IMPLEMENTED.** `orchestrator.mjs:100-109` defines `filterVerdictToFeedback()`; `:403` calls it to override the distiller's own output: `feedback = this.filterVerdictToFeedback(verdictJson)`. `loop/tests/g6-role-isolation.test.mjs` (BUILD 4-B) drives the real `Orchestrator`, feeds a verdict containing sensitive fields (`privateData`, `evaluatorCommentary`, `probeSummary`) plus a distiller that returns unrelated raw text, then asserts on `orchestrator.artifacts.feedback` that none of it leaked and the raw distiller output was discarded. One-line disable: comment out line 403.
+
+- **Capability manifest — IMPLEMENTED.** Constructor validation at `orchestrator.mjs:83-88` (throws if manifest missing/malformed/`allowedTools` not an array); enforcement in `callRole` at `:294-302` (throws if `allowBash`/`allowNetwork` are `true`). Tests (BUILD 4-C/D) construct the real `Orchestrator` with bad or permissive manifests and `assert.throws`. One-line disable: comment out the `allowBash` check at line 297.
 
 **Why not permission bits or per-user isolation?**
 - All production processes run as root (uid=0), making permission bits ineffective
