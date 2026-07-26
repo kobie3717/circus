@@ -2,20 +2,27 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { Orchestrator } from '../orchestrator.mjs';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { tempLoopDir } from './helpers/loop-dir.mjs';
+import { tempGitRepo } from './helpers/git-repo.mjs';
+import { TestOrchestrator } from './helpers/mock-network.mjs';
 
 test('G6 negative: role receiving disallowed artifacts fails', async (t) => {
+  const { repoRoot, baseBranch } = tempGitRepo(t);
+
   // Test that coder cannot receive verdict even if we try to inject it
   const adapter = {
     async plan({ task, feedback }) {
       return { artifact: '# Plan\n## Checks\n- [test]: echo ok' };
     },
-    async code({ plan, verdict }) {
+    async code({ plan, worktreePath, verdict }) {
       // If verdict is passed (shouldn't be), throw to indicate violation
       if (verdict !== undefined) {
         throw new Error('G6 violation: coder received disallowed artifact (verdict)');
       }
-      return { artifact: 'diff content' };
+      writeFileSync(join(worktreePath, 'change.txt'), 'diff content');
+      return { artifact: null };
     },
     async evaluate({ plan, diff }) {
       return { artifact: JSON.stringify({ rows: [{ name: 'test', pass: true, evidence: 'ok' }] }) };
@@ -25,19 +32,20 @@ test('G6 negative: role receiving disallowed artifacts fails', async (t) => {
     }
   };
 
-  const orchestrator = new Orchestrator(adapter, { loopDir: tempLoopDir(t) });
+  const orchestrator = new TestOrchestrator(adapter, { loopDir: tempLoopDir(t), repoRoot, baseBranch });
 
   // Manually inject verdict into artifacts before coder runs (simulating leak attempt)
   orchestrator.artifacts.verdict = 'leaked verdict';
 
   // Run should complete — callRole enforces isolation by only passing allowed artifacts
-  const result = await orchestrator.run('test task');
+  const result = await orchestrator.run({ id: 'TEST-G6-NEG', task: 'test task', mandatory_checks: [] });
 
   // Verify run completed (code adapter didn't receive verdict, so didn't throw)
   assert.ok(result.diff, 'Should complete without coder receiving verdict');
 });
 
 test('G6 positive: roles receive only allowed artifacts', async (t) => {
+  const { repoRoot, baseBranch } = tempGitRepo(t);
   const seenArtifacts = {
     coder: null,
     evaluator: null,
@@ -50,7 +58,8 @@ test('G6 positive: roles receive only allowed artifacts', async (t) => {
     },
     async code(ctx) {
       seenArtifacts.coder = Object.keys(ctx);
-      return { artifact: 'diff content' };
+      writeFileSync(join(ctx.worktreePath, 'change.txt'), 'diff content');
+      return { artifact: null };
     },
     async evaluate(ctx) {
       seenArtifacts.evaluator = Object.keys(ctx);
@@ -62,25 +71,28 @@ test('G6 positive: roles receive only allowed artifacts', async (t) => {
     }
   };
 
-  const orchestrator = new Orchestrator(adapter, { loopDir: tempLoopDir(t) });
-  await orchestrator.run('test task');
+  const orchestrator = new TestOrchestrator(adapter, { loopDir: tempLoopDir(t), repoRoot, baseBranch });
+  await orchestrator.run({ id: 'TEST-G6-POS', task: 'test task', mandatory_checks: [] });
 
   // Verify each role received only allowed artifacts (adapter interface enforcement)
-  assert.deepStrictEqual(seenArtifacts.coder, ['plan'], 'Coder should receive only plan');
+  assert.deepStrictEqual(seenArtifacts.coder.sort(), ['plan', 'worktreePath'], 'Coder should receive plan and worktreePath');
   assert.deepStrictEqual(seenArtifacts.evaluator.sort(), ['diff', 'plan'], 'Evaluator should receive plan and diff');
   assert.deepStrictEqual(seenArtifacts.distiller.sort(), ['diff', 'plan', 'verdict'], 'Distiller should receive plan, diff, and verdict');
 });
 
 test('G6 BUILD 4-A: temporal separation - coder exits before verdict written', async (t) => {
+  const { repoRoot, baseBranch } = tempGitRepo(t);
+
   // Drive REAL orchestrator and inspect its runState timestamps
   const adapter = {
     async plan({ task, feedback }) {
       return { artifact: '# Plan\n## Checks\n- [test]: echo ok' };
     },
-    async code({ plan }) {
+    async code({ plan, worktreePath }) {
       // Simulate some async work
       await new Promise(resolve => setTimeout(resolve, 10));
-      return { artifact: 'diff content' };
+      writeFileSync(join(worktreePath, 'change.txt'), 'diff content');
+      return { artifact: null };
     },
     async evaluate({ plan, diff }) {
       return { artifact: JSON.stringify({ rows: [{ name: 'test', pass: true, evidence: 'ok' }] }) };
@@ -90,8 +102,8 @@ test('G6 BUILD 4-A: temporal separation - coder exits before verdict written', a
     }
   };
 
-  const orchestrator = new Orchestrator(adapter, { loopDir: tempLoopDir(t) });
-  await orchestrator.run('test task');
+  const orchestrator = new TestOrchestrator(adapter, { loopDir: tempLoopDir(t), repoRoot, baseBranch });
+  await orchestrator.run({ id: 'TEST-G6-4A', task: 'test task', mandatory_checks: [] });
 
   // Verify orchestrator recorded real timestamps in runState
   assert.ok(orchestrator.runState.coderExitedAt, 'Orchestrator should record coder exit timestamp');
@@ -105,6 +117,8 @@ test('G6 BUILD 4-A: temporal separation - coder exits before verdict written', a
 });
 
 test('G6 BUILD 4-B: feedback projection - only whitelisted fields leak to coder', async (t) => {
+  const { repoRoot, baseBranch } = tempGitRepo(t);
+
   // Feed REAL orchestrator a verdict with sensitive fields, inspect REAL feedback output
   const sensitiveVerdict = {
     rows: [
@@ -132,8 +146,9 @@ test('G6 BUILD 4-B: feedback projection - only whitelisted fields leak to coder'
     async plan({ task, feedback }) {
       return { artifact: '# Plan\n## Checks\n- [test-check]: echo test\n- [lint-check]: echo lint' };
     },
-    async code({ plan }) {
-      return { artifact: 'diff content' };
+    async code({ plan, worktreePath }) {
+      writeFileSync(join(worktreePath, 'change.txt'), 'diff content');
+      return { artifact: null };
     },
     async evaluate({ plan, diff }) {
       // Return verdict with extra sensitive fields
@@ -145,8 +160,8 @@ test('G6 BUILD 4-B: feedback projection - only whitelisted fields leak to coder'
     }
   };
 
-  const orchestrator = new Orchestrator(adapter, { loopDir: tempLoopDir(t) });
-  await orchestrator.run('test task');
+  const orchestrator = new TestOrchestrator(adapter, { loopDir: tempLoopDir(t), repoRoot, baseBranch });
+  await orchestrator.run({ id: 'TEST-G6-4B', task: 'test task', mandatory_checks: [] });
 
   // Inspect REAL feedback that orchestrator produced
   const feedback = orchestrator.artifacts.feedback;
@@ -220,9 +235,13 @@ test('G6 BUILD 4-D: manifest enforcement - Bash and network must be denied', asy
     }
   };
 
+  const { repoRoot, baseBranch } = tempGitRepo(t);
+
   // Attempt to construct with Bash allowed (should fail when coder is invoked)
   const orchestratorWithBash = new Orchestrator(adapter, {
     loopDir: tempLoopDir(t),
+    repoRoot,
+    baseBranch,
     coderManifest: {
       allowedTools: ['read', 'edit', 'write'],
       allowedPaths: ['/worktree/**'],
@@ -233,7 +252,7 @@ test('G6 BUILD 4-D: manifest enforcement - Bash and network must be denied', asy
 
   await assert.rejects(
     async () => {
-      await orchestratorWithBash.run('test task');
+      await orchestratorWithBash.run({ id: 'TEST-G6-4D-BASH', task: 'test task', mandatory_checks: [] });
     },
     /G6 violation: coder manifest must not allow Bash execution/,
     'Orchestrator should reject coder invocation with Bash allowed'
@@ -242,6 +261,8 @@ test('G6 BUILD 4-D: manifest enforcement - Bash and network must be denied', asy
   // Attempt to construct with network allowed (should fail when coder is invoked)
   const orchestratorWithNetwork = new Orchestrator(adapter, {
     loopDir: tempLoopDir(t),
+    repoRoot,
+    baseBranch,
     coderManifest: {
       allowedTools: ['read', 'edit', 'write'],
       allowedPaths: ['/worktree/**'],
@@ -252,7 +273,7 @@ test('G6 BUILD 4-D: manifest enforcement - Bash and network must be denied', asy
 
   await assert.rejects(
     async () => {
-      await orchestratorWithNetwork.run('test task');
+      await orchestratorWithNetwork.run({ id: 'TEST-G6-4D-NET', task: 'test task', mandatory_checks: [] });
     },
     /G6 violation: coder manifest must not allow network access/,
     'Orchestrator should reject coder invocation with network allowed'

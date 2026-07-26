@@ -42,12 +42,13 @@ MUTATIONS["g4-harness-integrity"]="s/row.evidence.includes('SUBSTITUTED:')/false
 MUTATIONS["g5-stub-detection"]="s/flags.length > 0/false \/* MUTATION: g5-stub-detection disabled *\//"
 MUTATIONS["g6-role-isolation"]="s/feedback = this.filterVerdictToFeedback(verdictJson);/\/* MUTATION: g6-role-isolation disabled *\//"
 MUTATIONS["g2-resume-gate"]="s/this.checkResumeGate(resumeToken);/\/* MUTATION: g2-resume-gate disabled *\//"
+MUTATIONS["applying-worktree-cwd"]="s/stdio: 'pipe', timeout: 30000, cwd: worktreePath/stdio: 'pipe', timeout: 30000 \/* MUTATION: applying-worktree-cwd disabled *\//"
 
 MUTATION_COUNT=${#MUTATIONS[@]}
-EXPECTED_GUARDS=7  # 6 original guards + g2-resume-gate (first legitimate increment —
-                   # see PR: the prior increment to 7 was the gamed g7-fake-ineffective
-                   # mutation reverted in loop/g6-real. Any future change to this number
-                   # must arrive with the new mutation's red-run proof attached.
+EXPECTED_GUARDS=8  # 6 original guards + g2-resume-gate + applying-worktree-cwd
+                   # applying-worktree-cwd: disabling the cwd parameter in executeChecksAndCaptureExitCodes
+                   # should turn the "checks run against worktree" test red, proving checks would
+                   # run against the orchestrator's own directory instead of the coder's actual changes.
 
 if [ $MUTATION_COUNT -ne $EXPECTED_GUARDS ]; then
   echo "ERROR: Expected $EXPECTED_GUARDS mutations (G1-G6), found $MUTATION_COUNT"

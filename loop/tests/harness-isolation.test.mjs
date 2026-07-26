@@ -61,12 +61,12 @@ test('harness isolation: a real STOP with an injected loopDir never touches the 
 
   // handleStop calls process.exit(42) in production; here we only need to
   // prove the write target, so intercept process.exit for this assertion.
-  const orchestrator = new Orchestrator(adapter, { loopDir: dir });
+  const orchestrator = new Orchestrator(adapter, { loopDir: dir, baseBranch: 'main' });
   const originalExit = process.exit;
   let exitCode = null;
   process.exit = (code) => { exitCode = code; throw new Error('__STOP_EXIT__'); };
   try {
-    await orchestrator.run('test task');
+    await orchestrator.run({ id: 'TEST-001', task: 'test task', mandatory_checks: [] });
   } catch (err) {
     if (err.message !== '__STOP_EXIT__') throw err;
   } finally {

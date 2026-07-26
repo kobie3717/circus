@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { tempGitRepo } from './helpers/git-repo.mjs';
 
 const orchestratorPath = fileURLToPath(new URL('../orchestrator.mjs', import.meta.url));
 
@@ -59,20 +60,26 @@ test('G5 positive: editing existing files without flipping checks passes', async
 test('G5 BUILD 3: end-to-end orchestrator run with stub capitulation causes HALT', async (t) => {
   const tempDir = mkdtempSync(join(tmpdir(), 'circus-test-g5-e2e-'));
   const resumeHashPath = join(tempDir, 'resume-hash');
+  const { repoRoot } = tempGitRepo(t);
 
   t.after(() => rmSync(tempDir, { recursive: true, force: true }));
 
   // Full orchestrator run that triggers G5 HALT via detectStubCapitulation
   const childProcess = spawn('node', ['-e', `
+    import { writeFileSync } from 'node:fs';
+    import { join } from 'node:path';
     import { Orchestrator } from '${orchestratorPath}';
 
     const adapter = {
       async plan() {
         return { artifact: '# Plan\\n## Checks\\n- [file-check]: echo ok' };
       },
-      async code() {
-        // Diff adds new file
-        return { artifact: '--- /dev/null\\n+++ b/newfile.txt\\n@@ -0,0 +1 @@\\n+content' };
+      async code({ worktreePath }) {
+        // Write a genuinely new file — the orchestrator derives the diff via
+        // git diff in the worktree, it never reads a diff string off this
+        // return value.
+        writeFileSync(join(worktreePath, 'newfile.txt'), 'content');
+        return { artifact: null };
       },
       async evaluate() {
         return { artifact: JSON.stringify({ rows: [{ name: 'file-check', pass: true, evidence: 'ok' }] }) };
@@ -82,7 +89,7 @@ test('G5 BUILD 3: end-to-end orchestrator run with stub capitulation causes HALT
       }
     };
 
-    const orch = new Orchestrator(adapter, { resumeHashPath: '${resumeHashPath}' });
+    const orch = new Orchestrator(adapter, { resumeHashPath: '${resumeHashPath}', loopDir: '${tempDir}', baseBranch: 'main', repoRoot: '${repoRoot}' });
 
     // Patch detectStubCapitulation to simulate proper beforeResults tracking
     // (Current orchestrator has beforeResults={} limitation)
@@ -93,7 +100,7 @@ test('G5 BUILD 3: end-to-end orchestrator run with stub capitulation causes HALT
       return originalDetect(diff, simulatedBefore, afterResults);
     };
 
-    await orch.run('test task');
+    await orch.run({ id: 'TEST-001', task: 'test task', mandatory_checks: [] });
   `]);
 
   let stdout = '';
